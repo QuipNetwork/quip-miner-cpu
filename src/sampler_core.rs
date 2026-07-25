@@ -11,7 +11,7 @@
 //!
 //! Types (`Algorithm`, `SampleParams`, `SamplerResult`, base `IsingGraph`) and
 //! the beta schedule come from `quip-miner-core`; this module keeps only the
-//! CPU annealing kernels and a private adjacency ([`CpuGraph`]) built from the
+//! CPU annealing kernels and a private adjacency (`CpuGraph`) built from the
 //! base graph.
 
 use quip_miner_core::beta::{default_ising_beta_range, geometric_beta_schedule};
@@ -27,8 +27,10 @@ use rand::{Rng, SeedableRng};
 /// unlike a `Vec<Vec<_>>` whose rows are scattered heap allocations.
 ///
 /// Built from the base [`IsingGraph`] with the same defensive posture as
-/// `energy_milli`: edges out of range for `h.len()` are skipped, and couplings
-/// shorter than the edge list are treated as 0.
+/// `energy_milli`: edges out of range for `h.len()` are skipped, self-loops
+/// `(u, u)` are skipped (they would pollute `heff[u]` with `u`'s own spin and
+/// break the ΔE formula), and couplings shorter than the edge list are treated
+/// as 0.
 struct CpuGraph {
     h: Vec<f64>,
     /// CSR row offsets, length `n + 1`.
@@ -44,7 +46,13 @@ impl CpuGraph {
         let n = g.h.len();
         let mut deg = vec![0u32; n];
         for &(u, v) in &g.edges {
-            if u >= n || v >= n {
+            // Range guard + self-loop skip: a self-loop double-increments deg[u]
+            // and inserts `u` into its own neighbor list, so effective_field(u)
+            // would include u's own spin and apply_field_delta would mutate
+            // heff[u], breaking the ΔE = -2 s heff premise (own field excludes
+            // own spin). energy_milli scores self-loops as a constant (s_u^2=1),
+            // so dropping them does not change reported energies.
+            if u >= n || v >= n || u == v {
                 continue;
             }
             deg[u] += 1;
@@ -59,7 +67,7 @@ impl CpuGraph {
         let mut nbr_coup = vec![0.0f64; total];
         let mut cursor: Vec<u32> = nbr_start[..n].to_vec();
         for (k, &(u, v)) in g.edges.iter().enumerate() {
-            if u >= n || v >= n {
+            if u >= n || v >= n || u == v {
                 continue;
             }
             let coup = g.j.get(k).copied().unwrap_or(0.0);
@@ -175,9 +183,16 @@ fn anneal_one_read(
     // `effective_field(var, spins)` across the whole anneal. Seeded once
     // (O(edges)); each accepted flip updates only its neighbors (O(degree)),
     // so a sweep costs O(n + accepts·degree) instead of O(n·degree) every
-    // time. ΔE and the Gibbs conditional both read the cache in O(1). The
-    // accept/reject RNG stream is unchanged (ΔE is identical), so results are
-    // bit-for-bit the same as the recompute-every-flip version.
+    // time. ΔE and the Gibbs conditional both read the cache in O(1).
+    //
+    // The cache and a from-scratch recompute agree to within IEEE rounding, not
+    // exactly: `apply_field_delta` accumulates `+= coup * ds` while
+    // `effective_field` rebuilds the sum left-to-right from `h[var]`, so the two
+    // associate the same terms differently and drift by ~1 ULP per flip. The
+    // property test `prop_field_cache_matches_recompute` pins that bound. Only
+    // the incremental path runs in production, so the live accept/reject RNG
+    // stream stays self-consistent, but results are not bit-for-bit identical to
+    // a recompute-every-flip implementation.
     let mut heff: Vec<f64> = (0..n).map(|v| effective_field(v, &spins, graph)).collect();
 
     match algorithm {
@@ -227,6 +242,22 @@ fn score_spins(spins: &[i8], graph: &IsingGraph) -> SamplerResult {
 /// in that core's cache — fanning reads across cores bounced those cache lines
 /// and measured slower. Model-level parallelism (one model per core) lives in
 /// the streaming pump (`CpuSampler::sample_stream`).
+///
+/// # Examples
+///
+/// ```
+/// use quip_miner_cpu::{sample_ising, Algorithm, IsingGraph, SampleParams};
+///
+/// let graph = IsingGraph::new(vec![0.0, 0.0], vec![-1.0], vec![(0, 1)]);
+/// let params = SampleParams {
+///     num_reads: 4,
+///     num_sweeps: 16,
+///     seed: 1,
+///     ..Default::default()
+/// };
+/// let results = sample_ising(&graph, &params, Algorithm::Sa);
+/// assert_eq!(results.len(), params.num_reads);
+/// ```
 pub fn sample_ising(
     graph: &IsingGraph,
     params: &SampleParams,
@@ -255,6 +286,7 @@ pub fn sample_ising(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     fn ferro2() -> IsingGraph {
         // Prefer aligned spins: J=-1 means E = J s0 s1 is lower when s0==s1.
@@ -336,5 +368,208 @@ mod tests {
         assert!(results
             .iter()
             .all(|r| r.spins.is_empty() && r.energy_milli == 0));
+    }
+
+    /// Structured 4-node graph with mixed h and asymmetric J (not the 2-node ferro).
+    /// Couplings/biases deliberately include non-dyadic values so the cache
+    /// path is exercised under real IEEE association (see `heff_close`).
+    fn mixed4() -> IsingGraph {
+        IsingGraph::new(
+            vec![0.5, -0.3, 0.1, 0.0],
+            vec![1.0, -0.5, 0.75, -1.25, 0.25],
+            vec![(0, 1), (1, 2), (0, 2), (2, 3), (0, 3)],
+        )
+    }
+
+    /// Incremental `heff += coup * ds` and left-to-right `effective_field`
+    /// recompute are algebraically identical but not bit-identical in IEEE
+    /// f64 (different add association). Exact `==` fails on the first
+    /// non-dyadic fixture (observed 1-ULP and ~1e-14 relative drifts after a
+    /// few flips; multi-edge graphs drift further as O(edges·flips)·ε).
+    ///
+    /// Bound: relative 1e-12 of the larger magnitude, with a 1e-12 absolute
+    /// floor near zero. That is ~6 orders tighter than `energy_milli`'s 1e-3
+    /// quantum, yet fails if a whole O(1) coupling term is dropped or a
+    /// neighbor update is missed.
+    fn heff_close(cached: f64, recomputed: f64) -> bool {
+        if cached == recomputed {
+            return true;
+        }
+        let diff = (cached - recomputed).abs();
+        let scale = cached.abs().max(recomputed.abs()).max(1.0);
+        diff <= 1e-12 || diff <= scale * 1e-12
+    }
+
+    fn assert_heff_matches(heff: &[f64], spins: &[i8], graph: &CpuGraph) {
+        assert_eq!(heff.len(), graph.num_nodes());
+        for (i, &cached) in heff.iter().enumerate() {
+            let want = effective_field(i, spins, graph);
+            assert!(
+                heff_close(cached, want),
+                "heff[{i}] diverged from effective_field: cached={cached} recompute={want} (spins={spins:?})",
+            );
+        }
+    }
+
+    #[test]
+    fn field_cache_tracks_effective_field_across_flips() {
+        let g = mixed4();
+        let cpu = CpuGraph::from_base(&g);
+        let n = cpu.num_nodes();
+        let mut spins = vec![1i8, -1, 1, -1];
+        let mut heff: Vec<f64> = (0..n).map(|v| effective_field(v, &spins, &cpu)).collect();
+        assert_heff_matches(&heff, &spins, &cpu);
+
+        // Fixed flip sequence covering every node more than once.
+        let flips = [0usize, 2, 1, 3, 0, 1, 2, 3, 1, 0, 3, 2];
+        for &var in &flips {
+            let s = spin_sign(spins[var]);
+            spins[var] = -spins[var];
+            apply_field_delta(&cpu, &mut heff, var, -2.0 * s);
+            assert_heff_matches(&heff, &spins, &cpu);
+        }
+    }
+
+    /// Self-loop hypothesis: without `u == v` skip, from_base double-counts the
+    /// loop into deg[u] and inserts `u` twice into its own CSR row. Then
+    /// effective_field(u) includes u's own spin and apply_field_delta mutates
+    /// heff[u], breaking the ΔE = -2 s heff premise. energy_milli treats the
+    /// loop as a constant (s^2 = 1), so the Metropolis delta is wrong while
+    /// cache-vs-recompute can still agree (both wrong the same way).
+    #[test]
+    fn self_loops_are_skipped_and_do_not_corrupt_heff() {
+        // Pure self-loop on a single node: field must stay 0 for any spin.
+        let pure = IsingGraph::new(vec![0.0], vec![3.0], vec![(0, 0)]);
+        let pure_cpu = CpuGraph::from_base(&pure);
+        assert!(
+            pure_cpu.neighbors(0).0.is_empty(),
+            "self-loop must not appear in CSR neighbor list"
+        );
+        assert_eq!(effective_field(0, &[1i8], &pure_cpu), 0.0);
+        assert_eq!(effective_field(0, &[-1i8], &pure_cpu), 0.0);
+
+        // Self-loop mixed with a real edge: only the real neighbor remains.
+        let g = IsingGraph::new(vec![0.5, -0.25], vec![2.0, -1.0], vec![(0, 0), (0, 1)]);
+        let cpu = CpuGraph::from_base(&g);
+        let (n0, c0) = cpu.neighbors(0);
+        assert_eq!(n0, &[1]);
+        assert_eq!(c0, &[-1.0]);
+        let (n1, c1) = cpu.neighbors(1);
+        assert_eq!(n1, &[0]);
+        assert_eq!(c1, &[-1.0]);
+
+        let mut spins = vec![1i8, -1];
+        let mut heff: Vec<f64> = (0..2).map(|v| effective_field(v, &spins, &cpu)).collect();
+        // heff[0] must not include own-spin contribution from the self-loop.
+        // Coupling on (0,1) is -1.0, so field is h[0] + (-1)*s[1].
+        assert_eq!(heff[0], 0.5 - spin_sign(spins[1]));
+        assert_heff_matches(&heff, &spins, &cpu);
+
+        for &var in &[0usize, 1, 0, 1, 0] {
+            let s = spin_sign(spins[var]);
+            spins[var] = -spins[var];
+            apply_field_delta(&cpu, &mut heff, var, -2.0 * s);
+            // Own field must stay free of self-mutation from the flipped var.
+            assert_heff_matches(&heff, &spins, &cpu);
+        }
+    }
+
+    /// Empirically reconstruct the pre-fix CSR behavior for a self-loop and
+    /// show that ΔE and own-field update are wrong while cache-vs-recompute
+    /// still matches (silent mining-quality bug).
+    #[test]
+    fn self_loop_legacy_csr_corrupts_delta_not_cache_equality() {
+        // Manual CSR as from_base would build for n=1, edge (0,0), J=1, h=0:
+        // deg[0] += 2 → nbr row [0, 0] with coups [1, 1].
+        let legacy = CpuGraph {
+            h: vec![0.0],
+            nbr_start: vec![0, 2],
+            nbr_node: vec![0, 0],
+            nbr_coup: vec![1.0, 1.0],
+        };
+        let spins_plus = [1i8];
+        let heff0 = effective_field(0, &spins_plus, &legacy);
+        // True field excluding own spin is 0; legacy includes 2 * J * s = 2.
+        assert_eq!(heff0, 2.0);
+        // Metropolis delta used in anneal_one_read: -2 * s * heff.
+        let delta_legacy = -2.0 * spin_sign(spins_plus[0]) * heff0;
+        assert_eq!(delta_legacy, -4.0);
+        // True ΔE for a pure self-loop: energy is J * s * s = J (constant), so 0.
+        let delta_true = 0.0;
+        assert_ne!(
+            delta_legacy, delta_true,
+            "legacy self-loop CSR must produce a wrong Metropolis delta"
+        );
+
+        // Cache equality can still hold after apply_field_delta (both wrong).
+        let mut heff = vec![heff0];
+        let mut spins = spins_plus;
+        let s = spin_sign(spins[0]);
+        spins[0] = -spins[0];
+        apply_field_delta(&legacy, &mut heff, 0, -2.0 * s);
+        assert_eq!(heff[0], effective_field(0, &spins, &legacy));
+    }
+
+    proptest! {
+        // No file persistence: keeps the worktree free of proptest-regressions/.
+        #![proptest_config(ProptestConfig {
+            cases: 128,
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+        #[test]
+        fn prop_field_cache_matches_recompute(
+            n in 1usize..=6,
+            h in prop::collection::vec(-2.0f64..2.0, 1..=6),
+            edge_data in prop::collection::vec(
+                (any::<u8>(), any::<u8>(), -2.0f64..2.0),
+                0..=16,
+            ),
+            spin_bits in prop::collection::vec(any::<bool>(), 1..=6),
+            flip_vars in prop::collection::vec(any::<u8>(), 0..=40),
+        ) {
+            let n = n.min(h.len()).min(spin_bits.len()).max(1);
+            let h: Vec<f64> = h.into_iter().take(n).collect();
+            let mut edges = Vec::with_capacity(edge_data.len());
+            let mut j = Vec::with_capacity(edge_data.len());
+            for (u, v, c) in edge_data {
+                edges.push(((u as usize) % n, (v as usize) % n));
+                j.push(c);
+            }
+            let mut spins: Vec<i8> = spin_bits
+                .into_iter()
+                .take(n)
+                .map(|b| if b { 1i8 } else { -1i8 })
+                .collect();
+            let g = IsingGraph::new(h, j, edges);
+            let cpu = CpuGraph::from_base(&g);
+            let mut heff: Vec<f64> = (0..n)
+                .map(|v| effective_field(v, &spins, &cpu))
+                .collect();
+
+            for (i, &cached) in heff.iter().enumerate() {
+                prop_assert!(heff_close(cached, effective_field(i, &spins, &cpu)));
+            }
+
+            for fv in flip_vars {
+                let var = (fv as usize) % n;
+                let s = spin_sign(spins[var]);
+                spins[var] = -spins[var];
+                apply_field_delta(&cpu, &mut heff, var, -2.0 * s);
+                for (i, &cached) in heff.iter().enumerate() {
+                    // Exact equality does NOT hold: see heff_close docs and the
+                    // TEST-4 report (IEEE association of += vs recompute).
+                    let want = effective_field(i, &spins, &cpu);
+                    prop_assert!(
+                        heff_close(cached, want),
+                        "heff[{}] after flip {}: cached={} recompute={}",
+                        i,
+                        var,
+                        cached,
+                        want,
+                    );
+                }
+            }
+        }
     }
 }

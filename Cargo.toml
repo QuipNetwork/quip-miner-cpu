@@ -5,6 +5,7 @@ edition = "2021"
 description = "CPU Ising miners: simulated annealing and single-site Gibbs (v0.3)"
 license = "AGPL-3.0-or-later"
 repository = "https://gitlab.com/quip.network/quip-miner-cpu"
+rust-version = "1.97"
 
 [lib]
 name = "quip_miner_cpu"
@@ -17,6 +18,36 @@ path = "src/bin/quip_cpu_sa.rs"
 [[bin]]
 name = "quip-cpu-gibbs"
 path = "src/bin/quip_cpu_gibbs.rs"
+
+# Single-crate package, so lints live here rather than in [workspace.lints].
+[lints.rust]
+nonstandard-style     = "warn"
+redundant-lifetimes   = "warn"
+rust-2018-idioms      = "deny"
+unreachable-pub       = "warn"
+unsafe-code           = "deny"
+unused-extern-crates  = "warn"
+unused-imports        = "warn"
+unused-must-use       = "warn"
+unused-qualifications = "warn"
+
+[lints.clippy]
+panic                 = "deny"
+panic-in-result-fn    = "deny"
+unimplemented         = "deny"
+allow-attributes      = "deny"
+dbg-macro             = "warn"
+todo                  = "deny"
+print-stdout          = "deny"
+print-stderr          = "deny"
+redundant-clone       = "warn"
+uninlined-format-args = "warn"
+manual-string-new     = "warn"
+use-self              = "warn"
+await-holding-lock    = "deny"
+large-futures         = "deny"
+exit                  = "deny"
+mem-forget            = "deny"
 
 # Shared protocol crates live in the quip-protocol repo; pinned by tag until
 # they are published to a registry (crates.io / GitLab). Bump the tag to adopt
@@ -31,6 +62,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time",
 rand = { version = "0.8", features = ["small_rng"] }
 
 [dev-dependencies]
+proptest = "1.11.0"
 quip-mock-coordinator = { git = "https://gitlab.com/quip.network/quip-protocol.git", tag = "shared-v0.3.0" }
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "signal", "io-util", "sync", "process"] }
