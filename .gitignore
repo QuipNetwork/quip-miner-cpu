@@ -1,2 +1,9 @@
 /target
 .cargo/
+
+# Local AI agent tooling (per-developer, not project config)
+.claude/
+.serena/
+
+# Audit working artifacts (/rustcheck)
+.rustcheck/
