@@ -19,7 +19,6 @@ use quip_proto::v1::RejectReason;
 const DEFAULT_MAX_NODES: u32 = 100_000;
 const DEFAULT_MAX_EDGES: u32 = 1_000_000;
 
-/// Backend identity for `quip-cpu-sa`.
 /// CPU adapt envelope (from `CPU/sa_miner.py`).
 const CPU_ADAPT: AdaptBounds = AdaptBounds {
     min_sweeps: 64,
@@ -31,6 +30,7 @@ const CPU_ADAPT: AdaptBounds = AdaptBounds {
     reads_solution_floor_factor: 0,
 };
 
+/// Backend identity for `quip-cpu-sa`.
 pub const CPU_SA_IDENTITY: BackendIdentity = BackendIdentity {
     backend: "cpu",
     algorithm: "sa",
@@ -49,11 +49,36 @@ pub const CPU_GIBBS_IDENTITY: BackendIdentity = BackendIdentity {
 };
 
 /// CPU sampler backend. No device, no governor, uncapped reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CpuSampler {
     algorithm: Algorithm,
 }
 
 impl CpuSampler {
+    /// Create a CPU sampler for `algorithm` (SA or Gibbs).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use quip_miner_cpu::{Algorithm, CpuSampler, IsingGraph, SampleParams};
+    /// use quip_miner_core::Sampler;
+    /// use quip_proto::v1::RejectReason;
+    ///
+    /// # fn main() -> Result<(), RejectReason> {
+    /// let sampler = CpuSampler::new(Algorithm::Sa);
+    /// let graph = IsingGraph::new(vec![0.0, 0.0], vec![-1.0], vec![(0, 1)]);
+    /// let params = SampleParams {
+    ///     num_reads: 2,
+    ///     num_sweeps: 16,
+    ///     seed: 1,
+    ///     ..Default::default()
+    /// };
+    /// let results = sampler.sample(&graph, &params)?;
+    /// assert_eq!(results.len(), 2);
+    /// assert!(results.iter().all(|r| r.spins.iter().all(|&s| s == 1 || s == -1)));
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn new(algorithm: Algorithm) -> Self {
         Self { algorithm }
     }
@@ -119,7 +144,103 @@ impl Sampler for CpuSampler {
         }
         drop(work_tx); // close -> workers drain and exit
         for w in workers {
-            let _ = w.join();
+            // A panicking worker never emits a StreamResult for its in-flight
+            // job, so swallowing the join error would silently shrink the pump
+            // width for the rest of the session. The worker's own panic message
+            // already reached stderr via the default hook; re-raise here so the
+            // failure propagates instead of degrading throughput unnoticed.
+            if let Err(payload) = w.join() {
+                std::panic::resume_unwind(payload);
+            }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use quip_miner_core::{StreamJob, StreamResult};
+    use std::time::Duration;
+
+    fn tiny_ferro() -> IsingGraph {
+        IsingGraph::new(vec![0.0, 0.0], vec![-1.0], vec![(0, 1)])
+    }
+
+    fn tiny_params(num_reads: usize) -> SampleParams {
+        SampleParams {
+            num_reads,
+            num_sweeps: 16,
+            seed: 42,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn new_and_sample_returns_num_reads_of_pm1_spins() {
+        let sampler = CpuSampler::new(Algorithm::Sa);
+        let graph = tiny_ferro();
+        let params = tiny_params(4);
+        let results = sampler
+            .sample(&graph, &params)
+            .expect("CpuSampler::sample should not reject");
+        assert_eq!(results.len(), params.num_reads);
+        for r in &results {
+            assert_eq!(r.spins.len(), 2);
+            assert!(
+                r.spins.iter().all(|&s| s == 1 || s == -1),
+                "spins must be ±1, got {:?}",
+                r.spins
+            );
+        }
+    }
+
+    #[test]
+    fn stream_width_is_at_least_one() {
+        let sampler = CpuSampler::new(Algorithm::Gibbs);
+        assert!(sampler.stream_width() >= 1);
+    }
+
+    #[tokio::test]
+    async fn sample_stream_one_job_round_trip() {
+        let sampler = CpuSampler::new(Algorithm::Sa);
+        let (job_tx, job_rx) = tokio::sync::mpsc::channel::<StreamJob>(1);
+        let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<StreamResult>(1);
+
+        let job_id = b"job-stream-1".to_vec();
+        job_tx
+            .send(StreamJob {
+                job_id: job_id.clone(),
+                graph: tiny_ferro(),
+                params: tiny_params(1),
+            })
+            .await
+            .expect("send StreamJob");
+        // Close input so sample_stream drains workers and returns.
+        drop(job_tx);
+
+        let pump = tokio::task::spawn_blocking(move || {
+            sampler.sample_stream(job_rx, out_tx);
+        });
+
+        let got = tokio::time::timeout(Duration::from_secs(30), out_rx.recv())
+            .await
+            .expect("timeout waiting for StreamResult")
+            .expect("output channel closed without a result");
+
+        assert_eq!(got.job_id, job_id);
+        let results = got.result.expect("stream job should succeed");
+        assert_eq!(results.len(), 1);
+        assert!(results[0].spins.iter().all(|&s| s == 1 || s == -1));
+
+        // Pump finishes after the closed input is fully drained.
+        tokio::time::timeout(Duration::from_secs(30), pump)
+            .await
+            .expect("timeout waiting for sample_stream to exit")
+            .expect("spawn_blocking join");
+
+        assert!(
+            out_rx.recv().await.is_none(),
+            "exactly one StreamResult expected"
+        );
     }
 }
