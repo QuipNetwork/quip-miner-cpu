@@ -13,7 +13,9 @@ pub use quip_miner_core::{Algorithm, IsingGraph, SampleParams, SamplerResult};
 pub use sampler_core::sample_ising;
 
 use quip_miner_core::adapt::AdaptBounds;
-use quip_miner_core::{BackendIdentity, Sampler, StreamJob, StreamResult};
+use quip_miner_core::{
+    BackendIdentity, CancelGuard, Sampler, StreamJob, StreamOutcome, StreamResult,
+};
 use quip_proto::v1::RejectReason;
 
 const DEFAULT_MAX_NODES: u32 = 100_000;
@@ -105,6 +107,7 @@ impl Sampler for CpuSampler {
         &self,
         mut jobs: tokio::sync::mpsc::Receiver<StreamJob>,
         out: tokio::sync::mpsc::Sender<StreamResult>,
+        cancel: CancelGuard,
     ) {
         let width = self.stream_width();
         let algorithm = self.algorithm;
@@ -123,7 +126,7 @@ impl Sampler for CpuSampler {
                         if out
                             .blocking_send(StreamResult {
                                 job_id: j.job_id,
-                                result,
+                                outcome: StreamOutcome::Completed(result),
                                 device_access_time_us,
                             })
                             .is_err()
@@ -135,14 +138,30 @@ impl Sampler for CpuSampler {
             })
             .collect();
         drop(work_rx);
-        drop(out);
 
         while let Some(j) = jobs.blocking_recv() {
+            // Abandoned generations are dropped here, before a worker ever
+            // touches the graph: a reseed can leave the queue full of stale
+            // nonces, and sampling one would waste the round for nothing.
+            if cancel.is_cancelled(j.generation) {
+                if out
+                    .blocking_send(StreamResult {
+                        job_id: j.job_id,
+                        outcome: StreamOutcome::Cancelled,
+                        device_access_time_us: 0,
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+                continue;
+            }
             if work_tx.send(j).is_err() {
                 break;
             }
         }
         drop(work_tx); // close -> workers drain and exit
+        drop(out);
         for w in workers {
             // A panicking worker never emits a StreamResult for its in-flight
             // job, so swallowing the join error would silently shrink the pump
@@ -159,7 +178,7 @@ impl Sampler for CpuSampler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use quip_miner_core::{StreamJob, StreamResult};
+    use quip_miner_core::{StreamJob, StreamOutcome, StreamResult};
     use std::time::Duration;
 
     fn tiny_ferro() -> IsingGraph {
@@ -212,6 +231,7 @@ mod tests {
                 job_id: job_id.clone(),
                 graph: tiny_ferro(),
                 params: tiny_params(1),
+                generation: 0,
             })
             .await
             .expect("send StreamJob");
@@ -219,7 +239,7 @@ mod tests {
         drop(job_tx);
 
         let pump = tokio::task::spawn_blocking(move || {
-            sampler.sample_stream(job_rx, out_tx);
+            sampler.sample_stream(job_rx, out_tx, CancelGuard::default());
         });
 
         let got = tokio::time::timeout(Duration::from_secs(30), out_rx.recv())
@@ -228,7 +248,11 @@ mod tests {
             .expect("output channel closed without a result");
 
         assert_eq!(got.job_id, job_id);
-        let results = got.result.expect("stream job should succeed");
+        let StreamOutcome::Completed(result) = got.outcome else {
+            assert_eq!("got", "Completed outcome");
+            return;
+        };
+        let results = result.expect("stream job should succeed");
         assert_eq!(results.len(), 1);
         assert!(results[0].spins.iter().all(|&s| s == 1 || s == -1));
 
