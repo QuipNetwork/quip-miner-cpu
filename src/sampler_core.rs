@@ -209,9 +209,13 @@ fn anneal_one_read(
             for &beta in beta_schedule {
                 for _ in 0..sweeps_per_beta {
                     for var in 0..n {
+                        #[cfg(feature = "fine-spans")]
+                        let _d = trace_span!("spin_decision").entered();
                         let s = spin_sign(spins[var]);
                         let delta = -2.0 * s * heff[var];
                         if metropolis_accept(delta, beta, rng) {
+                            #[cfg(feature = "fine-spans")]
+                            let _f = trace_span!("apply_flip").entered();
                             spins[var] = -spins[var];
                             apply_field_delta(graph, &mut heff, var, -2.0 * s);
                             accepts += 1;
@@ -224,8 +228,12 @@ fn anneal_one_read(
             for &beta in beta_schedule {
                 for _ in 0..sweeps_per_beta {
                     for var in 0..n {
+                        #[cfg(feature = "fine-spans")]
+                        let _d = trace_span!("spin_decision").entered();
                         let new = gibbs_sample_spin(heff[var], beta, rng);
                         if new != spins[var] {
+                            #[cfg(feature = "fine-spans")]
+                            let _f = trace_span!("apply_flip").entered();
                             let ds = spin_sign(new) - spin_sign(spins[var]);
                             spins[var] = new;
                             apply_field_delta(graph, &mut heff, var, ds);

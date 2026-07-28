@@ -4,6 +4,18 @@
 //! `tracing` subscriber, aggregates per-part busy-time, derives per-spin and
 //! per-flip costs (aggregate ÷ frequency), and emits per-part JSON plus
 //! `tracing-flame` folded stacks for a flame graph.
+//!
+//! The headline per-part JSON always comes from the default build: coarse
+//! seam spans only (`cpu_graph_build`, `beta_schedule`, `anneal_read`,
+//! `random_spins`, `seed_heff`, `sweep_loop`, `score`), entered O(reads) times
+//! per model. Building with `--features fine-spans` additionally spans every
+//! spin decision and accepted flip inside the hot loop (`spin_decision`,
+//! `apply_flip`) for a diagnostic cross-check pass — never for the headline
+//! numbers, since millions of span enters per read measurably inflate the
+//! total wall time they are meant to describe. Use `fine-spans` output only
+//! for relative attribution and to sanity-check `derived.per_spin_ns` against
+//! an external `perf`/`cargo-flamegraph` run, e.g.:
+//! `cargo flamegraph --bin quip-cpu-bench -- --nodes 512 --edges 2048`.
 
 pub mod report;
 pub mod source;
