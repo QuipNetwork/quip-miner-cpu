@@ -41,12 +41,13 @@ pub enum SourceKind {
         /// Edge count (best effort; duplicate/degenerate draws are skipped).
         n_edges: usize,
     },
-    /// Read a corpus JSONL; `manifest` supplies topology for nonce-refs.
+    /// Read a corpus JSONL; `topology` supplies the topology for nonce-refs.
     Corpus {
-        /// Path to the JSONL corpus.
+        /// Path to the JSONL corpus (coordinator `instances.jsonl`).
         path: PathBuf,
-        /// Manifest supplying topology for nonce-ref entries.
-        manifest: Option<PathBuf>,
+        /// Coordinator `topology.spec.json` supplying topology for
+        /// nonce-ref entries.
+        topology: Option<PathBuf>,
     },
 }
 
@@ -71,6 +72,9 @@ pub struct BenchArgs {
     pub iters: usize,
     /// Output directory for `<model_id>.json` and `.folded`.
     pub out_dir: PathBuf,
+    /// Bench only the first `limit` corpus models (synthetic source ignores
+    /// this; it always produces exactly one model).
+    pub limit: Option<usize>,
 }
 
 /// Bench failure with a human-actionable message.
@@ -103,14 +107,13 @@ fn algorithm_name(a: Algorithm) -> &'static str {
     }
 }
 
-fn load_topology(manifest: Option<&PathBuf>) -> Result<Option<Topology>, BenchError> {
-    let Some(path) = manifest else {
+fn load_topology(topology: Option<&PathBuf>) -> Result<Option<Topology>, BenchError> {
+    let Some(path) = topology else {
         return Ok(None);
     };
     let text = std::fs::read_to_string(path)
-        .map_err(|e| BenchError::Source(format!("read manifest {}: {e}", path.display())))?;
-    let topo = source::topology_from_manifest_json(&text)
-        .map_err(|e| BenchError::Source(e.to_string()))?;
+        .map_err(|e| BenchError::Source(format!("read topology spec {}: {e}", path.display())))?;
+    let topo = source::parse_topology_spec(&text).map_err(|e| BenchError::Source(e.to_string()))?;
     Ok(Some(topo))
 }
 
@@ -119,9 +122,14 @@ fn models(args: &BenchArgs) -> Result<Vec<ModelSpec>, BenchError> {
         SourceKind::Synthetic { n_nodes, n_edges } => {
             Ok(vec![synthetic(*n_nodes, *n_edges, args.seed)])
         }
-        SourceKind::Corpus { path, manifest } => {
-            let topo = load_topology(manifest.as_ref())?;
-            from_jsonl(path, topo.as_ref()).map_err(|e| BenchError::Source(e.to_string()))
+        SourceKind::Corpus { path, topology } => {
+            let topo = load_topology(topology.as_ref())?;
+            let mut specs =
+                from_jsonl(path, topo.as_ref()).map_err(|e| BenchError::Source(e.to_string()))?;
+            if let Some(limit) = args.limit {
+                specs.truncate(limit);
+            }
+            Ok(specs)
         }
     }
 }
@@ -296,6 +304,47 @@ mod tests {
         let folded_txt = std::fs::read_to_string(&folded).expect("folded file");
         assert!(!folded_txt.trim().is_empty(), "folded stacks non-empty");
         assert!(folded_txt.contains("anneal_read"), "folded names present");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn corpus_limit_truncates_to_first_k_models() {
+        let dir = std::env::temp_dir().join(format!("quiplimit-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let topo_path = dir.join("topology.spec.json");
+        std::fs::write(
+            &topo_path,
+            r#"{
+                "nodes": [0, 1, 2, 3],
+                "edges": [[0, 1], [1, 2], [2, 3], [0, 3]],
+                "allowed_h_milli": [-1000, 0, 1000],
+                "allowed_j_milli": [-1000, 1000]
+            }"#,
+        )
+        .expect("write topology spec");
+        let corpus_path = dir.join("instances.jsonl");
+        let lines: Vec<String> = (0..3)
+            .map(|i| format!(r#"{{"nonce":"{i:064x}"}}"#))
+            .collect();
+        std::fs::write(&corpus_path, lines.join("\n")).expect("write corpus");
+
+        let args = BenchArgs {
+            algorithm: Algorithm::Sa,
+            source: SourceKind::Corpus {
+                path: corpus_path,
+                topology: Some(topo_path),
+            },
+            num_reads: 1,
+            num_sweeps: 1,
+            sweeps_per_beta: 1,
+            seed: 0,
+            warmup: 0,
+            iters: 1,
+            out_dir: dir.join("bench-out"),
+            limit: Some(1),
+        };
+        let specs = models(&args).expect("models under limit");
+        assert_eq!(specs.len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

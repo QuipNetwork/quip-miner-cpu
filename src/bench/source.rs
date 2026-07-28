@@ -1,10 +1,14 @@
 //! Bench model sources: synthetic (flag-driven) and corpus JSONL.
 //!
 //! Corpus entries are auto-detected: an entry with `nonce` is redrawn against a
-//! [`Topology`] via [`quip_protocol::chacha8::draw_ising_milli`]; an entry with
-//! `h_milli` is used verbatim. This mirrors sub-project A's `hardest_models`
-//! nonce-ref format so the same `instances.jsonl` feeds CPU and CUDA benches.
+//! [`Topology`] (parsed from a coordinator `topology.spec.json` via
+//! [`parse_topology_spec`]) using [`quip_protocol::chacha8::draw_ising_milli`];
+//! an entry with `h_milli` is used verbatim. The corpus JSONL is the
+//! coordinator's `instances.jsonl`: one JSON object per line keyed on `nonce`
+//! (un-prefixed 64-char hex = 32 bytes), with unrelated keys
+//! (`topology_hash`, `energy_milli`, `salt_hex`, `qblock_id`, …) ignored.
 
+use std::collections::HashMap;
 use std::path::Path;
 
 use quip_protocol::chacha8::draw_ising_milli;
@@ -14,7 +18,8 @@ use serde::Deserialize;
 
 use crate::IsingGraph;
 
-/// Topology shape for redrawing nonce-ref entries (from A's `manifest.json`).
+/// Topology shape for redrawing nonce-ref entries, resolved from a
+/// `topology.spec.json` file (see [`parse_topology_spec`]).
 #[derive(Debug, Clone)]
 pub struct Topology {
     /// Variable count.
@@ -25,7 +30,8 @@ pub struct Topology {
     pub allowed_h_milli: Vec<i32>,
     /// Allowed coupling milli-values.
     pub allowed_j_milli: Vec<i32>,
-    /// Fixed edge list for this topology.
+    /// Edge list, native node ids resolved to dense `0..n_nodes` positions
+    /// (matching `IsingGraph`'s index convention).
     pub edges: Vec<(usize, usize)>,
 }
 
@@ -47,12 +53,14 @@ pub enum SourceError {
     Parse { line: usize, reason: String },
     /// Entry has neither `nonce` nor `h_milli`, or both.
     Ambiguous { line: usize },
-    /// Nonce-ref entry but no `--manifest` topology supplied.
+    /// Nonce-ref entry but no `--topology` spec supplied.
     MissingTopology { line: usize },
     /// Nonce hex not 32 bytes.
     BadNonce { line: usize },
     /// `draw_ising_milli` rejected the topology.
     Draw { line: usize, reason: String },
+    /// A topology-spec `edges` endpoint is not a known node id.
+    TopologyEdgeUnknownNode { edge_index: usize, node: u32 },
 }
 
 impl std::fmt::Display for SourceError {
@@ -69,11 +77,15 @@ impl std::fmt::Display for SourceError {
             Self::MissingTopology { line } => {
                 write!(
                     f,
-                    "line {line}: nonce-ref entry requires --manifest topology"
+                    "line {line}: nonce-ref entry requires --topology topology spec"
                 )
             }
             Self::BadNonce { line } => write!(f, "line {line}: nonce must be 32 bytes hex"),
             Self::Draw { line, reason } => write!(f, "line {line}: draw failed: {reason}"),
+            Self::TopologyEdgeUnknownNode { edge_index, node } => write!(
+                f,
+                "topology spec: edge {edge_index} references unknown node id {node}"
+            ),
         }
     }
 }
@@ -208,32 +220,56 @@ fn build_nonce(
     })
 }
 
+/// Coordinator `topology.spec.json` shape: `nodes` are native (possibly
+/// sparse) ids in received order; `edges` reference those ids, not positions.
 #[derive(Debug, Deserialize)]
-struct ManifestJson {
-    n_nodes: usize,
-    n_edges: usize,
+struct TopologySpecJson {
+    nodes: Vec<u32>,
+    #[serde(default)]
+    edges: Vec<(u32, u32)>,
     allowed_h_milli: Vec<i32>,
     allowed_j_milli: Vec<i32>,
-    edges: Vec<(usize, usize)>,
 }
 
-/// Parse A's `manifest.json` into a [`Topology`] for nonce redraws.
+/// Parse a coordinator `topology.spec.json` document into a [`Topology`] for
+/// nonce redraws, resolving `edges`' native node ids to dense positions (id →
+/// index in `nodes`' received order), matching the coordinator's own
+/// `TopologyCache` resolution so sparse ids (e.g. D-Wave qubits) work.
 ///
-/// **Open coupling (keep-and-flag):** the exact field names are owned by
-/// sub-project A (`10-plan-coordinator-download.md`). If A's emitted schema
-/// differs (e.g. `topology.allowed_h`), adjust [`ManifestJson`]'s field names
-/// / add `#[serde(rename = "...")]` to match once A lands.
-pub fn topology_from_manifest_json(text: &str) -> Result<Topology, SourceError> {
-    let m: ManifestJson = serde_json::from_str(text).map_err(|e| SourceError::Parse {
+/// # Errors
+///
+/// Returns [`SourceError::Parse`] on invalid JSON or
+/// [`SourceError::TopologyEdgeUnknownNode`] if an edge references a node id
+/// absent from `nodes`.
+pub fn parse_topology_spec(text: &str) -> Result<Topology, SourceError> {
+    let spec: TopologySpecJson = serde_json::from_str(text).map_err(|e| SourceError::Parse {
         line: 0,
         reason: e.to_string(),
     })?;
+    let pos: HashMap<u32, usize> = spec
+        .nodes
+        .iter()
+        .enumerate()
+        .map(|(i, &node)| (node, i))
+        .collect();
+    let mut edges = Vec::with_capacity(spec.edges.len());
+    for (edge_index, &(u, v)) in spec.edges.iter().enumerate() {
+        let pu = *pos.get(&u).ok_or(SourceError::TopologyEdgeUnknownNode {
+            edge_index,
+            node: u,
+        })?;
+        let pv = *pos.get(&v).ok_or(SourceError::TopologyEdgeUnknownNode {
+            edge_index,
+            node: v,
+        })?;
+        edges.push((pu, pv));
+    }
     Ok(Topology {
-        n_nodes: m.n_nodes,
-        n_edges: m.n_edges,
-        allowed_h_milli: m.allowed_h_milli,
-        allowed_j_milli: m.allowed_j_milli,
-        edges: m.edges,
+        n_nodes: spec.nodes.len(),
+        n_edges: edges.len(),
+        allowed_h_milli: spec.allowed_h_milli,
+        allowed_j_milli: spec.allowed_j_milli,
+        edges,
     })
 }
 
@@ -304,16 +340,74 @@ mod tests {
     }
 
     #[test]
-    fn manifest_json_round_trips_into_topology() {
+    fn topology_spec_json_round_trips_into_topology() {
         let json = r#"{
-            "n_nodes": 4,
-            "n_edges": 3,
+            "nodes": [0, 1, 2, 3],
+            "edges": [[0,1],[1,2],[2,3]],
             "allowed_h_milli": [-1000, 1000],
-            "allowed_j_milli": [-1000, 1000],
-            "edges": [[0,1],[1,2],[2,3]]
+            "allowed_j_milli": [-1000, 1000]
         }"#;
-        let topo = topology_from_manifest_json(json).expect("parse manifest");
+        let topo = parse_topology_spec(json).expect("parse topology spec");
         assert_eq!(topo.n_nodes, 4);
+        assert_eq!(topo.n_edges, 3);
         assert_eq!(topo.edges, vec![(0, 1), (1, 2), (2, 3)]);
+    }
+
+    #[test]
+    fn topology_spec_resolves_sparse_native_node_ids_to_positions() {
+        // D-Wave-style sparse ids: edges reference ids, not array positions.
+        let json = r#"{
+            "nodes": [0, 12, 2400],
+            "edges": [[0, 12], [12, 2400]],
+            "allowed_h_milli": [-1000, 0, 1000],
+            "allowed_j_milli": [-1000, 1000]
+        }"#;
+        let topo = parse_topology_spec(json).expect("parse topology spec");
+        assert_eq!(topo.n_nodes, 3);
+        // Ids 0, 12, 2400 map to positions 0, 1, 2 in received order.
+        assert_eq!(topo.edges, vec![(0, 1), (1, 2)]);
+    }
+
+    #[test]
+    fn topology_spec_rejects_edge_with_unknown_node_id() {
+        let json = r#"{
+            "nodes": [0, 1],
+            "edges": [[0, 5]],
+            "allowed_h_milli": [1000],
+            "allowed_j_milli": [1000]
+        }"#;
+        let err = parse_topology_spec(json).unwrap_err();
+        assert!(matches!(
+            err,
+            SourceError::TopologyEdgeUnknownNode {
+                edge_index: 0,
+                node: 5
+            }
+        ));
+    }
+
+    #[test]
+    fn topology_spec_extra_keys_are_ignored() {
+        // Real instances.jsonl lines carry extra keys (topology_hash,
+        // energy_milli, ...); the corpus EntryJson must ignore them too.
+        let dir = std::env::temp_dir().join(format!("quipextra-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("nonce.jsonl");
+        writeln!(
+            std::fs::File::create(&p).unwrap(),
+            r#"{{"nonce":"{}","topology_hash":"deadbeef","energy_milli":-1000,"salt_hex":"aa","qblock_id":1}}"#,
+            "00".repeat(32)
+        )
+        .unwrap();
+        let topo = Topology {
+            n_nodes: 2,
+            n_edges: 1,
+            allowed_h_milli: vec![-1000, 1000],
+            allowed_j_milli: vec![-1000, 1000],
+            edges: vec![(0, 1)],
+        };
+        let specs = from_jsonl(&p, Some(&topo)).expect("redraw ignoring extra keys");
+        assert_eq!(specs.len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

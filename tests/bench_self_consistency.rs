@@ -28,6 +28,7 @@ fn synthetic_bench_report_is_self_consistent() {
         warmup: 2,
         iters: 5,
         out_dir: dir.clone(),
+        limit: None,
     };
     run_bench(&args).expect("bench run");
 

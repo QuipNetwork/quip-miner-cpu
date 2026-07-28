@@ -61,13 +61,21 @@ be attributed to each annealing seam instead of only the whole-model total.
 
 ```sh
 quip-cpu-bench --nodes 512 --edges 2048 --iters 5 --out-dir bench-out
-# or against a corpus JSONL (nonce-refs need --manifest for the topology):
-quip-cpu-bench --source instances.jsonl --manifest manifest.json --out-dir bench-out
+# or against a coordinator corpus (nonce-refs need --topology for the topology):
+quip-cpu-bench --source instances.jsonl --topology topology.spec.json --out-dir bench-out
 ```
 
+`--source` is the coordinator's `instances.jsonl` (one JSON object per line,
+keyed on `nonce`; unrelated keys ride along and are ignored). `--topology` is
+the coordinator's `topology.spec.json`
+(`{nodes, edges, allowed_h_milli, allowed_j_milli}`); each nonce-ref entry is
+redrawn against it via `quip_protocol::chacha8::draw_ising_milli`. `--limit K`
+benches only the first `K` corpus models.
+
 Flags: `--algorithm sa|gibbs`, `--nodes`/`--edges` (synthetic model) or
-`--source`/`--manifest` (corpus JSONL), `--num-reads`, `--num-sweeps`,
-`--sweeps-per-beta`, `--seed`, `--warmup`, `--iters`, `--out-dir`.
+`--source`/`--topology`/`--limit` (corpus JSONL), `--num-reads`,
+`--num-sweeps`, `--sweeps-per-beta`, `--seed`, `--warmup`, `--iters`,
+`--out-dir`.
 
 Each model writes `<out_dir>/<model_id>.json` and `<out_dir>/<model_id>.folded`:
 

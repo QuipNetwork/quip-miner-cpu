@@ -38,9 +38,13 @@ struct Cli {
     /// Corpus JSONL path (mutually exclusive with --nodes).
     #[arg(long)]
     source: Option<PathBuf>,
-    /// Manifest JSON supplying topology for nonce-ref corpus entries.
+    /// Coordinator `topology.spec.json` supplying topology for nonce-ref
+    /// corpus entries.
     #[arg(long)]
-    manifest: Option<PathBuf>,
+    topology: Option<PathBuf>,
+    /// Bench only the first K corpus models.
+    #[arg(long)]
+    limit: Option<usize>,
     /// Reads per sample call.
     #[arg(long, default_value_t = 64)]
     num_reads: usize,
@@ -72,7 +76,7 @@ fn source_kind(cli: &Cli) -> Result<SourceKind, String> {
         }),
         (None, Some(p)) => Ok(SourceKind::Corpus {
             path: p.clone(),
-            manifest: cli.manifest.clone(),
+            topology: cli.topology.clone(),
         }),
         (None, None) => Err("provide --nodes (synthetic) or --source (corpus)".into()),
         (Some(_), Some(_)) => Err("--nodes and --source are mutually exclusive".into()),
@@ -98,6 +102,7 @@ fn main() -> ExitCode {
         warmup: cli.warmup,
         iters: cli.iters,
         out_dir: cli.out_dir,
+        limit: cli.limit,
     };
     match run_bench(&args) {
         Ok(()) => ExitCode::SUCCESS,
