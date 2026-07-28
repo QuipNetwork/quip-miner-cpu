@@ -294,10 +294,11 @@ pub fn sample_ising(
                 .wrapping_add(read_idx as u64)
                 .wrapping_add(1);
             let mut rng = SmallRng::seed_from_u64(seed);
-            let (spins, _accepts) = {
+            let (spins, accepts) = {
                 let _s = info_span!("anneal_read").entered();
                 anneal_one_read(&cpu, &beta_schedule, sweeps_per, algorithm, &mut rng)
             };
+            crate::bench::timing::record_accepts(accepts);
             let _s = info_span!("score").entered();
             score_spins(&spins, graph)
         })
