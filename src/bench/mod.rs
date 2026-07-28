@@ -194,6 +194,56 @@ pub fn run_bench(args: &BenchArgs) -> Result<(), BenchError> {
     Ok(())
 }
 
+/// A `tracing::Subscriber` that always wants every callsite, with no-op
+/// behavior otherwise. See [`ensure_always_interested_global_default`].
+struct AlwaysInterested;
+
+impl tracing::Subscriber for AlwaysInterested {
+    fn register_callsite(&self, _: &tracing::Metadata<'_>) -> tracing::subscriber::Interest {
+        tracing::subscriber::Interest::always()
+    }
+
+    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+    fn event(&self, _: &tracing::Event<'_>) {}
+
+    fn enter(&self, _: &tracing::span::Id) {}
+
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
+/// Install [`AlwaysInterested`] as the process-wide global default subscriber,
+/// once.
+///
+/// `tracing`'s per-callsite `Interest` cache is process-global and lazily set
+/// on a callsite's first-ever use: whichever thread hits a span macro first
+/// asks the *currently active* dispatcher (thread-local `with_default` if set,
+/// else the global default) and caches the answer for the rest of the
+/// process. With no global default, that fallback is a no-op subscriber that
+/// answers `Interest::never()` — so if an unrelated concurrently-running test
+/// (no `with_default` of its own) happens to be the first to touch a seam span
+/// like `anneal_read`, that span is permanently cached as "never wanted",
+/// silently dropping it for every later `with_default` subscriber in the
+/// process, including this crate's own bench harness. Setting an
+/// always-interested global default closes that gap: every callsite's
+/// first-touch interest becomes `Always`, so recording still correctly
+/// depends on whichever dispatcher is thread-locally active when the span is
+/// actually created. `set_global_default` only succeeds once per process; a
+/// later call here is a harmless no-op.
+pub(crate) fn ensure_always_interested_global_default() {
+    let _ = tracing::subscriber::set_global_default(AlwaysInterested);
+}
+
 /// Run `f` under a subscriber that both aggregates per-part busy-time and writes
 /// `tracing-flame` folded stacks to `folded_path`. The subscriber is installed
 /// only for the duration of `f` (`with_default`), so it never leaks into other
@@ -203,6 +253,7 @@ pub fn run_instrumented<R>(
     folded_path: &Path,
     f: impl FnOnce() -> R,
 ) -> Result<R, BenchError> {
+    ensure_always_interested_global_default();
     let (flame, guard) = tracing_flame::FlameLayer::with_file(folded_path)
         .map_err(|e| BenchError::Io(format!("open folded file {}: {e}", folded_path.display())))?;
     let timing = TimingLayer::new(Arc::clone(agg));

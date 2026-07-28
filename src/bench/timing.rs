@@ -128,6 +128,7 @@ mod tests {
 
     #[test]
     fn layer_accumulates_named_span_time_and_counts() {
+        crate::bench::ensure_always_interested_global_default();
         let agg = Arc::new(TimingAggregator::default());
         let layer = TimingLayer::new(Arc::clone(&agg));
         let subscriber = tracing_subscriber::registry().with(layer);

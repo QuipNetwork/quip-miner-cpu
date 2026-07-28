@@ -21,6 +21,8 @@ test:
     - rustup component add clippy
     - cargo test --release
     - cargo clippy --release --all-targets -- -D warnings
+    - cargo test --release --features fine-spans
+    - cargo clippy --release --all-targets --features fine-spans -- -D warnings
 
 .build:
   stage: build

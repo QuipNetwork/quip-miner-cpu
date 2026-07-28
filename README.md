@@ -14,6 +14,7 @@ reads are sequential and cache-local. Energies are scored with the canonical
 |--------|-----------|
 | `quip-cpu-sa` | simulated annealing (Metropolis) |
 | `quip-cpu-gibbs` | single-site heat-bath Gibbs |
+| `quip-cpu-bench` | per-part timing harness (see [Benchmarking](#benchmarking)) |
 
 Prebuilt `amd64`/`arm64` binaries are attached to each
 [Release](https://gitlab.com/quip.network/quip-miner-cpu/-/releases).
@@ -51,6 +52,45 @@ quip-coordinator drive --miner ./quip-cpu-sa \
 quip-cpu-sa --capabilities   # capabilities JSON
 quip-cpu-sa --check          # probe the backend is runnable
 ```
+
+## Benchmarking
+
+`quip-cpu-bench` runs a model through the sampler under a `tracing` subscriber
+and emits per-part timing plus a flame graph, so the sampler's time budget can
+be attributed to each annealing seam instead of only the whole-model total.
+
+```sh
+quip-cpu-bench --nodes 512 --edges 2048 --iters 5 --out-dir bench-out
+# or against a corpus JSONL (nonce-refs need --manifest for the topology):
+quip-cpu-bench --source instances.jsonl --manifest manifest.json --out-dir bench-out
+```
+
+Flags: `--algorithm sa|gibbs`, `--nodes`/`--edges` (synthetic model) or
+`--source`/`--manifest` (corpus JSONL), `--num-reads`, `--num-sweeps`,
+`--sweeps-per-beta`, `--seed`, `--warmup`, `--iters`, `--out-dir`.
+
+Each model writes `<out_dir>/<model_id>.json` and `<out_dir>/<model_id>.folded`:
+
+- `schema_version` — bump signals a JSON shape change.
+- `parts[]` — one entry per traced span (`part`, `scope`, `total_ns`, `count`,
+  `per_call_ns`, `source`). `scope` is `"top_level"` for the four
+  non-overlapping seams (`cpu_graph_build`, `beta_schedule`, `anneal_read`,
+  `score`) summed into `residual_ns`, or `"nested"` for `anneal_read`'s
+  children (`random_spins`, `seed_heff`, `sweep_loop`), reported for the flame
+  view but excluded from that sum.
+- `derived` — `per_spin_ns` and `accept_rate` computed as aggregate ÷
+  frequency (`sweep_loop.total_ns` ÷ spin visits), plus `sweep_loop_ns_per_read`.
+- `residual_ns`/`residual_frac` — `measured_model_ns` minus the summed
+  top-level parts; a large fraction signals a missing seam.
+- `<model_id>.folded` — `tracing-flame` folded stacks; render with
+  `inferno-flamegraph < model.folded > model.svg`.
+
+The headline JSON uses coarse, always-on seam spans (negligible overhead —
+entered O(reads) times per model). `--features fine-spans` also spans every
+spin decision and accepted flip inside the hot loop, for a diagnostic
+cross-check. That build measurably distorts absolute timing, so headline
+numbers never use it. Optional external cross-check:
+`cargo flamegraph --bin quip-cpu-bench -- --nodes 512 --edges 2048`.
 
 ## Tests
 
