@@ -19,6 +19,7 @@ use quip_miner_core::{Algorithm, IsingGraph, SampleParams, SamplerResult};
 use quip_protocol::scoring::energy_milli;
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
+use tracing::{info_span, trace_span};
 
 /// Per-variable neighbor lists in CSR layout for O(degree) local fields.
 ///
@@ -172,11 +173,14 @@ fn anneal_one_read(
     sweeps_per_beta: usize,
     algorithm: Algorithm,
     rng: &mut SmallRng,
-) -> Vec<i8> {
+) -> (Vec<i8>, u64) {
     let n = graph.num_nodes();
-    let mut spins = random_spins(n, rng);
+    let mut spins = {
+        let _s = trace_span!("random_spins").entered();
+        random_spins(n, rng)
+    };
     if n == 0 {
-        return spins;
+        return (spins, 0);
     }
 
     // Incremental effective-field cache: `heff[var]` stays equal to
@@ -193,8 +197,13 @@ fn anneal_one_read(
     // the incremental path runs in production, so the live accept/reject RNG
     // stream stays self-consistent, but results are not bit-for-bit identical to
     // a recompute-every-flip implementation.
-    let mut heff: Vec<f64> = (0..n).map(|v| effective_field(v, &spins, graph)).collect();
+    let mut heff: Vec<f64> = {
+        let _s = trace_span!("seed_heff").entered();
+        (0..n).map(|v| effective_field(v, &spins, graph)).collect()
+    };
 
+    let mut accepts: u64 = 0;
+    let _sweep = trace_span!("sweep_loop").entered();
     match algorithm {
         Algorithm::Sa => {
             for &beta in beta_schedule {
@@ -205,6 +214,7 @@ fn anneal_one_read(
                         if metropolis_accept(delta, beta, rng) {
                             spins[var] = -spins[var];
                             apply_field_delta(graph, &mut heff, var, -2.0 * s);
+                            accepts += 1;
                         }
                     }
                 }
@@ -219,13 +229,14 @@ fn anneal_one_read(
                             let ds = spin_sign(new) - spin_sign(spins[var]);
                             spins[var] = new;
                             apply_field_delta(graph, &mut heff, var, ds);
+                            accepts += 1;
                         }
                     }
                 }
             }
         }
     }
-    spins
+    (spins, accepts)
 }
 
 fn score_spins(spins: &[i8], graph: &IsingGraph) -> SamplerResult {
@@ -264,8 +275,14 @@ pub fn sample_ising(
     algorithm: Algorithm,
 ) -> Vec<SamplerResult> {
     let num_reads = params.num_reads.max(1);
-    let cpu = CpuGraph::from_base(graph);
-    let beta_schedule = build_beta_schedule(graph, params);
+    let cpu = {
+        let _s = info_span!("cpu_graph_build").entered();
+        CpuGraph::from_base(graph)
+    };
+    let beta_schedule = {
+        let _s = info_span!("beta_schedule").entered();
+        build_beta_schedule(graph, params)
+    };
     let sweeps_per = params.sweeps_per_beta.max(1);
     let base_seed = params.seed;
 
@@ -277,7 +294,11 @@ pub fn sample_ising(
                 .wrapping_add(read_idx as u64)
                 .wrapping_add(1);
             let mut rng = SmallRng::seed_from_u64(seed);
-            let spins = anneal_one_read(&cpu, &beta_schedule, sweeps_per, algorithm, &mut rng);
+            let (spins, _accepts) = {
+                let _s = info_span!("anneal_read").entered();
+                anneal_one_read(&cpu, &beta_schedule, sweeps_per, algorithm, &mut rng)
+            };
+            let _s = info_span!("score").entered();
             score_spins(&spins, graph)
         })
         .collect()
@@ -409,6 +430,27 @@ mod tests {
                 "heff[{i}] diverged from effective_field: cached={cached} recompute={want} (spins={spins:?})",
             );
         }
+    }
+
+    #[test]
+    fn anneal_returns_accept_count_within_bounds() {
+        let g = mixed4();
+        let cpu = CpuGraph::from_base(&g);
+        let params = SampleParams {
+            num_reads: 1,
+            num_sweeps: 32,
+            seed: 3,
+            ..Default::default()
+        };
+        let betas = build_beta_schedule(&g, &params);
+        let sweeps_per = params.sweeps_per_beta.max(1);
+        let mut rng = SmallRng::seed_from_u64(9);
+        let (spins, accepts) =
+            anneal_one_read(&cpu, &betas, sweeps_per, Algorithm::Sa, &mut rng);
+        assert_eq!(spins.len(), cpu.num_nodes());
+        // At most one accept per spin visit.
+        let visits = (betas.len() * sweeps_per * cpu.num_nodes()) as u64;
+        assert!(accepts <= visits, "accepts {accepts} exceeded visits {visits}");
     }
 
     #[test]
