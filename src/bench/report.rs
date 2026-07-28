@@ -122,13 +122,22 @@ fn saturating_u64(v: u128) -> u64 {
 }
 
 /// Compute derived metrics from the model shape and a timing snapshot.
+///
+/// `iters` is the number of measured `sample_ising` calls folded into `snap`
+/// and `accepts` (a bench run repeats the model `iters` times and the
+/// aggregator sums across all of them, so the visit count must scale by
+/// `iters` too or `accept_rate` could read above 1.0). Pass `1` for a
+/// single-call snapshot (e.g. the Task 4 unit tests below).
 #[must_use]
 pub fn derive_metrics(
     desc: &ModelDescriptor,
     snap: &BTreeMap<String, PartAccum>,
     accepts: u64,
+    iters: usize,
 ) -> DerivedMetrics {
-    let spin_visits = (desc.num_reads as u64)
+    let iters = iters.max(1) as u64;
+    let reads_total = (desc.num_reads as u64).saturating_mul(iters);
+    let spin_visits = reads_total
         .saturating_mul(desc.num_betas as u64)
         .saturating_mul(desc.sweeps_per_beta as u64)
         .saturating_mul(desc.n_nodes as u64);
@@ -143,8 +152,8 @@ pub fn derive_metrics(
     } else {
         0.0
     };
-    let sweep_loop_ns_per_read = if desc.num_reads > 0 {
-        sweep_total as f64 / desc.num_reads as f64
+    let sweep_loop_ns_per_read = if reads_total > 0 {
+        sweep_total as f64 / reads_total as f64
     } else {
         0.0
     };
@@ -166,8 +175,8 @@ pub fn residual(measured_ns: u64, parts: &[PartTiming], top_level: &[&str]) -> (
         .filter(|p| top_level.contains(&p.part.as_str()))
         .map(|p| p.total_ns)
         .sum();
-    let res = i64::try_from(measured_ns).unwrap_or(i64::MAX)
-        - i64::try_from(summed).unwrap_or(i64::MAX);
+    let res =
+        i64::try_from(measured_ns).unwrap_or(i64::MAX) - i64::try_from(summed).unwrap_or(i64::MAX);
     let frac = if measured_ns > 0 {
         res as f64 / measured_ns as f64
     } else {
@@ -233,7 +242,7 @@ pub fn build_report(
             }
         })
         .collect();
-    let derived = derive_metrics(&model, snap, accepts);
+    let derived = derive_metrics(&model, snap, accepts, iters);
     let (residual_ns, residual_frac) = residual(measured_model_ns, &parts, &TOP_LEVEL_PARTS);
     BenchReport {
         schema_version: SCHEMA_VERSION,
@@ -300,7 +309,7 @@ mod tests {
         let mut snap = BTreeMap::new();
         snap.insert("sweep_loop".to_owned(), accum(1_200_000, 2)); // 1.2 ms over 2 reads
         snap.insert("anneal_read".to_owned(), accum(1_400_000, 2));
-        let derived = derive_metrics(&desc, &snap, /* accepts= */ 60);
+        let derived = derive_metrics(&desc, &snap, /* accepts= */ 60, /* iters= */ 1);
         assert_eq!(derived.spin_visits, 120);
         // per_spin = sweep_loop_total / visits = 1_200_000 / 120 = 10_000 ns.
         assert!((derived.per_spin_ns - 10_000.0).abs() < 1e-6);
@@ -309,6 +318,31 @@ mod tests {
         // sweep_loop_ns_per_read = 600_000.
         assert!((derived.sweep_loop_ns_per_read - 600_000.0).abs() < 1e-6);
         assert!(derived.per_flip_ns.is_none());
+    }
+
+    #[test]
+    fn spin_visits_scale_with_iters_so_accept_rate_stays_bounded() {
+        // A bench run repeats one read/beta/sweep/node model 3 times; the
+        // aggregator's snapshot and accepts sum over all 3 measured calls, so
+        // spin_visits must scale by iters or accept_rate would exceed 1.0.
+        let desc = ModelDescriptor {
+            model_id: "m".into(),
+            n_nodes: 4,
+            n_edges: 3,
+            num_reads: 2,
+            num_betas: 2,
+            sweeps_per_beta: 1,
+            seed: 0,
+        };
+        let iters = 3;
+        let single_call_visits = 2u64 * 2 * 4; // reads * betas * sweeps_per_beta(1, elided) * nodes = 16
+        let mut snap = BTreeMap::new();
+        snap.insert("sweep_loop".to_owned(), accum(1_000, (iters as u64) * 2));
+        // Max possible accepts across 3 calls: iters * single_call_visits.
+        let accepts = (iters as u64) * single_call_visits;
+        let derived = derive_metrics(&desc, &snap, accepts, iters);
+        assert_eq!(derived.spin_visits, (iters as u64) * single_call_visits);
+        assert!((derived.accept_rate - 1.0).abs() < 1e-12);
     }
 
     fn part(name: &str, total_ns: u64) -> PartTiming {
@@ -381,12 +415,16 @@ mod tests {
         // Model: ns = a*visits + b*accepts, a=10, b=40. Build 4 rows.
         let a = 10.0;
         let b = 40.0;
-        let rows: Vec<(f64, f64, f64)> = [(100.0, 20.0), (100.0, 60.0), (200.0, 40.0), (200.0, 120.0)]
-            .iter()
-            .map(|&(v, acc)| (v, acc, a * v + b * acc))
-            .collect();
+        let rows: Vec<(f64, f64, f64)> =
+            [(100.0, 20.0), (100.0, 60.0), (200.0, 40.0), (200.0, 120.0)]
+                .iter()
+                .map(|&(v, acc)| (v, acc, a * v + b * acc))
+                .collect();
         let per_flip = fit_per_flip(&rows).expect("fit");
-        assert!((per_flip - 40.0).abs() < 1e-6, "recovered per_flip = {per_flip}");
+        assert!(
+            (per_flip - 40.0).abs() < 1e-6,
+            "recovered per_flip = {per_flip}"
+        );
     }
 
     #[test]

@@ -61,10 +61,16 @@ impl std::fmt::Display for SourceError {
             Self::Io(m) => write!(f, "read corpus: {m}"),
             Self::Parse { line, reason } => write!(f, "line {line}: {reason}"),
             Self::Ambiguous { line } => {
-                write!(f, "line {line}: entry needs exactly one of `nonce` or `h_milli`")
+                write!(
+                    f,
+                    "line {line}: entry needs exactly one of `nonce` or `h_milli`"
+                )
             }
             Self::MissingTopology { line } => {
-                write!(f, "line {line}: nonce-ref entry requires --manifest topology")
+                write!(
+                    f,
+                    "line {line}: nonce-ref entry requires --manifest topology"
+                )
             }
             Self::BadNonce { line } => write!(f, "line {line}: nonce must be 32 bytes hex"),
             Self::Draw { line, reason } => write!(f, "line {line}: draw failed: {reason}"),
@@ -98,7 +104,9 @@ fn parse_nonce(hex: &str, line: usize) -> Result<[u8; 32], SourceError> {
     }
     let mut out = [0u8; 32];
     for (i, byte) in out.iter_mut().enumerate() {
-        let s = hex.get(i * 2..i * 2 + 2).ok_or(SourceError::BadNonce { line })?;
+        let s = hex
+            .get(i * 2..i * 2 + 2)
+            .ok_or(SourceError::BadNonce { line })?;
         *byte = u8::from_str_radix(s, 16).map_err(|_| SourceError::BadNonce { line })?;
     }
     Ok(out)
@@ -140,8 +148,10 @@ pub fn from_jsonl(path: &Path, topology: Option<&Topology>) -> Result<Vec<ModelS
         if raw.is_empty() {
             continue;
         }
-        let e: EntryJson =
-            serde_json::from_str(raw).map_err(|err| SourceError::Parse { line, reason: err.to_string() })?;
+        let e: EntryJson = serde_json::from_str(raw).map_err(|err| SourceError::Parse {
+            line,
+            reason: err.to_string(),
+        })?;
         let has_nonce = e.nonce.is_some();
         let has_explicit = e.h_milli.is_some();
         let spec = match (has_nonce, has_explicit) {
@@ -159,12 +169,19 @@ fn build_explicit(e: &EntryJson, line: usize) -> ModelSpec {
     let j = milli_to_unit(e.j_milli.as_deref().unwrap_or(&[]));
     let edges = e.edges.clone().unwrap_or_default();
     ModelSpec {
-        model_id: e.model_id.clone().unwrap_or_else(|| format!("explicit-{line}")),
+        model_id: e
+            .model_id
+            .clone()
+            .unwrap_or_else(|| format!("explicit-{line}")),
         graph: IsingGraph::new(h, j, edges),
     }
 }
 
-fn build_nonce(e: &EntryJson, topology: Option<&Topology>, line: usize) -> Result<ModelSpec, SourceError> {
+fn build_nonce(
+    e: &EntryJson,
+    topology: Option<&Topology>,
+    line: usize,
+) -> Result<ModelSpec, SourceError> {
     let topo = topology.ok_or(SourceError::MissingTopology { line })?;
     let nonce = parse_nonce(e.nonce.as_deref().unwrap_or(""), line)?;
     let (h_milli, j_milli) = draw_ising_milli(
@@ -174,10 +191,20 @@ fn build_nonce(e: &EntryJson, topology: Option<&Topology>, line: usize) -> Resul
         &topo.allowed_h_milli,
         &topo.allowed_j_milli,
     )
-    .map_err(|err| SourceError::Draw { line, reason: err.to_string() })?;
+    .map_err(|err| SourceError::Draw {
+        line,
+        reason: err.to_string(),
+    })?;
     Ok(ModelSpec {
-        model_id: e.model_id.clone().unwrap_or_else(|| format!("nonce-{line}")),
-        graph: IsingGraph::new(milli_to_unit(&h_milli), milli_to_unit(&j_milli), topo.edges.clone()),
+        model_id: e
+            .model_id
+            .clone()
+            .unwrap_or_else(|| format!("nonce-{line}")),
+        graph: IsingGraph::new(
+            milli_to_unit(&h_milli),
+            milli_to_unit(&j_milli),
+            topo.edges.clone(),
+        ),
     })
 }
 
@@ -197,8 +224,10 @@ struct ManifestJson {
 /// differs (e.g. `topology.allowed_h`), adjust [`ManifestJson`]'s field names
 /// / add `#[serde(rename = "...")]` to match once A lands.
 pub fn topology_from_manifest_json(text: &str) -> Result<Topology, SourceError> {
-    let m: ManifestJson =
-        serde_json::from_str(text).map_err(|e| SourceError::Parse { line: 0, reason: e.to_string() })?;
+    let m: ManifestJson = serde_json::from_str(text).map_err(|e| SourceError::Parse {
+        line: 0,
+        reason: e.to_string(),
+    })?;
     Ok(Topology {
         n_nodes: m.n_nodes,
         n_edges: m.n_edges,
@@ -228,7 +257,11 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("explicit.jsonl");
         let mut f = std::fs::File::create(&p).unwrap();
-        writeln!(f, r#"{{"model_id":"x","h_milli":[500,-500],"j_milli":[-1000],"edges":[[0,1]]}}"#).unwrap();
+        writeln!(
+            f,
+            r#"{{"model_id":"x","h_milli":[500,-500],"j_milli":[-1000],"edges":[[0,1]]}}"#
+        )
+        .unwrap();
         let specs = from_jsonl(&p, None).expect("parse");
         assert_eq!(specs.len(), 1);
         assert_eq!(specs[0].model_id, "x");

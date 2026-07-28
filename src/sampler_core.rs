@@ -446,12 +446,14 @@ mod tests {
         let betas = build_beta_schedule(&g, &params);
         let sweeps_per = params.sweeps_per_beta.max(1);
         let mut rng = SmallRng::seed_from_u64(9);
-        let (spins, accepts) =
-            anneal_one_read(&cpu, &betas, sweeps_per, Algorithm::Sa, &mut rng);
+        let (spins, accepts) = anneal_one_read(&cpu, &betas, sweeps_per, Algorithm::Sa, &mut rng);
         assert_eq!(spins.len(), cpu.num_nodes());
         // At most one accept per spin visit.
         let visits = (betas.len() * sweeps_per * cpu.num_nodes()) as u64;
-        assert!(accepts <= visits, "accepts {accepts} exceeded visits {visits}");
+        assert!(
+            accepts <= visits,
+            "accepts {accepts} exceeded visits {visits}"
+        );
     }
 
     #[test]
