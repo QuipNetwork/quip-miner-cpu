@@ -7,6 +7,7 @@
 //! The coordinator session loop lives in `quip-miner-core`; this crate provides
 //! the [`CpuSampler`] backend and the two binaries.
 
+pub mod bench;
 pub mod sampler_core;
 
 pub use quip_miner_core::{Algorithm, IsingGraph, SampleParams, SamplerResult};
