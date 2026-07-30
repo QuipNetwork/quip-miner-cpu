@@ -96,12 +96,34 @@ impl Sampler for CpuSampler {
         Ok(sample_ising(graph, params, self.algorithm))
     }
 
-    /// One model per core: `sample`'s reads are sequential and cache-local, so
-    /// throughput comes from running `stream_width` models concurrently, each
+    /// Concurrent models to run. `sample`'s reads are sequential and cache-local,
+    /// so throughput comes from running `stream_width` models concurrently, each
     /// pinned to a worker thread. Fanning a single model's reads across cores
     /// bounced the shared arrays' cache lines and measured slower.
+    ///
+    /// SA is one model per core. Gibbs is ~4x heavier per model (its heat-bath
+    /// resample is memory-bound and it runs 2x the sweeps), so one model per core
+    /// oversubscribes memory bandwidth and the miner dies under sustained load;
+    /// cap Gibbs at `cores / 4` (budgeting ~4 cores of headroom per model).
+    ///
+    /// `QUIP_CPU_STREAM_WIDTH` overrides the count. Prefer it over pinning the
+    /// process with `taskset` to bound concurrency: `taskset` also shrinks the
+    /// tokio runtime that drains results over gRPC, and a CPU-starved drain
+    /// stalls the workers on `out.blocking_send`. The env var caps the worker
+    /// pool while leaving every core visible to tokio.
     fn stream_width(&self) -> usize {
-        std::thread::available_parallelism().map_or(1, |n| n.get())
+        if let Some(n) = std::env::var("QUIP_CPU_STREAM_WIDTH")
+            .ok()
+            .and_then(|w| w.parse::<usize>().ok())
+            .filter(|&n| n >= 1)
+        {
+            return n;
+        }
+        let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+        match self.algorithm {
+            Algorithm::Gibbs => (cores / 4).max(1),
+            _ => cores,
+        }
     }
 
     fn sample_stream(
