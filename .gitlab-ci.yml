@@ -15,6 +15,26 @@ cache:
   key: cargo-$CI_COMMIT_REF_SLUG
   paths: [.cargo/, target/]
 
+# Apple Silicon runners (`macos`, `arm64`) are shell executors, so the default
+# `image:` does not apply and the default `before_script` (apt-get) would fail.
+# Both are overridden here.
+#
+# The cache key is deliberately different from the Linux one. `target/` holds
+# host-specific build artifacts, so sharing one key across operating systems
+# poisons both caches.
+.macos:
+  tags: [macos, arm64]
+  cache:
+    key: cargo-macos-$CI_COMMIT_REF_SLUG
+    paths: [.cargo/, target/]
+  before_script:
+    # `--no-modify-path` keeps rustup-init from appending `source $CARGO_HOME/env`
+    # to the runner's shell profile. `CARGO_HOME` is inside the build directory,
+    # so that line breaks every later login shell once the job is cleaned up.
+    - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.97.1 --no-modify-path
+    - source "$CARGO_HOME/env"
+    - brew install protobuf
+
 test:
   stage: test
   script:
@@ -28,15 +48,20 @@ test:
     paths: [dist/]
     expire_in: 1 week
 
-build-amd64:
+# Asset names carry both the operating system and the architecture. The earlier
+# scheme used the architecture alone, which cannot separate a Linux aarch64
+# binary from a Darwin arm64 one. An Apple Silicon host downloaded
+# `quip-cpu-sa-arm64`, received a Linux ELF, and only discovered the mismatch
+# when it tried to run the file.
+build-linux-amd64:
   extends: .build
   script:
     - cargo build --release --bins
     - mkdir -p dist
-    - cp target/release/quip-cpu-sa dist/quip-cpu-sa-amd64
-    - cp target/release/quip-cpu-gibbs dist/quip-cpu-gibbs-amd64
+    - cp target/release/quip-cpu-sa dist/quip-cpu-sa-linux-amd64
+    - cp target/release/quip-cpu-gibbs dist/quip-cpu-gibbs-linux-amd64
 
-build-arm64:
+build-linux-arm64:
   extends: .build
   script:
     - apt-get install -y -qq gcc-aarch64-linux-gnu
@@ -44,8 +69,20 @@ build-arm64:
     - export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
     - cargo build --release --bins --target aarch64-unknown-linux-gnu
     - mkdir -p dist
-    - cp target/aarch64-unknown-linux-gnu/release/quip-cpu-sa dist/quip-cpu-sa-arm64
-    - cp target/aarch64-unknown-linux-gnu/release/quip-cpu-gibbs dist/quip-cpu-gibbs-arm64
+    - cp target/aarch64-unknown-linux-gnu/release/quip-cpu-sa dist/quip-cpu-sa-linux-arm64
+    - cp target/aarch64-unknown-linux-gnu/release/quip-cpu-gibbs dist/quip-cpu-gibbs-linux-arm64
+
+# Tag only. The Apple Silicon runners are a shared and limited resource, and the
+# `test` job already proves the crate compiles on every pipeline.
+build-darwin-arm64:
+  extends: [.build, .macos]
+  rules:
+    - if: $CI_COMMIT_TAG
+  script:
+    - cargo build --release --bins
+    - mkdir -p dist
+    - cp target/release/quip-cpu-sa dist/quip-cpu-sa-darwin-arm64
+    - cp target/release/quip-cpu-gibbs dist/quip-cpu-gibbs-darwin-arm64
 
 # On a tag: upload every built binary to the generic package registry, then cut
 # a Release linking them as downloadable assets.
@@ -56,6 +93,16 @@ upload:
     - if: $CI_COMMIT_TAG
   before_script: []
   script:
+    # Three build jobs produce two binaries each. A short `dist/` means one of
+    # them failed or did not run, so stop here rather than publish a release
+    # that silently omits a platform.
+    - |
+      count=$(ls dist/ | wc -l)
+      if [ "$count" -ne 6 ]; then
+        echo "expected 6 binaries in dist/, found ${count}:" >&2
+        ls -la dist/ >&2
+        exit 1
+      fi
     - |
       for f in dist/*; do
         n=$(basename "$f")
@@ -74,7 +121,9 @@ release:
     - |
       base="${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/${PKG}/${CI_COMMIT_TAG}"
       release-cli create --name "quip-miner-cpu ${CI_COMMIT_TAG}" --tag-name "${CI_COMMIT_TAG}" \
-        --assets-link "{\"name\":\"quip-cpu-sa-amd64\",\"url\":\"${base}/quip-cpu-sa-amd64\"}" \
-        --assets-link "{\"name\":\"quip-cpu-gibbs-amd64\",\"url\":\"${base}/quip-cpu-gibbs-amd64\"}" \
-        --assets-link "{\"name\":\"quip-cpu-sa-arm64\",\"url\":\"${base}/quip-cpu-sa-arm64\"}" \
-        --assets-link "{\"name\":\"quip-cpu-gibbs-arm64\",\"url\":\"${base}/quip-cpu-gibbs-arm64\"}"
+        --assets-link "{\"name\":\"quip-cpu-sa-linux-amd64\",\"url\":\"${base}/quip-cpu-sa-linux-amd64\"}" \
+        --assets-link "{\"name\":\"quip-cpu-gibbs-linux-amd64\",\"url\":\"${base}/quip-cpu-gibbs-linux-amd64\"}" \
+        --assets-link "{\"name\":\"quip-cpu-sa-linux-arm64\",\"url\":\"${base}/quip-cpu-sa-linux-arm64\"}" \
+        --assets-link "{\"name\":\"quip-cpu-gibbs-linux-arm64\",\"url\":\"${base}/quip-cpu-gibbs-linux-arm64\"}" \
+        --assets-link "{\"name\":\"quip-cpu-sa-darwin-arm64\",\"url\":\"${base}/quip-cpu-sa-darwin-arm64\"}" \
+        --assets-link "{\"name\":\"quip-cpu-gibbs-darwin-arm64\",\"url\":\"${base}/quip-cpu-gibbs-darwin-arm64\"}"
