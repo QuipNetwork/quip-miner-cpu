@@ -247,13 +247,12 @@ fn draw_initial_conditions(m: usize, rng: &mut SmallRng) -> (Vec<Real>, Vec<Real
 /// The heating flag is a separate parameter rather than a read of
 /// `variant.gamma` so a test can force the heated path on a variant whose `γ`
 /// is zero. That equivalence is what makes the shipped discrete variant free of
-/// the heating cost while sharing one code path with the heated variants. It is
-/// named `_heated` until Task 6 gives it work.
+/// the heating cost while sharing one code path with the heated variants.
 fn sb_run(
     g: &SbGraph,
     n_step: usize,
     variant: SbVariant,
-    _heated: bool,
+    heated: bool,
     x: &mut [Real],
     y: &mut [Real],
 ) {
@@ -262,6 +261,9 @@ fn sb_run(
     // `g(x_j)` for every particle, refreshed once per step so the force reads
     // the OLD positions for every i.
     let mut coupled: Vec<Real> = vec![0.0; m];
+    // Momenta captured before the SB substep. Empty when the variant does not
+    // heat, so the unheated path pays neither the allocation nor the copy.
+    let mut y_pre: Vec<Real> = vec![0.0; if heated { m } else { 0 }];
 
     for k in 0..n_step {
         // `-(a0 - a(t_k))`, folded into one multiply.
@@ -274,6 +276,10 @@ fn sb_run(
                 }
             }
             Coupling::Continuous => coupled.copy_from_slice(x),
+        }
+
+        if heated {
+            y_pre.copy_from_slice(y);
         }
 
         // Momentum first, from the OLD positions. `J_uv = -j_uv` and
@@ -308,6 +314,17 @@ fn sb_run(
             } else if *xi < -1.0 {
                 *xi = -1.0;
                 *yi = 0.0;
+            }
+        }
+
+        // Kanao and Goto's heating: applied last, from the momentum captured
+        // before this step, so a particle the wall just stopped leaves with
+        // nonzero momentum. The `+γy` term is negative damping, so the
+        // equations are no longer Hamiltonian and plain symplectic Euler does
+        // not apply; this ordering is the one the paper tuned numerically.
+        if heated {
+            for (yi, &pre) in y.iter_mut().zip(y_pre.iter()) {
+                *yi += variant.gamma * pre * DT;
             }
         }
     }
@@ -384,6 +401,30 @@ pub fn sample_sb(
             }
         })
         .collect()
+}
+
+/// Test-only view of one read's final state, including the ancilla slot.
+/// Mirrors `sample_sb`'s read-0 path exactly: same seed derivation, same
+/// initial conditions, same heated-path selection. Plans 03 and 04 assert
+/// momenta and wall positions through this window; the name and signature
+/// are pinned across the qui-76 plan set.
+#[cfg(test)]
+pub(crate) fn sb_final_state_for_test(
+    graph: &IsingGraph,
+    params: &SampleParams,
+    variant: SbVariant,
+) -> (Vec<Real>, Vec<Real>) {
+    let sb = SbGraph::from_base(graph);
+    let m = sb.num_particles();
+    let n_step = params.num_sweeps.max(1);
+    let seed = params
+        .seed
+        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        .wrapping_add(1);
+    let mut rng = SmallRng::seed_from_u64(seed);
+    let (mut x, mut y) = draw_initial_conditions(m, &mut rng);
+    sb_run(&sb, n_step, variant, variant.gamma != 0.0, &mut x, &mut y);
+    (x, y)
 }
 
 #[cfg(test)]
@@ -602,6 +643,106 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Hypothesis (Kanao and Goto): the heating increment is applied after the
+    /// wall clip and reads the momentum from before the step, so a particle the
+    /// wall just stopped leaves the step moving. Plain SB leaves it at exactly
+    /// zero. That difference is the whole mechanism by which the heated
+    /// variants re-escape local optima that plain SB freezes into.
+    ///
+    /// Both particles start just short of the +1 wall with outward momentum, so
+    /// step 0 clips both.
+    #[test]
+    fn heating_restores_momentum_after_a_wall_collision() {
+        let g = IsingGraph::new(vec![0.0, 0.0], vec![-1.0], vec![(0, 1)]);
+        let sb = SbGraph::from_base(&g);
+
+        let mut x_cold: Vec<Real> = vec![0.99, 0.99];
+        let mut y_cold: Vec<Real> = vec![0.5, 0.5];
+        sb_run(&sb, 1, DSB, false, &mut x_cold, &mut y_cold);
+        assert_eq!(x_cold, vec![1.0, 1.0], "the wall must clip both positions");
+        assert_eq!(
+            y_cold,
+            vec![0.0, 0.0],
+            "plain SB leaves a wall-stopped particle at rest"
+        );
+
+        let mut x_hot: Vec<Real> = vec![0.99, 0.99];
+        let mut y_hot: Vec<Real> = vec![0.5, 0.5];
+        sb_run(&sb, 1, HDSB, true, &mut x_hot, &mut y_hot);
+        assert_eq!(x_hot, vec![1.0, 1.0], "the wall must clip both positions");
+        for &yi in &y_hot {
+            assert_ne!(
+                yi, 0.0,
+                "heating must leave nonzero momentum at the wall, got {yi}"
+            );
+        }
+    }
+
+    /// Hypothesis: with `γ = 0` the heating increment is exactly zero, so
+    /// forcing the heated path on an unheated variant must not move a single
+    /// bit. This is what lets the shipped discrete binary skip the heating work
+    /// without becoming a second implementation.
+    #[test]
+    fn gamma_zero_through_the_heated_path_is_byte_identical() {
+        let g = mixed4();
+        let sb = SbGraph::from_base(&g);
+        let m = sb.num_particles();
+        let (x0, y0) = draw_initial_conditions(m, &mut SmallRng::seed_from_u64(9));
+
+        let (mut x_cold, mut y_cold) = (x0.clone(), y0.clone());
+        sb_run(&sb, 200, DSB, false, &mut x_cold, &mut y_cold);
+        let (mut x_hot, mut y_hot) = (x0, y0);
+        sb_run(&sb, 200, DSB, true, &mut x_hot, &mut y_hot);
+
+        let bits = |v: &[Real]| v.iter().map(|f| f.to_bits()).collect::<Vec<_>>();
+        assert_eq!(
+            bits(&x_cold),
+            bits(&x_hot),
+            "positions must be byte-identical with gamma = 0"
+        );
+        assert_eq!(
+            bits(&y_cold),
+            bits(&y_hot),
+            "momenta must be byte-identical with gamma = 0"
+        );
+    }
+
+    /// Hypothesis: the test window mirrors `sample_sb`'s read-0 path. The
+    /// state carries one extra slot when the graph has a bias (the ancilla),
+    /// walls hold, and gauge-fixing the window's positions reproduces
+    /// `sample_sb`'s read-0 spins for the same seed.
+    #[test]
+    fn final_state_window_matches_read_zero() {
+        let g = IsingGraph::new(vec![0.5, -0.25], vec![-1.0], vec![(0, 1)]);
+        let params = SampleParams {
+            num_reads: 1,
+            num_sweeps: 64,
+            seed: 3,
+            ..Default::default()
+        };
+        let (x, y) = sb_final_state_for_test(&g, &params, DSB);
+        assert_eq!(x.len(), 3, "two nodes plus the ancilla");
+        assert_eq!(y.len(), 3);
+        assert!(x.iter().all(|v| v.abs() <= 1.0), "walls must hold");
+
+        let sb = SbGraph::from_base(&g);
+        let spins = gauge_fixed_spins(&sb, &x);
+        let results = sample_sb(&g, &params, DSB);
+        assert_eq!(
+            results[0].spins, spins,
+            "the window must reproduce read 0 exactly"
+        );
+    }
+
+    /// Hypothesis: only the two heated variants select the heating path.
+    #[test]
+    fn only_heated_variants_carry_a_nonzero_gamma() {
+        assert_eq!(DSB.gamma, 0.0);
+        assert_eq!(BSB.gamma, 0.0);
+        assert!(HDSB.gamma > 0.0);
+        assert!(HBSB.gamma > 0.0);
     }
 
     /// Self-loop, out-of-range edge, and a `j` vector shorter than `edges`. All
