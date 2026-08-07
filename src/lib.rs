@@ -19,6 +19,7 @@ pub mod sb_sampler;
 pub use quip_miner_core::{Algorithm, IsingGraph, SampleParams, SamplerResult};
 pub use sampler_core::sample_ising;
 pub use sb_core::{sample_sb, Coupling, SbVariant, BSB, DSB, HBSB, HDSB};
+pub use gibbs_parallel::{ConfigError, GibbsConfig};
 pub use sb_sampler::{SbSampler, CPU_SB_IDENTITY};
 
 use quip_miner_core::adapt::AdaptBounds;
@@ -142,6 +143,7 @@ fn run_stream_pump<K>(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CpuSampler {
     algorithm: Algorithm,
+    gibbs: GibbsConfig,
 }
 
 impl CpuSampler {
@@ -170,7 +172,19 @@ impl CpuSampler {
     /// # }
     /// ```
     pub fn new(algorithm: Algorithm) -> Self {
-        Self { algorithm }
+        Self {
+            algorithm,
+            gibbs: GibbsConfig::default(),
+        }
+    }
+
+    /// Replace the chromatic Gibbs settings. Ignored by the SA path.
+    ///
+    /// Validate the configuration before calling this. The sampler cannot
+    /// refuse a bad worker count once a job is in flight, so the binary checks
+    /// it at startup and exits with a configuration error instead.
+    pub fn with_gibbs_config(self, gibbs: GibbsConfig) -> Self {
+        Self { gibbs, ..self }
     }
 }
 
@@ -180,15 +194,29 @@ impl Sampler for CpuSampler {
         graph: &IsingGraph,
         params: &SampleParams,
     ) -> Result<Vec<SamplerResult>, RejectReason> {
+        if self.algorithm == Algorithm::Gibbs {
+            // A colour budget the graph cannot meet is a property of the job,
+            // not of the miner, so it rejects that job rather than exiting.
+            return gibbs_parallel::sample_gibbs_with(graph, params, &self.gibbs)
+                .map_err(|_| RejectReason::Malformed);
+        }
         Ok(sample_ising(graph, params, self.algorithm))
     }
 
-    /// One model per core: `sample`'s reads are sequential and cache-local, so
-    /// throughput comes from running `stream_width` models concurrently, each
-    /// pinned to a worker thread. Fanning a single model's reads across cores
-    /// bounced the shared arrays' cache lines and measured slower.
+    /// Models to run concurrently.
+    ///
+    /// SA reads are sequential and cache-local, so one model per core is right:
+    /// fanning a single model's reads across cores bounced the shared arrays'
+    /// cache lines and measured slower. Chromatic Gibbs already spends
+    /// `gibbs.workers` cores inside one model, so it runs proportionally fewer
+    /// models to keep the machine from oversubscribing itself.
     fn stream_width(&self) -> usize {
-        std::thread::available_parallelism().map_or(1, |n| n.get())
+        let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+        if self.algorithm == Algorithm::Gibbs {
+            (cores / self.gibbs.workers.max(1)).max(1)
+        } else {
+            cores
+        }
     }
 
     fn sample_stream(
@@ -198,9 +226,16 @@ impl Sampler for CpuSampler {
         cancel: CancelGuard,
     ) {
         let algorithm = self.algorithm;
+        let gibbs = self.gibbs;
         run_stream_pump(
             self.stream_width(),
-            move |g, p| sample_ising(g, p, algorithm),
+            move |g, p| {
+                if algorithm == Algorithm::Gibbs {
+                    gibbs_parallel::sample_gibbs_with(g, p, &gibbs).unwrap_or_default()
+                } else {
+                    sample_ising(g, p, algorithm)
+                }
+            },
             jobs,
             out,
             cancel,

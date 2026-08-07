@@ -1,9 +1,10 @@
-//! Neal-style SA and single-site heat-bath Gibbs over a geometric beta ladder.
+//! Neal-style simulated annealing over a geometric beta ladder.
 //!
 //! Algorithm notes (match dwave-neal / GPU ports):
 //! - Beta schedule: geometric from auto hot/cold range (or explicit range).
 //! - SA: per-read random restart; sequential Metropolis flips per sweep.
-//! - Gibbs: heat-bath resample `P(s=+1) = 1/(1+exp(2 β h_eff))`.
+//! - Gibbs: dispatched to `crate::gibbs_parallel`, which resamples whole
+//!   colour classes at once. This module holds no Gibbs kernel.
 //! - Solution energies are always scored with
 //!   [`quip_protocol::scoring::energy_milli`] (positive sign, trunc toward 0).
 //! - Parallelism: model-level (one model per core via the streaming pump);
@@ -160,23 +161,10 @@ fn metropolis_accept(delta: f64, beta: f64, rng: &mut SmallRng) -> bool {
     rng.gen::<f64>() < accept_prob
 }
 
-/// Heat-bath: sample new spin from conditional Boltzmann.
-fn gibbs_sample_spin(heff: f64, beta: f64, rng: &mut SmallRng) -> i8 {
-    // P(s = +1) = 1 / (1 + exp(2 β h_eff))
-    let arg = (2.0 * beta * heff).clamp(-500.0, 500.0);
-    let p_plus = 1.0 / (1.0 + arg.exp());
-    if rng.gen::<f64>() < p_plus {
-        1
-    } else {
-        -1
-    }
-}
-
 fn anneal_one_read(
     graph: &CpuGraph,
     beta_schedule: &[f64],
     sweeps_per_beta: usize,
-    algorithm: Algorithm,
     rng: &mut SmallRng,
 ) -> Vec<i8> {
     let n = graph.num_nodes();
@@ -201,32 +189,14 @@ fn anneal_one_read(
     // a recompute-every-flip implementation.
     let mut heff: Vec<f64> = (0..n).map(|v| effective_field(v, &spins, graph)).collect();
 
-    match algorithm {
-        Algorithm::Sa => {
-            for &beta in beta_schedule {
-                for _ in 0..sweeps_per_beta {
-                    for var in 0..n {
-                        let s = spin_sign(spins[var]);
-                        let delta = -2.0 * s * heff[var];
-                        if metropolis_accept(delta, beta, rng) {
-                            spins[var] = -spins[var];
-                            apply_field_delta(graph, &mut heff, var, -2.0 * s);
-                        }
-                    }
-                }
-            }
-        }
-        Algorithm::Gibbs => {
-            for &beta in beta_schedule {
-                for _ in 0..sweeps_per_beta {
-                    for var in 0..n {
-                        let new = gibbs_sample_spin(heff[var], beta, rng);
-                        if new != spins[var] {
-                            let ds = spin_sign(new) - spin_sign(spins[var]);
-                            spins[var] = new;
-                            apply_field_delta(graph, &mut heff, var, ds);
-                        }
-                    }
+    for &beta in beta_schedule {
+        for _ in 0..sweeps_per_beta {
+            for var in 0..n {
+                let s = spin_sign(spins[var]);
+                let delta = -2.0 * s * heff[var];
+                if metropolis_accept(delta, beta, rng) {
+                    spins[var] = -spins[var];
+                    apply_field_delta(graph, &mut heff, var, -2.0 * s);
                 }
             }
         }
@@ -269,6 +239,16 @@ pub fn sample_ising(
     params: &SampleParams,
     algorithm: Algorithm,
 ) -> Vec<SamplerResult> {
+    if algorithm == Algorithm::Gibbs {
+        // Gibbs runs the chromatic kernel at its default worker count. There is
+        // no sequential Gibbs: the colour classes are the algorithm, not an
+        // optimisation layered over a single-site scan.
+        return crate::gibbs_parallel::sample_gibbs_parallel(
+            graph,
+            params,
+            crate::gibbs_parallel::DEFAULT_GIBBS_WORKERS,
+        );
+    }
     let num_reads = params.num_reads.max(1);
     let cpu = CpuGraph::from_base(graph);
     let beta_schedule = build_beta_schedule(graph, params);
@@ -283,7 +263,7 @@ pub fn sample_ising(
                 .wrapping_add(read_idx as u64)
                 .wrapping_add(1);
             let mut rng = SmallRng::seed_from_u64(seed);
-            let spins = anneal_one_read(&cpu, &beta_schedule, sweeps_per, algorithm, &mut rng);
+            let spins = anneal_one_read(&cpu, &beta_schedule, sweeps_per, &mut rng);
             score_spins(&spins, graph)
         })
         .collect()

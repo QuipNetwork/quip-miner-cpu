@@ -25,9 +25,89 @@ use quip_protocol::scoring::energy_milli;
 use crate::coloring::Coloring;
 use crate::sampler_core::CpuGraph;
 
-/// Default workers per model. Measured as the best setting for the
-/// Advantage2-System1 topology; see `docs/comparisons.md`.
+/// Default workers per model.
+///
+/// Measured as the best setting on the Advantage2-System1 topology: 3.38 times
+/// the throughput of one worker, at 85 percent efficiency. Higher counts scale
+/// worse, because a class update is one or two microseconds of work and every
+/// class ends at a barrier. See `docs/comparisons.md`.
 pub const DEFAULT_GIBBS_WORKERS: usize = 4;
+
+/// A worker or colour setting the miner must not start with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigError {
+    /// Zero workers cannot sample.
+    NoWorkers,
+    /// More workers than the host has cores. The barrier spins, so
+    /// oversubscription does not merely slow the sampler down, it collapses it.
+    /// Measured at 16 workers on a 12-core host, a pure spin ran about 90 times
+    /// slower than one worker.
+    Oversubscribed { requested: usize, available: usize },
+    /// The graph needs more colour classes than the configured budget allows.
+    TooManyColors { needed: usize, allowed: usize },
+}
+
+impl std::fmt::Display for ConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoWorkers => write!(f, "gibbs workers must be at least 1"),
+            Self::Oversubscribed {
+                requested,
+                available,
+            } => write!(
+                f,
+                "gibbs workers ({requested}) exceed the {available} cores this host \
+                 reports. The class barrier spins, so oversubscription collapses throughput"
+            ),
+            Self::TooManyColors { needed, allowed } => write!(
+                f,
+                "this graph needs {needed} colour classes but the configured budget is {allowed}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ConfigError {}
+
+/// Worker and colour settings for the chromatic Gibbs sampler.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GibbsConfig {
+    /// Workers splitting each colour class.
+    pub workers: usize,
+    /// Largest colour count this miner accepts. `None` accepts any colouring.
+    ///
+    /// The class count is a property of the graph, not a setting: a greedy
+    /// colouring of Advantage2-System1 needs 8 classes, and no 4-colouring of
+    /// it was found. Use this to refuse a topology that colours worse than the
+    /// deployment expects, rather than to request a smaller colouring.
+    pub max_colors: Option<usize>,
+}
+
+impl Default for GibbsConfig {
+    fn default() -> Self {
+        Self {
+            workers: DEFAULT_GIBBS_WORKERS,
+            max_colors: None,
+        }
+    }
+}
+
+impl GibbsConfig {
+    /// Reject settings the host cannot serve. Call once at startup.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.workers == 0 {
+            return Err(ConfigError::NoWorkers);
+        }
+        let available = std::thread::available_parallelism().map_or(1, |n| n.get());
+        if self.workers > available {
+            return Err(ConfigError::Oversubscribed {
+                requested: self.workers,
+                available,
+            });
+        }
+        Ok(())
+    }
+}
 
 /// SplitMix64. Counter-based, so a draw depends only on its key and never on
 /// how the work was divided between workers.
@@ -220,14 +300,39 @@ pub fn sample_gibbs_parallel(
     params: &SampleParams,
     workers: usize,
 ) -> Vec<SamplerResult> {
+    sample_gibbs_with(
+        graph,
+        params,
+        &GibbsConfig {
+            workers,
+            max_colors: None,
+        },
+    )
+    .expect("a config with no colour budget cannot fail")
+}
+
+/// Sample under a full [`GibbsConfig`], rejecting a graph that colours worse
+/// than the configured budget.
+pub fn sample_gibbs_with(
+    graph: &IsingGraph,
+    params: &SampleParams,
+    config: &GibbsConfig,
+) -> Result<Vec<SamplerResult>, ConfigError> {
+    let workers = config.workers;
     let cpu = CpuGraph::from_base(graph);
     let coloring = Coloring::new(&cpu);
+    if let Some(allowed) = config.max_colors {
+        let needed = coloring.classes().len();
+        if needed > allowed {
+            return Err(ConfigError::TooManyColors { needed, allowed });
+        }
+    }
     let betas = crate::sampler_core::build_beta_schedule(graph, params);
     let sweeps_per_beta = params.sweeps_per_beta.max(1);
     let n = cpu.num_nodes();
     let num_reads = params.num_reads.max(1);
 
-    (0..num_reads)
+    let results = (0..num_reads)
         .map(|read_idx| {
             let seed = params
                 .seed
@@ -249,7 +354,8 @@ pub fn sample_gibbs_parallel(
                 spins: out,
             }
         })
-        .collect()
+        .collect::<Vec<_>>();
+    Ok(results)
 }
 
 #[cfg(test)]
@@ -335,6 +441,77 @@ mod tests {
         let spins = atomics(&[1]);
         gibbs_read(&cpu, &coloring, &[6.0], 20, 11, 2, &spins);
         assert_eq!(read_back(&spins), vec![-1]);
+    }
+
+    /// Hypothesis: zero workers is refused. A miner that starts with it would
+    /// sample nothing and report success.
+    #[test]
+    fn zero_workers_is_refused() {
+        let c = GibbsConfig {
+            workers: 0,
+            max_colors: None,
+        };
+        assert_eq!(c.validate(), Err(ConfigError::NoWorkers));
+    }
+
+    /// Hypothesis: asking for more workers than the host has cores is refused
+    /// at startup. The class barrier spins, so oversubscription collapses
+    /// throughput rather than degrading it gently.
+    #[test]
+    fn oversubscription_is_refused() {
+        let available = std::thread::available_parallelism().map_or(1, |n| n.get());
+        let c = GibbsConfig {
+            workers: available + 1,
+            max_colors: None,
+        };
+        assert_eq!(
+            c.validate(),
+            Err(ConfigError::Oversubscribed {
+                requested: available + 1,
+                available
+            })
+        );
+    }
+
+    /// Hypothesis: the default configuration is valid on any host and asks for
+    /// the measured best worker count.
+    #[test]
+    fn the_default_config_is_valid_and_uses_four_workers() {
+        let c = GibbsConfig::default();
+        assert_eq!(c.workers, 4);
+        assert_eq!(c.max_colors, None);
+        assert_eq!(c.validate(), Ok(()));
+    }
+
+    /// Hypothesis: a graph needing more classes than the budget is rejected
+    /// rather than silently sampled with a worse colouring. A triangle needs
+    /// three classes, so a budget of two must fail and a budget of three must
+    /// pass.
+    #[test]
+    fn a_graph_over_the_colour_budget_is_rejected() {
+        let g = IsingGraph::new(vec![0.0; 3], vec![1.0; 3], vec![(0, 1), (1, 2), (0, 2)]);
+        let p = SampleParams {
+            num_reads: 1,
+            num_sweeps: 8,
+            seed: 1,
+            ..Default::default()
+        };
+        let tight = GibbsConfig {
+            workers: 2,
+            max_colors: Some(2),
+        };
+        assert_eq!(
+            sample_gibbs_with(&g, &p, &tight),
+            Err(ConfigError::TooManyColors {
+                needed: 3,
+                allowed: 2
+            })
+        );
+        let ok = GibbsConfig {
+            workers: 2,
+            max_colors: Some(3),
+        };
+        assert!(sample_gibbs_with(&g, &p, &ok).is_ok());
     }
 
     /// Hypothesis: an empty graph has no classes, so the kernel does nothing
