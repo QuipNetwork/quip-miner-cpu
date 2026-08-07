@@ -441,6 +441,10 @@ pub(crate) fn sb_final_state_for_test(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+    // Both glob imports above carry an `Rng` trait. Name rand's explicitly:
+    // the glob-ambiguity lint is a future hard error.
+    use rand::Rng;
 
     /// Hypothesis: the four shipped variants are exactly the coupling form and
     /// heating rate the design table names. A later plan builds three binaries
@@ -995,8 +999,8 @@ mod tests {
     fn only_heated_variants_carry_a_nonzero_gamma() {
         assert_eq!(DSB.gamma, 0.0);
         assert_eq!(BSB.gamma, 0.0);
-        assert!(HDSB.gamma > 0.0);
-        assert!(HBSB.gamma > 0.0);
+        const { assert!(HDSB.gamma > 0.0) };
+        const { assert!(HBSB.gamma > 0.0) };
     }
 
     /// Self-loop, out-of-range edge, and a `j` vector shorter than `edges`. All
@@ -1141,5 +1145,121 @@ mod tests {
         assert_eq!(DT, 1.0);
         assert_eq!(A0, 1.0);
         assert_eq!(INIT_RANGE, 0.1);
+    }
+
+    /// Build a small random graph from proptest inputs. Edge endpoints are taken
+    /// modulo `n`, which deliberately generates self-loops and repeated edges.
+    fn graph_from_parts(n: usize, h: Vec<f64>, edge_data: Vec<(u8, u8, f64)>) -> IsingGraph {
+        let n = n.min(h.len()).max(1);
+        let h: Vec<f64> = h.into_iter().take(n).collect();
+        let mut edges = Vec::with_capacity(edge_data.len());
+        let mut j = Vec::with_capacity(edge_data.len());
+        for (u, v, c) in edge_data {
+            edges.push(((u as usize) % n, (v as usize) % n));
+            j.push(c);
+        }
+        IsingGraph::new(h, j, edges)
+    }
+
+    proptest! {
+        // No file persistence: keeps the worktree free of proptest-regressions/.
+        #![proptest_config(ProptestConfig {
+            cases: 64,
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+
+        /// Hypothesis: every returned spin is a valid wire value, the vector
+        /// length always matches the graph, and the reported energy always
+        /// equals consensus scoring of those exact spins.
+        #[test]
+        fn prop_spins_are_pm1_and_energy_matches_scoring(
+            n in 1usize..=6,
+            h in prop::collection::vec(-2.0f64..2.0, 1..=6),
+            edge_data in prop::collection::vec(
+                (any::<u8>(), any::<u8>(), -2.0f64..2.0),
+                0..=12,
+            ),
+            seed in any::<u64>(),
+            sweeps in 1usize..=64,
+        ) {
+            let g = graph_from_parts(n, h, edge_data);
+            for variant in ALL_VARIANTS {
+                let results = sample_sb(&g, &sb_params(3, sweeps, seed), variant);
+                prop_assert_eq!(results.len(), 3);
+                for r in &results {
+                    prop_assert_eq!(r.spins.len(), g.h.len());
+                    prop_assert!(r.spins.iter().all(|&s| s == 1 || s == -1));
+                    prop_assert_eq!(
+                        r.energy_milli,
+                        energy_milli(&r.spins, &g.h, &g.j, &g.edges)
+                    );
+                }
+            }
+        }
+
+        /// Hypothesis: the integrator never produces a non-finite value and the
+        /// wall rule holds after every step. This catches an integrator that
+        /// diverges at a large time step and a wall rule applied in the wrong
+        /// order. HbSB is used because its heating rate is the largest, so it
+        /// is the variant most able to run away.
+        #[test]
+        fn prop_no_nan_and_walls_hold(
+            n in 1usize..=6,
+            h in prop::collection::vec(-2.0f64..2.0, 1..=6),
+            edge_data in prop::collection::vec(
+                (any::<u8>(), any::<u8>(), -2.0f64..2.0),
+                0..=12,
+            ),
+            seed in any::<u64>(),
+            sweeps in 1usize..=64,
+        ) {
+            let g = graph_from_parts(n, h, edge_data);
+            let sb = SbGraph::from_base(&g);
+            let m = sb.num_particles();
+            let (mut x, mut y) =
+                draw_initial_conditions(m, &mut SmallRng::seed_from_u64(seed));
+            sb_run(&sb, sweeps, HBSB, true, &mut x, &mut y);
+            for (&xi, &yi) in x.iter().zip(y.iter()) {
+                prop_assert!(xi.is_finite(), "position not finite: {}", xi);
+                prop_assert!(yi.is_finite(), "momentum not finite: {}", yi);
+                prop_assert!(xi.abs() <= 1.0, "wall violated: {}", xi);
+            }
+        }
+
+        /// Hypothesis: the ancilla gauge is a symmetry of the dynamics.
+        /// Negating every initial condition negates the whole trajectory
+        /// exactly, because every operation in the update is sign-symmetric in
+        /// IEEE arithmetic, so the gauge-fixed spins come out identical. This
+        /// fails if the gauge fix is dropped or applied to the wrong index.
+        #[test]
+        fn prop_ancilla_gauge_is_consistent(
+            n in 1usize..=5,
+            h in prop::collection::vec(-2.0f64..2.0, 1..=5),
+            edge_data in prop::collection::vec(
+                (any::<u8>(), any::<u8>(), -2.0f64..2.0),
+                0..=10,
+            ),
+            seed in any::<u64>(),
+            sweeps in 1usize..=48,
+        ) {
+            let mut g = graph_from_parts(n, h, edge_data);
+            // Force the ancilla to exist; a generated all-zero bias vector would
+            // make this property vacuous and the shrinker drives toward zero.
+            g.h[0] = 1.0;
+            let sb = SbGraph::from_base(&g);
+            prop_assert!(sb.has_bias);
+            let m = sb.num_particles();
+            let (x0, y0) = draw_initial_conditions(m, &mut SmallRng::seed_from_u64(seed));
+
+            let (mut xa, mut ya) = (x0.clone(), y0.clone());
+            sb_run(&sb, sweeps, DSB, false, &mut xa, &mut ya);
+
+            let mut xb: Vec<Real> = x0.iter().map(|v| -v).collect();
+            let mut yb: Vec<Real> = y0.iter().map(|v| -v).collect();
+            sb_run(&sb, sweeps, DSB, false, &mut xb, &mut yb);
+
+            prop_assert_eq!(gauge_fixed_spins(&sb, &xa), gauge_fixed_spins(&sb, &xb));
+        }
     }
 }
