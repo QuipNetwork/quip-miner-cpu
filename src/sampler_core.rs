@@ -31,7 +31,7 @@ use rand::{Rng, SeedableRng};
 /// `(u, u)` are skipped (they would pollute `heff[u]` with `u`'s own spin and
 /// break the ΔE formula), and couplings shorter than the edge list are treated
 /// as 0.
-struct CpuGraph {
+pub(crate) struct CpuGraph {
     h: Vec<f64>,
     /// CSR row offsets, length `n + 1`.
     nbr_start: Vec<u32>,
@@ -42,7 +42,7 @@ struct CpuGraph {
 }
 
 impl CpuGraph {
-    fn from_base(g: &IsingGraph) -> Self {
+    pub(crate) fn from_base(g: &IsingGraph) -> Self {
         let n = g.h.len();
         let mut deg = vec![0u32; n];
         for &(u, v) in &g.edges {
@@ -88,13 +88,13 @@ impl CpuGraph {
         }
     }
 
-    fn num_nodes(&self) -> usize {
+    pub(crate) fn num_nodes(&self) -> usize {
         self.h.len()
     }
 
     /// `(neighbor_ids, couplings)` slices for `var`.
     #[inline]
-    fn neighbors(&self, var: usize) -> (&[u32], &[f64]) {
+    pub(crate) fn neighbors(&self, var: usize) -> (&[u32], &[f64]) {
         let s = self.nbr_start[var] as usize;
         let e = self.nbr_start[var + 1] as usize;
         (&self.nbr_node[s..e], &self.nbr_coup[s..e])

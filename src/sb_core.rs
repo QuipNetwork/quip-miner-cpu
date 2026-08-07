@@ -29,6 +29,8 @@
 //! dynamics are deterministic for every variant, including the heated ones, so
 //! read diversity comes entirely from the initial condition.
 
+use quip_miner_core::IsingGraph;
+
 /// Internal state precision. One line changes the whole kernel to f64 for a
 /// benchmark build; the reported energy never depends on it, because the
 /// sampler returns `sign(x)` as `i8` and `energy_milli` rescores in f64.
@@ -92,6 +94,89 @@ pub const HBSB: SbVariant = SbVariant {
     gamma: 0.5,
 };
 
+/// Per-particle neighbor lists in CSR layout, in `Real` precision.
+///
+/// Built from the base [`IsingGraph`] with the same defensive posture as
+/// `sampler_core::CpuGraph`: edges out of range for `h.len()` are skipped,
+/// self-loops `(u, u)` are skipped, and couplings shorter than the edge list
+/// read 0.
+///
+/// This deliberately does not reuse `quip_miner_core::CsrGraph`, whose
+/// `from_base` keeps self-loops. A self-loop in an SB neighbor row would inject
+/// a spurious self-force `-c0 j_uu sgn(x_u)` into that node and shift its
+/// bifurcation, while `energy_milli` scores the loop as an unoptimizable
+/// constant. `sb_graph_matches_cpu_graph_adjacency` guards the duplication.
+///
+/// Biases live outside the CSR rows because they reach the force through the
+/// ancilla column rather than through a neighbor row.
+struct SbGraph {
+    /// Linear biases, one per node, narrowed for the hot loop.
+    h: Vec<Real>,
+    /// CSR row offsets, length `n + 1`.
+    nbr_start: Vec<u32>,
+    /// Flattened neighbor node ids.
+    nbr_node: Vec<u32>,
+    /// Flattened couplings, parallel to `nbr_node`.
+    nbr_coup: Vec<Real>,
+    /// True when any `h_i != 0`. The ancilla exists only then.
+    has_bias: bool,
+}
+
+impl SbGraph {
+    fn from_base(g: &IsingGraph) -> Self {
+        let n = g.h.len();
+        let mut deg = vec![0u32; n];
+        for &(u, v) in &g.edges {
+            if u >= n || v >= n || u == v {
+                continue;
+            }
+            deg[u] += 1;
+            deg[v] += 1;
+        }
+        let mut nbr_start = vec![0u32; n + 1];
+        for i in 0..n {
+            nbr_start[i + 1] = nbr_start[i] + deg[i];
+        }
+        let total = nbr_start[n] as usize;
+        let mut nbr_node = vec![0u32; total];
+        let mut nbr_coup: Vec<Real> = vec![0.0; total];
+        let mut cursor: Vec<u32> = nbr_start[..n].to_vec();
+        for (k, &(u, v)) in g.edges.iter().enumerate() {
+            if u >= n || v >= n || u == v {
+                continue;
+            }
+            let coup = g.j.get(k).copied().unwrap_or(0.0) as Real;
+            let pu = cursor[u] as usize;
+            nbr_node[pu] = v as u32;
+            nbr_coup[pu] = coup;
+            cursor[u] += 1;
+            let pv = cursor[v] as usize;
+            nbr_node[pv] = u as u32;
+            nbr_coup[pv] = coup;
+            cursor[v] += 1;
+        }
+        Self {
+            h: g.h.iter().map(|&b| b as Real).collect(),
+            nbr_start,
+            nbr_node,
+            nbr_coup,
+            has_bias: g.h.iter().any(|&b| b != 0.0),
+        }
+    }
+
+    fn num_nodes(&self) -> usize {
+        self.h.len()
+    }
+
+    /// `(neighbor_ids, couplings)` slices for `var`.
+    #[inline]
+    fn neighbors(&self, var: usize) -> (&[u32], &[Real]) {
+        let s = self.nbr_start[var] as usize;
+        let e = self.nbr_start[var + 1] as usize;
+        (&self.nbr_node[s..e], &self.nbr_coup[s..e])
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -130,6 +215,62 @@ mod tests {
                 gamma: 0.5
             }
         );
+    }
+
+    /// Self-loop, out-of-range edge, and a `j` vector shorter than `edges`. All
+    /// three defensive cases in one graph.
+    fn adversarial() -> IsingGraph {
+        IsingGraph::new(
+            vec![0.5, -0.25, 0.0],
+            vec![2.0, -1.0, 0.75],
+            vec![(0, 0), (0, 1), (9, 2), (1, 2)],
+        )
+    }
+
+    /// Hypothesis: `SbGraph` repeats `CpuGraph`'s CSR construction rather than
+    /// reusing `quip_miner_core::CsrGraph`, whose `from_base` keeps self-loops.
+    /// A self-loop in an SB neighbor row injects a spurious self-force
+    /// `-c0 j_uu sgn(x_u)` that biases that node's bifurcation, while
+    /// `energy_milli` scores the loop as an unoptimizable constant. This test
+    /// replaces hoisting a shared builder: it pins the duplicate against the
+    /// original.
+    ///
+    /// The fixture's couplings are dyadic, so narrowing them to f32 and widening
+    /// back to f64 is exact and the comparison is meaningful.
+    #[test]
+    fn sb_graph_matches_cpu_graph_adjacency() {
+        let g = adversarial();
+        let sb = SbGraph::from_base(&g);
+        let cpu = crate::sampler_core::CpuGraph::from_base(&g);
+        assert_eq!(sb.num_nodes(), cpu.num_nodes());
+        for v in 0..sb.num_nodes() {
+            let (sb_nodes, sb_coups) = sb.neighbors(v);
+            let (cpu_nodes, cpu_coups) = cpu.neighbors(v);
+            assert_eq!(sb_nodes, cpu_nodes, "neighbor ids differ at node {v}");
+            let widened: Vec<f64> = sb_coups.iter().map(|&c| f64::from(c)).collect();
+            assert_eq!(widened, cpu_coups, "couplings differ at node {v}");
+        }
+    }
+
+    /// Hypothesis: the CSR drops a self-loop and an out-of-range edge outright,
+    /// and a missing coupling reads 0.0 rather than shifting the edge list.
+    #[test]
+    fn sb_graph_drops_self_loops_and_out_of_range_edges() {
+        let sb = SbGraph::from_base(&adversarial());
+        assert_eq!(sb.neighbors(0).0, &[1]);
+        assert_eq!(sb.neighbors(0).1, &[-1.0]);
+        assert_eq!(sb.neighbors(1).0, &[0, 2]);
+        assert_eq!(sb.neighbors(1).1, &[-1.0, 0.0]);
+        assert_eq!(sb.neighbors(2).0, &[1]);
+        assert_eq!(sb.neighbors(2).1, &[0.0]);
+        assert!(sb.has_bias, "h = [0.5, -0.25, 0.0] carries a bias");
+    }
+
+    /// Hypothesis: an all-zero bias vector means no ancilla.
+    #[test]
+    fn zero_biases_mean_no_ancilla() {
+        let g = IsingGraph::new(vec![0.0, 0.0], vec![-1.0], vec![(0, 1)]);
+        assert!(!SbGraph::from_base(&g).has_bias);
     }
 
     /// Hypothesis: the integrator constants are the paper values. The
