@@ -381,6 +381,17 @@ pub fn sample_sb(
     let n_step = params.num_sweeps.max(1);
     let heated = variant.gamma != 0.0;
     let m = g.num_particles();
+    if m == 0 {
+        // No variables and no ancilla: skip the integrator entirely rather than
+        // spin n_step times over empty slices.
+        let energy = energy_milli(&[], &graph.h, &graph.j, &graph.edges);
+        return (0..num_reads)
+            .map(|_| SamplerResult {
+                spins: Vec::new(),
+                energy_milli: energy,
+            })
+            .collect();
+    }
     let base_seed = params.seed;
 
     (0..num_reads)
@@ -641,6 +652,71 @@ mod tests {
                     energy_milli(&r.spins, &g.h, &g.j, &g.edges),
                     "{variant:?}: reported energy must equal consensus scoring"
                 );
+            }
+        }
+    }
+
+    /// Hypothesis: a graph with no variables returns `num_reads` empty spin
+    /// vectors at energy 0 without allocating state or running the integrator.
+    #[test]
+    fn empty_graph_returns_empty_reads() {
+        let g = IsingGraph::new(vec![], vec![], vec![]);
+        for variant in ALL_VARIANTS {
+            let results = sample_sb(&g, &sb_params(3, 8192, 1), variant);
+            assert_eq!(results.len(), 3);
+            assert!(results
+                .iter()
+                .all(|r| r.spins.is_empty() && r.energy_milli == 0));
+        }
+    }
+
+    /// Hypothesis: the remaining rows of the design's edge-case table all return
+    /// valid ±1 spins of the right length and never panic. `clippy::panic` is
+    /// denied and a malformed job must not take down a mining session.
+    #[test]
+    fn degenerate_graphs_return_valid_spins() {
+        let cases: Vec<(&str, IsingGraph)> = vec![
+            (
+                "single node, no bias",
+                IsingGraph::new(vec![0.0], vec![], vec![]),
+            ),
+            (
+                "single node, bias only",
+                IsingGraph::new(vec![1.0], vec![], vec![]),
+            ),
+            (
+                "all zero",
+                IsingGraph::new(vec![0.0, 0.0, 0.0], vec![0.0, 0.0], vec![(0, 1), (1, 2)]),
+            ),
+            (
+                "disconnected node",
+                IsingGraph::new(vec![0.0, 0.0, 0.0], vec![-1.0], vec![(0, 1)]),
+            ),
+            (
+                "non-finite bias",
+                IsingGraph::new(vec![f64::NAN, 1.0], vec![-1.0], vec![(0, 1)]),
+            ),
+            (
+                "non-finite coupling",
+                IsingGraph::new(vec![0.0, 0.0], vec![f64::INFINITY], vec![(0, 1)]),
+            ),
+            (
+                "short j vector",
+                IsingGraph::new(vec![0.5, 0.0], vec![], vec![(0, 1)]),
+            ),
+        ];
+        for (name, g) in cases {
+            for variant in ALL_VARIANTS {
+                let results = sample_sb(&g, &sb_params(4, 128, 3), variant);
+                assert_eq!(results.len(), 4, "{name} / {variant:?}");
+                for r in &results {
+                    assert_eq!(r.spins.len(), g.h.len(), "{name} / {variant:?}");
+                    assert!(
+                        r.spins.iter().all(|&s| s == 1 || s == -1),
+                        "{name} / {variant:?}: spins must be ±1, got {:?}",
+                        r.spins
+                    );
+                }
             }
         }
     }
