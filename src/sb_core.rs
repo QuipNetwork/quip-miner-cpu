@@ -656,6 +656,82 @@ mod tests {
         }
     }
 
+    /// Hypothesis: randomness enters only at initialization, so the same seed
+    /// and the same parameters give byte-identical results for every variant,
+    /// including the heated ones. The protocol requires that the same seed and
+    /// the same binary produce the same output.
+    #[test]
+    fn same_seed_produces_identical_results() {
+        let g = mixed_random14();
+        let params = sb_params(8, 256, 777);
+        for variant in ALL_VARIANTS {
+            let a = sample_sb(&g, &params, variant);
+            let b = sample_sb(&g, &params, variant);
+            assert_eq!(a, b, "{variant:?} must be deterministic at a fixed seed");
+        }
+    }
+
+    /// Hypothesis: reads are independent restarts and the base seed changes all
+    /// of them, so read diversity comes entirely from the initial condition.
+    /// A kernel that ignored the seed would still pass every other test here.
+    ///
+    /// The step count is 32 rather than the 256 the other tests use. At 14
+    /// nodes dSB reaches the exact ground state from every initial condition
+    /// well before 256 steps, so both seeds return the same optimum on every
+    /// read and the comparison stops discriminating. Thirty-two steps keeps the
+    /// trajectories short of convergence, which is where the seed is still
+    /// visible in the output.
+    #[test]
+    fn different_seeds_produce_different_results() {
+        let g = mixed_random14();
+        let a = sample_sb(&g, &sb_params(8, 32, 1), DSB);
+        let b = sample_sb(&g, &sb_params(8, 32, 2), DSB);
+        assert_ne!(
+            a, b,
+            "randomized initial conditions must diversify across seeds"
+        );
+    }
+
+    /// Regression guard on DT, INIT_RANGE and c0.
+    ///
+    /// Particles reaching the walls early is intrinsic to SB: c0 is chosen so
+    /// the coupling force and the restoring force are the same order when the
+    /// pump starts. The pathology is different. With the constants too large
+    /// every particle pins in the opening steps and never moves again, and the
+    /// run returns nothing but the sign of its initial draw. Guard that
+    /// directly, and check the wall invariant on the same run.
+    ///
+    /// This is a regression guard on the constants, not a claim about the
+    /// algorithm.
+    #[test]
+    fn final_positions_are_not_just_the_sign_of_the_initial_draw() {
+        let g = mixed_random14();
+        let sb = SbGraph::from_base(&g);
+        let m = sb.num_particles();
+        let (x0, y0) = draw_initial_conditions(m, &mut SmallRng::seed_from_u64(31));
+        let (mut x, mut y) = (x0.clone(), y0);
+        sb_run(&sb, 1000, DSB, false, &mut x, &mut y);
+
+        let moved = x0
+            .iter()
+            .zip(x.iter())
+            .filter(|(a, b)| (**a >= 0.0) != (**b >= 0.0))
+            .count();
+        assert!(
+            moved * 4 >= m,
+            "only {moved} of {m} particles left the side they started on: the \
+             constants pin the system before the pump separates anything"
+        );
+        assert!(
+            x.iter().all(|v| v.abs() <= 1.0),
+            "the wall clip must hold |x| <= 1: {x:?}"
+        );
+        assert!(
+            x.iter().all(|v| v.is_finite()) && y.iter().all(|v| v.is_finite()),
+            "the integrator must not diverge: x = {x:?}, y = {y:?}"
+        );
+    }
+
     /// Minimum energy over all `2^n` configurations, in milli units. Only safe
     /// for `n <= 24`; every caller here stays at or below 14.
     fn brute_force_min_energy(g: &IsingGraph) -> i64 {
