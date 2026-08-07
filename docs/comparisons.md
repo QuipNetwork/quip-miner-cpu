@@ -268,10 +268,10 @@ across particles:
 | 12 | 546 ms | 0.26 | 234 ms | 1.84 |
 | 16 | 660 ms | 0.21 | 783 ms | 0.55 |
 
-Particle-level parallelism peaks near 2.5, and the best worker count grows with
-the problem: 4 workers at 4577 nodes, 8 at 18308. That is the barrier again.
-Larger problems put more work between two barriers, so more workers pay off.
-Oversubscription collapses this kernel as it collapses Gibbs.
+Particle-level parallelism peaks near 2.5. The best worker count grows with the
+problem, from 4 workers at 4577 nodes to 8 at 18308, because a larger problem
+puts more work between two barriers. Oversubscription collapses this kernel as
+it collapses Gibbs.
 
 Read-level parallelism reaches 6.54 at 16 threads and never regresses, so
 prefer it whenever the read count reaches the core count. Reach for
