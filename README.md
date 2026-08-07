@@ -1,8 +1,9 @@
 # quip-miner-cpu
 
 CPU Ising miners for the [quip.network](https://gitlab.com/quip.network) v0.3
-mining protocol: simulated annealing (`quip-cpu-sa`) and single-site chromatic
-Gibbs (`quip-cpu-gibbs`), shipped as separate binaries.
+mining protocol: simulated annealing (`quip-cpu-sa`), single-site chromatic
+Gibbs (`quip-cpu-gibbs`), and discrete Simulated Bifurcation (`quip-cpu-sb`),
+shipped as separate binaries.
 
 The sampler runs one model per core (model-level parallelism); each model's
 reads are sequential and cache-local. Energies are scored with the canonical
@@ -14,6 +15,13 @@ reads are sequential and cache-local. Energies are scored with the canonical
 |--------|-----------|
 | `quip-cpu-sa` | simulated annealing (Metropolis) |
 | `quip-cpu-gibbs` | single-site heat-bath Gibbs |
+| `quip-cpu-sb` | discrete Simulated Bifurcation |
+
+All three samplers stream jobs through one shared pump, `run_stream_pump` in
+`src/lib.rs`. That pump holds the only copy of the cancellation check before
+dispatch and of the panic re-raise on worker join. The SB kernel and its
+sampler live in `src/sb_core.rs` and `src/sb_sampler.rs`, separate from the
+annealing path.
 
 Prebuilt binaries are attached to each
 [Release](https://gitlab.com/quip.network/quip-miner-cpu/-/releases) for

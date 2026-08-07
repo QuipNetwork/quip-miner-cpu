@@ -1,11 +1,14 @@
 //! CPU Ising samplers.
 //!
-//! Two binaries share this library:
+//! Three binaries share this library:
 //! - `quip-cpu-sa` — neal-style geometric SA (Metropolis)
 //! - `quip-cpu-gibbs` — heat-bath single-site Gibbs over the same ladder
+//! - `quip-cpu-sb` — discrete Simulated Bifurcation
 //!
 //! The coordinator session loop lives in `quip-miner-core`; this crate provides
-//! the [`CpuSampler`] backend and the two binaries.
+//! the [`CpuSampler`] and [`SbSampler`] backends and the three binaries. All of
+//! them stream jobs through one shared pump, so cancellation and panic
+//! propagation cannot drift between them.
 
 pub mod sampler_core;
 pub mod sb_core;
