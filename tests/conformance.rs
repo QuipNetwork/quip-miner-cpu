@@ -18,9 +18,18 @@ fn profile_bin(name: &str) -> String {
     p.to_string_lossy().into_owned()
 }
 
-fn ensure_built(package_bins: &[&str]) {
+/// Build the crate and assert the named binaries landed in the profile
+/// directory. `features` is forwarded to `cargo build --features`; the
+/// experimental SB and tensor-network binaries need it, the production ones do
+/// not.
+fn ensure_built_with(package_bins: &[&str], features: &[&str]) {
+    let mut args: Vec<String> = vec!["build".into(), "-p".into(), "quip-miner-cpu".into()];
+    if !features.is_empty() {
+        args.push("--features".into());
+        args.push(features.join(","));
+    }
     let status = Command::new(env!("CARGO"))
-        .args(["build", "-p", "quip-miner-cpu"])
+        .args(&args)
         .status()
         .expect("cargo build quip-miner-cpu");
     assert!(status.success(), "failed to build quip-miner-cpu");
@@ -31,6 +40,10 @@ fn ensure_built(package_bins: &[&str]) {
             profile_bin(b)
         );
     }
+}
+
+fn ensure_built(package_bins: &[&str]) {
+    ensure_built_with(package_bins, &[]);
 }
 
 #[tokio::test]
@@ -113,11 +126,43 @@ async fn quip_cpu_gibbs_passes_conformance() {
     assert_eq!(report.exit_code, 0, "clean shutdown expected");
 }
 
+#[tokio::test]
+async fn quip_cpu_sb_passes_conformance() {
+    ensure_built(&["quip-cpu-sb"]);
+    let miner = profile_bin("quip-cpu-sb");
+    let socket = format!(
+        "/tmp/quip-cpu-sb-conf-{}-{}.sock",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let report = drive_miner(&miner, &format!("unix://{socket}")).await;
+    assert!(report.handshake_ok, "SB handshake failed");
+    assert_eq!(
+        report.result_job_ids().len(),
+        3,
+        "expected 3 job results (job-1, job-2, job-hash)"
+    );
+    assert!(report.result_job_ids().iter().any(|id| id == b"job-1"));
+    assert!(report.result_job_ids().iter().any(|id| id == b"job-2"));
+    assert!(report.result_job_ids().iter().any(|id| id == b"job-hash"));
+    assert!(report.has_reject(b"job-bad-h", RejectReason::Malformed));
+    assert!(report.has_reject(b"job-gate", RejectReason::UnsupportedKind));
+    assert!(report.has_reject(b"job-old", RejectReason::Expired));
+    assert_eq!(report.exit_code, 0, "clean shutdown expected");
+}
+
 #[test]
 fn capabilities_and_version_and_check() {
-    ensure_built(&["quip-cpu-sa", "quip-cpu-gibbs"]);
+    ensure_built(&["quip-cpu-sa", "quip-cpu-gibbs", "quip-cpu-sb"]);
 
-    for (bin, algo) in [("quip-cpu-sa", "sa"), ("quip-cpu-gibbs", "gibbs")] {
+    for (bin, algo) in [
+        ("quip-cpu-sa", "sa"),
+        ("quip-cpu-gibbs", "gibbs"),
+        ("quip-cpu-sb", "sb"),
+    ] {
         let path = profile_bin(bin);
 
         let out = Command::new(&path).arg("--capabilities").output().unwrap();
