@@ -10,6 +10,8 @@
 //! them stream jobs through one shared pump, so cancellation and panic
 //! propagation cannot drift between them.
 
+mod coloring;
+pub mod gibbs_parallel;
 pub mod sampler_core;
 pub mod sb_core;
 pub mod sb_sampler;

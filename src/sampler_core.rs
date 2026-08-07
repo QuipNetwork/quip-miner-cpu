@@ -88,6 +88,12 @@ impl CpuGraph {
         }
     }
 
+    /// Linear bias at `var`.
+    #[inline]
+    pub(crate) fn bias(&self, var: usize) -> f64 {
+        self.h[var]
+    }
+
     pub(crate) fn num_nodes(&self) -> usize {
         self.h.len()
     }
@@ -102,7 +108,7 @@ impl CpuGraph {
 }
 
 /// Geometric beta schedule for one sample request (f64 for CPU precision).
-fn build_beta_schedule(graph: &IsingGraph, params: &SampleParams) -> Vec<f64> {
+pub(crate) fn build_beta_schedule(graph: &IsingGraph, params: &SampleParams) -> Vec<f64> {
     let sweeps_per = params.sweeps_per_beta.max(1);
     let num_betas = (params.num_sweeps / sweeps_per).max(1);
     let (hot, cold) = params
