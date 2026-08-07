@@ -29,7 +29,10 @@
 //! dynamics are deterministic for every variant, including the heated ones, so
 //! read diversity comes entirely from the initial condition.
 
-use quip_miner_core::IsingGraph;
+use quip_miner_core::{IsingGraph, SampleParams, SamplerResult};
+use quip_protocol::scoring::energy_milli;
+use rand::rngs::SmallRng;
+use rand::{Rng, SeedableRng};
 
 /// Internal state precision. One line changes the whole kernel to f64 for a
 /// benchmark build; the reported energy never depends on it, because the
@@ -197,6 +200,12 @@ impl SbGraph {
         self.h.len()
     }
 
+    /// Particle count: the graph's nodes plus the ancilla when the problem
+    /// carries a bias.
+    fn num_particles(&self) -> usize {
+        self.num_nodes() + usize::from(self.has_bias)
+    }
+
     /// `(neighbor_ids, couplings)` slices for `var`.
     #[inline]
     fn neighbors(&self, var: usize) -> (&[u32], &[Real]) {
@@ -204,6 +213,177 @@ impl SbGraph {
         let e = self.nbr_start[var + 1] as usize;
         (&self.nbr_node[s..e], &self.nbr_coup[s..e])
     }
+}
+
+/// Pump `a(t_k) = a0 (k + 1) / n_step`.
+///
+/// The `k + 1` makes the final step run at full pump, where the restoring
+/// coefficient `a0 - a(t)` reaches zero and the coupling term alone decides the
+/// sign of each position. Callers guarantee `n_step >= 1`.
+#[inline]
+fn pump(step: usize, n_step: usize) -> Real {
+    A0 * (step + 1) as Real / n_step as Real
+}
+
+/// Draw one read's initial conditions, `x, y ~ U(-INIT_RANGE, INIT_RANGE)`.
+///
+/// Positions are drawn first, then momenta. The order is part of the kernel's
+/// reproducibility contract and the determinism fixture pins it.
+fn draw_initial_conditions(m: usize, rng: &mut SmallRng) -> (Vec<Real>, Vec<Real>) {
+    let x: Vec<Real> = (0..m)
+        .map(|_| rng.gen_range(-INIT_RANGE..=INIT_RANGE))
+        .collect();
+    let y: Vec<Real> = (0..m)
+        .map(|_| rng.gen_range(-INIT_RANGE..=INIT_RANGE))
+        .collect();
+    (x, y)
+}
+
+/// Integrate `n_step` SB steps in place over the given initial conditions.
+///
+/// `x` and `y` have length `g.num_particles()`: the graph's nodes, plus the
+/// ancilla at index `n` when the problem carries a bias.
+///
+/// The heating flag is a separate parameter rather than a read of
+/// `variant.gamma` so a test can force the heated path on a variant whose `γ`
+/// is zero. That equivalence is what makes the shipped discrete variant free of
+/// the heating cost while sharing one code path with the heated variants. It is
+/// named `_heated` until Task 6 gives it work.
+fn sb_run(
+    g: &SbGraph,
+    n_step: usize,
+    variant: SbVariant,
+    _heated: bool,
+    x: &mut [Real],
+    y: &mut [Real],
+) {
+    let n = g.num_nodes();
+    let m = x.len();
+    // `g(x_j)` for every particle, refreshed once per step so the force reads
+    // the OLD positions for every i.
+    let mut coupled: Vec<Real> = vec![0.0; m];
+
+    for k in 0..n_step {
+        // `-(a0 - a(t_k))`, folded into one multiply.
+        let restore = pump(k, n_step) - A0;
+
+        match variant.coupling {
+            Coupling::Discrete => {
+                for (c, &xi) in coupled.iter_mut().zip(x.iter()) {
+                    *c = if xi >= 0.0 { 1.0 } else { -1.0 };
+                }
+            }
+            Coupling::Continuous => coupled.copy_from_slice(x),
+        }
+
+        // Momentum first, from the OLD positions. `J_uv = -j_uv` and
+        // `J_{i,N} = -h_i`, so the coupling force carries a leading minus and
+        // the CSR can store the quip values unchanged.
+        for i in 0..n {
+            let (nodes, coups) = g.neighbors(i);
+            let mut f: Real = 0.0;
+            for (&v, &coup) in nodes.iter().zip(coups.iter()) {
+                f += coup * coupled[v as usize];
+            }
+            if g.has_bias {
+                f += g.h[i] * coupled[n];
+            }
+            y[i] += (restore * x[i] - g.c0 * f) * DT;
+        }
+        if g.has_bias {
+            let mut f: Real = 0.0;
+            for (&bias, &c) in g.h.iter().zip(coupled.iter()) {
+                f += bias * c;
+            }
+            y[n] += (restore * x[n] - g.c0 * f) * DT;
+        }
+
+        // Position from the NEW momentum, then the perfectly inelastic wall:
+        // the particle stops dead at x = ±1 rather than bouncing.
+        for (xi, yi) in x.iter_mut().zip(y.iter_mut()) {
+            *xi += A0 * *yi * DT;
+            if *xi > 1.0 {
+                *xi = 1.0;
+                *yi = 0.0;
+            } else if *xi < -1.0 {
+                *xi = -1.0;
+                *yi = 0.0;
+            }
+        }
+    }
+}
+
+/// Gauge-fix and drop the ancilla: `s_i = sgn(x_i) sgn(x_N)`.
+///
+/// The quadratic-only energy depends on products `s_i s_j`, so `s` and `-s`
+/// have equal energy and the ancilla's own sign is the gauge. The returned
+/// vector has length `num_nodes()`, matching the original graph.
+///
+/// A float position of exactly zero maps to `+1`, matching the reference
+/// package's `positions >= 0` rule. `sampler_core::spin_sign` maps an `i8` zero
+/// to `-1` instead. The two never meet: this is the only place SB crosses into
+/// `i8`, and it only ever writes ±1.
+fn gauge_fixed_spins(g: &SbGraph, x: &[Real]) -> Vec<i8> {
+    let n = g.num_nodes();
+    let gauge: i8 = if g.has_bias && x[n] < 0.0 { -1 } else { 1 };
+    x.iter()
+        .take(n)
+        .map(|&xi| gauge * if xi >= 0.0 { 1i8 } else { -1i8 })
+        .collect()
+}
+
+/// Run `num_reads` independent SB trajectories sequentially on one core.
+///
+/// Reads stay on a single core so the model's arrays stay hot in that core's
+/// cache. Model-level parallelism (one model per core) lives in the streaming
+/// pump.
+///
+/// # Examples
+///
+/// ```
+/// use quip_miner_cpu::{sample_sb, IsingGraph, SampleParams, DSB};
+///
+/// let graph = IsingGraph::new(vec![0.0, 0.0], vec![-1.0], vec![(0, 1)]);
+/// let params = SampleParams {
+///     num_reads: 4,
+///     num_sweeps: 256,
+///     seed: 1,
+///     ..Default::default()
+/// };
+/// let results = sample_sb(&graph, &params, DSB);
+/// assert_eq!(results.len(), params.num_reads);
+/// assert!(results.iter().all(|r| r.spins.iter().all(|&s| s == 1 || s == -1)));
+/// ```
+pub fn sample_sb(
+    graph: &IsingGraph,
+    params: &SampleParams,
+    variant: SbVariant,
+) -> Vec<SamplerResult> {
+    let num_reads = params.num_reads.max(1);
+    let g = SbGraph::from_base(graph);
+    let n_step = params.num_sweeps.max(1);
+    let heated = variant.gamma != 0.0;
+    let m = g.num_particles();
+    let base_seed = params.seed;
+
+    (0..num_reads)
+        .map(|read_idx| {
+            // Same derivation as `sampler_core::sample_ising`, so a benchmark
+            // can pair an SB run with an SA run on one job at one seed.
+            let seed = base_seed
+                .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                .wrapping_add(read_idx as u64)
+                .wrapping_add(1);
+            let mut rng = SmallRng::seed_from_u64(seed);
+            let (mut x, mut y) = draw_initial_conditions(m, &mut rng);
+            sb_run(&g, n_step, variant, heated, &mut x, &mut y);
+            let spins = gauge_fixed_spins(&g, &x);
+            SamplerResult {
+                energy_milli: energy_milli(&spins, &graph.h, &graph.j, &graph.edges),
+                spins,
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -244,6 +424,184 @@ mod tests {
                 gamma: 0.5
             }
         );
+    }
+
+    fn sb_params(num_reads: usize, num_sweeps: usize, seed: u64) -> SampleParams {
+        SampleParams {
+            num_reads,
+            num_sweeps,
+            seed,
+            ..Default::default()
+        }
+    }
+
+    /// Four nodes, mixed-sign couplings, nonzero biases. Exercises the ancilla,
+    /// several CSR rows, and both coupling forms without being slow.
+    fn mixed4() -> IsingGraph {
+        IsingGraph::new(
+            vec![0.5, -0.3, 0.1, 0.0],
+            vec![1.0, -0.5, 0.75, -1.25, 0.25],
+            vec![(0, 1), (1, 2), (0, 2), (2, 3), (0, 3)],
+        )
+    }
+
+    const ALL_VARIANTS: [SbVariant; 4] = [DSB, BSB, HDSB, HBSB];
+
+    /// Reads whose reported energy equals `want`.
+    fn count_at(results: &[SamplerResult], want: i64) -> usize {
+        results.iter().filter(|r| r.energy_milli == want).count()
+    }
+
+    /// Hypothesis: the pump reaches `a0` exactly on the final step. Starting the
+    /// index at zero instead of one would waste the last step at `a < a0`,
+    /// where the restoring coefficient never reaches zero and the coupling term
+    /// alone never decides the sign.
+    #[test]
+    fn pump_reaches_a0_exactly_on_the_final_step() {
+        assert_eq!(pump(0, 1), A0);
+        assert_eq!(pump(3, 4), A0);
+        assert_eq!(pump(0, 4), 0.25);
+        assert_eq!(pump(1, 4), 0.5);
+        for k in 0..99 {
+            assert!(
+                pump(k, 100) < pump(k + 1, 100),
+                "the pump must increase monotonically at step {k}"
+            );
+        }
+    }
+
+    /// Hypothesis: `J_uv = -j_uv`, so a negative quip coupling is
+    /// ferromagnetic in SB and the aligned answer must be the one SB reaches
+    /// more often. A sign error inverts the whole optimization silently, and it
+    /// would show up here as the opposed reads outnumbering the aligned ones.
+    ///
+    /// The assertion counts reads rather than demanding every read be optimal.
+    /// HbSB carries the largest heating rate in the family and is designed to
+    /// keep fluctuating late in the run instead of freezing, so a per-read
+    /// assertion would pin that variant's chaos rather than the sign
+    /// convention. A strict majority is what separates a correct kernel from an
+    /// inverted one, on every variant.
+    #[test]
+    fn ferromagnetic_pair_aligns() {
+        let g = IsingGraph::new(vec![0.0, 0.0], vec![-1.0], vec![(0, 1)]);
+        for variant in ALL_VARIANTS {
+            let results = sample_sb(&g, &sb_params(32, 256, 42), variant);
+            assert_eq!(results.len(), 32);
+            let aligned = count_at(&results, -1000);
+            let opposed = count_at(&results, 1000);
+            assert_eq!(
+                aligned + opposed,
+                32,
+                "{variant:?}: this graph has only two energies"
+            );
+            assert!(
+                aligned > opposed,
+                "{variant:?}: a negative quip coupling is ferromagnetic in SB, so aligned \
+                 reads must outnumber opposed ones; got {aligned} aligned, {opposed} opposed"
+            );
+        }
+    }
+
+    /// Hypothesis: a positive quip coupling is antiferromagnetic in SB.
+    #[test]
+    fn antiferromagnetic_pair_anti_aligns() {
+        let g = IsingGraph::new(vec![0.0, 0.0], vec![1.0], vec![(0, 1)]);
+        for variant in ALL_VARIANTS {
+            let results = sample_sb(&g, &sb_params(32, 256, 43), variant);
+            let opposed = count_at(&results, -1000);
+            let aligned = count_at(&results, 1000);
+            assert_eq!(
+                aligned + opposed,
+                32,
+                "{variant:?}: this graph has only two energies"
+            );
+            assert!(
+                opposed > aligned,
+                "{variant:?}: a positive quip coupling is antiferromagnetic in SB, so \
+                 opposed reads must outnumber aligned ones; got {opposed} opposed, \
+                 {aligned} aligned"
+            );
+        }
+    }
+
+    /// Hypothesis: the ancilla column is `J_{i,N} = -h_i`, so a positive bias
+    /// and its ancilla anti-align, and the gauge fix `s_i = sgn(x_i) sgn(x_N)`
+    /// returns `-1` whichever side the ancilla itself lands on. This is the
+    /// direct test of the ancilla wiring and the gauge fix together: without the
+    /// gauge fix the answer would be the ancilla's coin flip.
+    #[test]
+    fn positive_bias_tilts_spin_negative() {
+        let g = IsingGraph::new(vec![1.0], vec![], vec![]);
+        for variant in ALL_VARIANTS {
+            let results = sample_sb(&g, &sb_params(32, 256, 44), variant);
+            let negative = count_at(&results, -1000);
+            let positive = count_at(&results, 1000);
+            assert_eq!(
+                negative + positive,
+                32,
+                "{variant:?}: this graph has only two energies"
+            );
+            assert!(
+                negative > positive,
+                "{variant:?}: a positive bias must tilt the spin negative through the \
+                 ancilla and the gauge fix; got {negative} negative, {positive} positive"
+            );
+        }
+    }
+
+    /// Hypothesis: the bias enters the normalization as well as the force.
+    /// Dropping it from `||J||_F` would leave `c0` too large on a bias-heavy
+    /// instance and let the bias overwhelm the coupling, which the first three
+    /// sign tests cannot detect.
+    ///
+    /// `h = [2.0, -0.5]` with one ferromagnetic edge `j = -1.0`. Per-spin greedy
+    /// on the biases alone picks `(-1, +1)` at -1500. The optimum `(-1, -1)` at
+    /// -2500 forces node 1 against its own bias, because the coupling is
+    /// stronger than that bias.
+    #[test]
+    fn mixed_bias_and_coupling_beats_greedy() {
+        let g = IsingGraph::new(vec![2.0, -0.5], vec![-1.0], vec![(0, 1)]);
+        for variant in ALL_VARIANTS {
+            let results = sample_sb(&g, &sb_params(32, 512, 45), variant);
+            let best = results
+                .iter()
+                .map(|r| r.energy_milli)
+                .min()
+                .expect("num_reads > 0");
+            assert_eq!(
+                best,
+                -2500,
+                "{variant:?}: SB must reach the coupling-driven optimum (-1, -1), got {:?}",
+                results
+                    .iter()
+                    .map(|r| (r.spins.clone(), r.energy_milli))
+                    .collect::<Vec<_>>()
+            );
+            assert!(
+                results
+                    .iter()
+                    .any(|r| r.spins == vec![-1i8, -1i8] && r.energy_milli == -2500),
+                "{variant:?}: the optimal energy must come from the optimal spins"
+            );
+        }
+    }
+
+    /// Hypothesis: every reported energy equals consensus scoring of its own
+    /// spins, and every spin is a valid wire value.
+    #[test]
+    fn reported_energies_match_consensus_scoring() {
+        let g = mixed4();
+        for variant in ALL_VARIANTS {
+            for r in sample_sb(&g, &sb_params(8, 256, 46), variant) {
+                assert!(r.spins.iter().all(|&s| s == 1 || s == -1));
+                assert_eq!(r.spins.len(), g.h.len());
+                assert_eq!(
+                    r.energy_milli,
+                    energy_milli(&r.spins, &g.h, &g.j, &g.edges),
+                    "{variant:?}: reported energy must equal consensus scoring"
+                );
+            }
+        }
     }
 
     /// Self-loop, out-of-range edge, and a `j` vector shorter than `edges`. All
