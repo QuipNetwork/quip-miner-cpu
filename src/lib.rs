@@ -8,9 +8,11 @@
 //! the [`CpuSampler`] backend and the two binaries.
 
 pub mod sampler_core;
+pub mod sb_core;
 
 pub use quip_miner_core::{Algorithm, IsingGraph, SampleParams, SamplerResult};
 pub use sampler_core::sample_ising;
+pub use sb_core::{Coupling, SbVariant, BSB, DSB, HBSB, HDSB};
 
 use quip_miner_core::adapt::AdaptBounds;
 use quip_miner_core::{

@@ -19,6 +19,13 @@ path = "src/bin/quip_cpu_sa.rs"
 name = "quip-cpu-gibbs"
 path = "src/bin/quip_cpu_gibbs.rs"
 
+# Experimental backends are developer-built only. CI tests and lints them with
+# --all-features; it must never package them into release assets. The feature is
+# empty because the modules compile unconditionally and only the [[bin]] targets
+# are gated.
+[features]
+experimental = []
+
 # Single-crate package, so lints live here rather than in [workspace.lints].
 [lints.rust]
 nonstandard-style     = "warn"
