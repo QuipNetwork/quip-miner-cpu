@@ -656,6 +656,108 @@ mod tests {
         }
     }
 
+    /// Minimum energy over all `2^n` configurations, in milli units. Only safe
+    /// for `n <= 24`; every caller here stays at or below 14.
+    fn brute_force_min_energy(g: &IsingGraph) -> i64 {
+        let n = g.h.len();
+        let mut best = i64::MAX;
+        for mask in 0u32..(1u32 << n) {
+            let spins: Vec<i8> = (0..n)
+                .map(|i| if (mask >> i) & 1 == 1 { 1i8 } else { -1i8 })
+                .collect();
+            best = best.min(energy_milli(&spins, &g.h, &g.j, &g.edges));
+        }
+        best
+    }
+
+    /// Every edge antiferromagnetic, so no assignment satisfies all three.
+    /// Six of the eight configurations are ground states.
+    fn frustrated_triangle() -> IsingGraph {
+        IsingGraph::new(
+            vec![0.0; 3],
+            vec![1.0, 1.0, 1.0],
+            vec![(0, 1), (1, 2), (0, 2)],
+        )
+    }
+
+    /// Twelve-node ring with alternating coupling signs and one nonzero bias.
+    fn ring12() -> IsingGraph {
+        let edges: Vec<(usize, usize)> = (0..12).map(|i| (i, (i + 1) % 12)).collect();
+        let j: Vec<f64> = (0..12)
+            .map(|k| if k % 2 == 0 { -1.0 } else { 1.0 })
+            .collect();
+        let mut h = vec![0.0; 12];
+        h[0] = 0.5;
+        IsingGraph::new(h, j, edges)
+    }
+
+    /// Fourteen nodes, mixed-sign couplings and nonzero biases everywhere,
+    /// drawn once from a fixed seed so the fixture is stable.
+    fn mixed_random14() -> IsingGraph {
+        let mut rng = SmallRng::seed_from_u64(20_260_807);
+        let h: Vec<f64> = (0..14).map(|_| rng.gen_range(-1.0..=1.0)).collect();
+        let mut edges = Vec::new();
+        for u in 0..14 {
+            for v in (u + 1)..14 {
+                if rng.gen::<f64>() < 0.35 {
+                    edges.push((u, v));
+                }
+            }
+        }
+        let j: Vec<f64> = (0..edges.len()).map(|_| rng.gen_range(-1.0..=1.0)).collect();
+        IsingGraph::new(h, j, edges)
+    }
+
+    /// Hypothesis: every variant reaches the true ground state of a small
+    /// frustrated instance. The triangle is tiny and six of its eight
+    /// configurations are optimal, so this is the cheap correctness gate that
+    /// exercises all four variant switches.
+    #[test]
+    fn every_variant_finds_the_frustrated_triangle_ground_state() {
+        let g = frustrated_triangle();
+        let want = brute_force_min_energy(&g);
+        assert_eq!(want, -1000, "triangle ground energy");
+        for variant in ALL_VARIANTS {
+            let results = sample_sb(&g, &sb_params(32, 512, 2026), variant);
+            let best = results
+                .iter()
+                .map(|r| r.energy_milli)
+                .min()
+                .expect("num_reads > 0");
+            assert_eq!(best, want, "{variant:?}: best {best} != brute-force {want}");
+        }
+    }
+
+    /// Hypothesis: the discrete variants reach the true ground state of larger
+    /// instances at a sensible step count. The ballistic variants are excluded
+    /// here on purpose: Kanao and Goto rank solution quality
+    /// HbSB > HdSB > dSB > bSB, and bSB reaching an exact ground state is not a
+    /// claim this plan makes. If a discrete variant fails, that is a finding
+    /// about the kernel or the constants; report it rather than weakening the
+    /// assertion or raising the budget without recording why.
+    #[test]
+    fn discrete_variants_find_brute_forced_ground_states() {
+        let cases: Vec<(&str, IsingGraph, usize, usize)> = vec![
+            ("ring12", ring12(), 64, 2048),
+            ("mixed_random14", mixed_random14(), 128, 4096),
+        ];
+        for (name, g, reads, sweeps) in cases {
+            let want = brute_force_min_energy(&g);
+            for variant in [DSB, HDSB] {
+                let results = sample_sb(&g, &sb_params(reads, sweeps, 2026), variant);
+                let best = results
+                    .iter()
+                    .map(|r| r.energy_milli)
+                    .min()
+                    .expect("num_reads > 0");
+                assert_eq!(
+                    best, want,
+                    "{name} / {variant:?}: best {best} != brute-force ground {want}"
+                );
+            }
+        }
+    }
+
     /// Hypothesis: a graph with no variables returns `num_reads` empty spin
     /// vectors at energy 0 without allocating state or running the integrator.
     #[test]
