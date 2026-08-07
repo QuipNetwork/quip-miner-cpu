@@ -120,6 +120,10 @@ struct SbGraph {
     nbr_coup: Vec<Real>,
     /// True when any `h_i != 0`. The ancilla exists only then.
     has_bias: bool,
+    /// Coupling normalization `0.5 sqrt(n_spins - 1) / ||J||_F`, computed once
+    /// per job. Zero when the problem carries no scale or the inputs are not
+    /// finite.
+    c0: Real,
 }
 
 impl SbGraph {
@@ -141,11 +145,16 @@ impl SbGraph {
         let mut nbr_node = vec![0u32; total];
         let mut nbr_coup: Vec<Real> = vec![0.0; total];
         let mut cursor: Vec<u32> = nbr_start[..n].to_vec();
+        // Frobenius norm accumulates in f64: tens of thousands of edges with
+        // |j| near 1 lose precision in f32, and c0 divides by its square root.
+        let mut sum_sq = 0.0f64;
         for (k, &(u, v)) in g.edges.iter().enumerate() {
             if u >= n || v >= n || u == v {
                 continue;
             }
-            let coup = g.j.get(k).copied().unwrap_or(0.0) as Real;
+            let coup_f64 = g.j.get(k).copied().unwrap_or(0.0);
+            sum_sq += coup_f64 * coup_f64;
+            let coup = coup_f64 as Real;
             let pu = cursor[u] as usize;
             nbr_node[pu] = v as u32;
             nbr_coup[pu] = coup;
@@ -155,12 +164,32 @@ impl SbGraph {
             nbr_coup[pv] = coup;
             cursor[v] += 1;
         }
+        let has_bias = g.h.iter().any(|&b| b != 0.0);
+        for &b in &g.h {
+            sum_sq += b * b;
+        }
+        // Each surviving edge contributes j^2 twice to the full symmetric
+        // matrix, and each bias contributes h^2 twice (ancilla row and column).
+        let norm_sq = 2.0 * sum_sq;
+        let n_spins = n + usize::from(has_bias);
+        let c0_f64 = if norm_sq > 0.0 && n_spins > 1 {
+            0.5 * ((n_spins - 1) as f64).sqrt() / norm_sq.sqrt()
+        } else {
+            0.0
+        };
+        // Narrow after the division, then check: a tiny ||J||_F can push c0
+        // past f32::MAX even when the f64 value is finite, and a non-finite h
+        // or j makes the sum itself non-finite. Either way the kernel runs with
+        // no coupling force and returns valid spins; the scorer decides.
+        let c0_narrow = c0_f64 as Real;
+        let c0 = if c0_narrow.is_finite() { c0_narrow } else { 0.0 };
         Self {
             h: g.h.iter().map(|&b| b as Real).collect(),
             nbr_start,
             nbr_node,
             nbr_coup,
-            has_bias: g.h.iter().any(|&b| b != 0.0),
+            has_bias,
+            c0,
         }
     }
 
@@ -264,6 +293,85 @@ mod tests {
         assert_eq!(sb.neighbors(2).0, &[1]);
         assert_eq!(sb.neighbors(2).1, &[0.0]);
         assert!(sb.has_bias, "h = [0.5, -0.25, 0.0] carries a bias");
+    }
+
+    /// Hypothesis: `c0 = 0.5 sqrt(n_spins - 1) / ||J||_F` with
+    /// `||J||_F^2 = 2 (Σ j^2 + Σ h^2)` and `n_spins = N + 1` when the ancilla
+    /// exists. Here N = 2, one edge with j = -1, biases [1.0, 0.0], so
+    /// `||J||_F^2 = 2(1 + 1) = 4` and `n_spins = 3`.
+    #[test]
+    fn c0_matches_the_closed_form_with_the_ancilla() {
+        let g = IsingGraph::new(vec![1.0, 0.0], vec![-1.0], vec![(0, 1)]);
+        let sb = SbGraph::from_base(&g);
+        let want = 0.5 * 2.0f64.sqrt() / 4.0f64.sqrt();
+        assert!(
+            (f64::from(sb.c0) - want).abs() < 1e-6,
+            "c0 = {} want {want}",
+            sb.c0
+        );
+    }
+
+    /// Hypothesis: only edges that survive the defensive filter may enter
+    /// `Σ j^2`. Counting a self-loop or an out-of-range edge in the
+    /// normalization while the force loop skips it would shrink `c0` on any
+    /// graph that carries one, and the two would disagree silently.
+    #[test]
+    fn self_loop_and_out_of_range_edges_are_excluded_from_c0() {
+        let plain = IsingGraph::new(vec![0.0, 0.0], vec![-1.0], vec![(0, 1)]);
+        let looped = IsingGraph::new(vec![0.0, 0.0], vec![-1.0, 50.0], vec![(0, 1), (1, 1)]);
+        let ranged = IsingGraph::new(vec![0.0, 0.0], vec![-1.0, 50.0], vec![(0, 1), (0, 9)]);
+        let want = SbGraph::from_base(&plain).c0;
+        assert_eq!(SbGraph::from_base(&looped).c0, want);
+        assert_eq!(SbGraph::from_base(&ranged).c0, want);
+    }
+
+    /// Hypothesis: the zero guard covers every problem with no scale to
+    /// normalize against. `c0` is the only division in the kernel, so it must
+    /// never run on a zero denominator.
+    #[test]
+    fn c0_is_zero_when_the_problem_carries_no_scale() {
+        let empty = SbGraph::from_base(&IsingGraph::new(vec![], vec![], vec![]));
+        assert_eq!(empty.c0, 0.0);
+        let all_zero = SbGraph::from_base(&IsingGraph::new(vec![0.0, 0.0], vec![0.0], vec![(0, 1)]));
+        assert_eq!(all_zero.c0, 0.0);
+        let single = SbGraph::from_base(&IsingGraph::new(vec![0.0], vec![], vec![]));
+        assert_eq!(single.c0, 0.0);
+    }
+
+    /// Hypothesis: a non-finite bias or coupling on the wire must not produce a
+    /// non-finite `c0`. `energy_milli` already scores a non-finite problem as
+    /// its `1 << 62` sentinel, so the kernel matches that posture instead of
+    /// adding validation. It must not panic: `clippy::panic` is denied and a
+    /// malformed job must not take down a mining session.
+    #[test]
+    fn c0_is_zero_for_non_finite_biases_or_couplings() {
+        let nan_bias = SbGraph::from_base(&IsingGraph::new(
+            vec![f64::NAN, 0.0],
+            vec![-1.0],
+            vec![(0, 1)],
+        ));
+        assert_eq!(nan_bias.c0, 0.0);
+        let inf_coupling = SbGraph::from_base(&IsingGraph::new(
+            vec![0.0, 0.0],
+            vec![f64::INFINITY],
+            vec![(0, 1)],
+        ));
+        assert_eq!(inf_coupling.c0, 0.0);
+    }
+
+    /// Hypothesis: the bias belongs in the normalization. The ancilla
+    /// construction forces it, because bias values become matrix entries that
+    /// SB normalizes. A bias-only problem is solvable and must get a positive
+    /// `c0` through the ancilla column.
+    #[test]
+    fn bias_only_graph_gets_a_positive_c0_through_the_ancilla() {
+        let sb = SbGraph::from_base(&IsingGraph::new(vec![1.0], vec![], vec![]));
+        assert!(sb.has_bias);
+        assert!(
+            sb.c0 > 0.0,
+            "bias-only graph must normalize through the ancilla, got {}",
+            sb.c0
+        );
     }
 
     /// Hypothesis: an all-zero bias vector means no ancilla.
