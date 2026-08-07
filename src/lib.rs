@@ -11,6 +11,7 @@
 //! propagation cannot drift between them.
 
 mod coloring;
+mod spin_barrier;
 pub mod gibbs_parallel;
 pub mod sampler_core;
 pub mod sb_core;
@@ -18,7 +19,7 @@ pub mod sb_sampler;
 
 pub use quip_miner_core::{Algorithm, IsingGraph, SampleParams, SamplerResult};
 pub use sampler_core::sample_ising;
-pub use sb_core::{sample_sb, Coupling, SbVariant, BSB, DSB, HBSB, HDSB};
+pub use sb_core::{sample_sb, sample_sb_with_workers, Coupling, SbVariant, BSB, DSB, HBSB, HDSB};
 pub use gibbs_parallel::{ConfigError, GibbsConfig};
 pub use sb_sampler::{SbSampler, CPU_SB_IDENTITY};
 

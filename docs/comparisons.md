@@ -247,10 +247,36 @@ barrier to collapse at. Goto and colleagues make this the central property of
 the method: every particle updates from the previous positions, so the update
 carries no ordering constraint. Let the operator choose the count.
 
-This measures parallelism across reads only. The papers emphasise a second
-kind, across the particles inside one read, which starts to matter once the
-read count falls below the core count. No code here does that, so it stays
-unmeasured.
+### Particle-level parallelism for Simulated Bifurcation
+
+`sample_sb_with_workers` splits the particles inside one read. Two barriers
+guard each step: one publishes the coupling vector, the other stops a fast
+worker starting the next step while a slow one still reads the current one.
+The output is bit-identical at every worker count, which
+`parallel_matches_sequential_bit_for_bit` pins across all four variants.
+
+One read by 1000 steps, median of 5, so the only parallelism available is
+across particles:
+
+| workers | 4577 nodes | speedup | 18308 nodes | speedup |
+|--------:|-----------:|--------:|------------:|--------:|
+| 1 | 140 ms | 1.00 | 429 ms | 1.00 |
+| 2 | 72 ms | 1.95 | 338 ms | 1.27 |
+| 4 | 56 ms | 2.48 | 277 ms | 1.55 |
+| 6 | 114 ms | 1.22 | 199 ms | 2.15 |
+| 8 | 83 ms | 1.69 | 173 ms | 2.48 |
+| 12 | 546 ms | 0.26 | 234 ms | 1.84 |
+| 16 | 660 ms | 0.21 | 783 ms | 0.55 |
+
+Particle-level parallelism peaks near 2.5, and the best worker count grows with
+the problem: 4 workers at 4577 nodes, 8 at 18308. That is the barrier again.
+Larger problems put more work between two barriers, so more workers pay off.
+Oversubscription collapses this kernel as it collapses Gibbs.
+
+Read-level parallelism reaches 6.54 at 16 threads and never regresses, so
+prefer it whenever the read count reaches the core count. Reach for
+particle-level parallelism when the read count is the smaller number, which is
+where it cuts the latency of a single read.
 
 ### Colouring the pivot topology
 

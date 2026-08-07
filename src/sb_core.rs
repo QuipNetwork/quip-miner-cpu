@@ -29,10 +29,14 @@
 //! dynamics are deterministic for every variant, including the heated ones, so
 //! read diversity comes entirely from the initial condition.
 
+use std::sync::atomic::{AtomicU32, Ordering};
+
 use quip_miner_core::{IsingGraph, SampleParams, SamplerResult};
 use quip_protocol::scoring::energy_milli;
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
+
+use crate::spin_barrier::SpinBarrier;
 
 /// Internal state precision. One line changes the whole kernel to f64 for a
 /// benchmark build; the reported energy never depends on it, because the
@@ -330,6 +334,122 @@ fn sb_run(
     }
 }
 
+/// Integrate `n_step` SB steps across `workers` threads.
+///
+/// Simulated Bifurcation carries no ordering constraint inside a step: the
+/// force reads the previous positions, so every particle updates independently.
+/// That is the property Goto and colleagues build the method on, and it is why
+/// this needs no colouring and no per-class barrier. Workers own a contiguous
+/// slice of the particles for the whole run.
+///
+/// Two barriers per step. The first publishes `coupled` before any worker reads
+/// a neighbour's entry. The second stops a fast worker starting the next step's
+/// `coupled` write while a slow worker still reads the current one.
+///
+/// Randomness enters only at initialization, and each particle's arithmetic is
+/// unchanged, so the result is bit-identical to [`sb_run`] at any worker count.
+/// `parallel_matches_sequential_bit_for_bit` pins that.
+fn sb_run_parallel(
+    g: &SbGraph,
+    n_step: usize,
+    variant: SbVariant,
+    heated: bool,
+    x: &mut [Real],
+    y: &mut [Real],
+    workers: usize,
+) {
+    let m = x.len();
+    let n = g.num_nodes();
+    // f32 bit patterns behind atomics: workers write disjoint indices but read
+    // every entry of `coupled`, which Rust cannot express with split borrows.
+    let xa: Vec<AtomicU32> = x.iter().map(|v| AtomicU32::new(v.to_bits())).collect();
+    let ya: Vec<AtomicU32> = y.iter().map(|v| AtomicU32::new(v.to_bits())).collect();
+    let ca: Vec<AtomicU32> = (0..m).map(|_| AtomicU32::new(0)).collect();
+    let barrier = SpinBarrier::new(workers);
+
+    std::thread::scope(|scope| {
+        for wid in 0..workers {
+            let (xa, ya, ca, barrier) = (&xa, &ya, &ca, &barrier);
+            scope.spawn(move || {
+                let chunk = m.div_ceil(workers);
+                let lo = (wid * chunk).min(m);
+                let hi = (lo + chunk).min(m);
+                let mut sense = false;
+                let mut y_pre: Vec<Real> = vec![0.0; if heated { hi - lo } else { 0 }];
+
+                for k in 0..n_step {
+                    let restore = pump(k, n_step) - A0;
+
+                    for i in lo..hi {
+                        let xi = Real::from_bits(xa[i].load(Ordering::Relaxed));
+                        let c = match variant.coupling {
+                            Coupling::Discrete => {
+                                if xi >= 0.0 {
+                                    1.0
+                                } else {
+                                    -1.0
+                                }
+                            }
+                            Coupling::Continuous => xi,
+                        };
+                        ca[i].store(c.to_bits(), Ordering::Relaxed);
+                        if heated {
+                            y_pre[i - lo] = Real::from_bits(ya[i].load(Ordering::Relaxed));
+                        }
+                    }
+                    barrier.wait(&mut sense);
+
+                    for i in lo..hi {
+                        // The ancilla's force is a reduction over every bias, so
+                        // whichever worker owns index `n` performs it. Handing
+                        // it to worker 0 instead would need a third barrier.
+                        let f: Real = if i == n {
+                            let mut acc: Real = 0.0;
+                            for (bias, c) in g.h.iter().zip(ca.iter()) {
+                                acc += bias * Real::from_bits(c.load(Ordering::Relaxed));
+                            }
+                            acc
+                        } else {
+                            let (nodes, coups) = g.neighbors(i);
+                            let mut acc: Real = 0.0;
+                            for (&v, &coup) in nodes.iter().zip(coups.iter()) {
+                                acc += coup * Real::from_bits(ca[v as usize].load(Ordering::Relaxed));
+                            }
+                            if g.has_bias {
+                                acc += g.h[i] * Real::from_bits(ca[n].load(Ordering::Relaxed));
+                            }
+                            acc
+                        };
+
+                        let xi = Real::from_bits(xa[i].load(Ordering::Relaxed));
+                        let mut yi = Real::from_bits(ya[i].load(Ordering::Relaxed));
+                        yi += (restore * xi - g.c0 * f) * DT;
+                        let mut xi = xi + A0 * yi * DT;
+                        if xi > 1.0 {
+                            xi = 1.0;
+                            yi = 0.0;
+                        } else if xi < -1.0 {
+                            xi = -1.0;
+                            yi = 0.0;
+                        }
+                        if heated {
+                            yi += variant.gamma * y_pre[i - lo] * DT;
+                        }
+                        xa[i].store(xi.to_bits(), Ordering::Relaxed);
+                        ya[i].store(yi.to_bits(), Ordering::Relaxed);
+                    }
+                    barrier.wait(&mut sense);
+                }
+            });
+        }
+    });
+
+    for (i, (xv, yv)) in x.iter_mut().zip(y.iter_mut()).enumerate() {
+        *xv = Real::from_bits(xa[i].load(Ordering::Relaxed));
+        *yv = Real::from_bits(ya[i].load(Ordering::Relaxed));
+    }
+}
+
 /// Gauge-fix and drop the ancilla: `s_i = sgn(x_i) sgn(x_N)`.
 ///
 /// The quadratic-only energy depends on products `s_i s_j`, so `s` and `-s`
@@ -376,6 +496,22 @@ pub fn sample_sb(
     params: &SampleParams,
     variant: SbVariant,
 ) -> Vec<SamplerResult> {
+    sample_sb_with_workers(graph, params, variant, 1)
+}
+
+/// Sample with `workers` threads splitting the particles inside every read.
+///
+/// Simulated Bifurcation has no ideal worker count. Throughput rises
+/// monotonically with workers until the host runs out of cores, because the
+/// integrator carries no ordering constraint inside a step. The output is
+/// bit-identical at every count, so this setting trades latency for cores and
+/// nothing else.
+pub fn sample_sb_with_workers(
+    graph: &IsingGraph,
+    params: &SampleParams,
+    variant: SbVariant,
+    workers: usize,
+) -> Vec<SamplerResult> {
     let num_reads = params.num_reads.max(1);
     let g = SbGraph::from_base(graph);
     let n_step = params.num_sweeps.max(1);
@@ -404,7 +540,11 @@ pub fn sample_sb(
                 .wrapping_add(1);
             let mut rng = SmallRng::seed_from_u64(seed);
             let (mut x, mut y) = draw_initial_conditions(m, &mut rng);
-            sb_run(&g, n_step, variant, heated, &mut x, &mut y);
+            if workers <= 1 {
+                sb_run(&g, n_step, variant, heated, &mut x, &mut y);
+            } else {
+                sb_run_parallel(&g, n_step, variant, heated, &mut x, &mut y, workers);
+            }
             let spins = gauge_fixed_spins(&g, &x);
             SamplerResult {
                 energy_milli: energy_milli(&spins, &graph.h, &graph.j, &graph.edges),
@@ -506,6 +646,59 @@ mod tests {
     /// Reads whose reported energy equals `want`.
     fn count_at(results: &[SamplerResult], want: i64) -> usize {
         results.iter().filter(|r| r.energy_milli == want).count()
+    }
+
+    /// Hypothesis: the particle-parallel integrator reproduces the sequential
+    /// one bit for bit at every worker count. Randomness enters only at
+    /// initialization and each particle's arithmetic is unchanged, so any
+    /// difference means a worker read a neighbour mid-update or the barriers
+    /// let a step overlap the next one. Both are races that a tolerance-based
+    /// check would hide.
+    #[test]
+    fn parallel_matches_sequential_bit_for_bit() {
+        for g in [mixed4(), ring12(), mixed_random14()] {
+            let sb = SbGraph::from_base(&g);
+            let m = sb.num_particles();
+            for variant in ALL_VARIANTS {
+                let heated = variant.gamma != 0.0;
+                let (x0, y0) = draw_initial_conditions(m, &mut SmallRng::seed_from_u64(4));
+
+                let (mut xs, mut ys) = (x0.clone(), y0.clone());
+                sb_run(&sb, 200, variant, heated, &mut xs, &mut ys);
+                let bits = |v: &[Real]| v.iter().map(|f| f.to_bits()).collect::<Vec<_>>();
+
+                for workers in [2usize, 3, 4, 8] {
+                    let (mut xp, mut yp) = (x0.clone(), y0.clone());
+                    sb_run_parallel(&sb, 200, variant, heated, &mut xp, &mut yp, workers);
+                    assert_eq!(
+                        bits(&xs),
+                        bits(&xp),
+                        "{variant:?}: positions differ at {workers} workers"
+                    );
+                    assert_eq!(
+                        bits(&ys),
+                        bits(&yp),
+                        "{variant:?}: momenta differ at {workers} workers"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Hypothesis: the worker count is invisible through the public sampler
+    /// too, including the ancilla path and the gauge fix.
+    #[test]
+    fn sample_sb_is_identical_at_every_worker_count() {
+        let g = mixed_random14();
+        let params = sb_params(4, 256, 31);
+        let want = sample_sb_with_workers(&g, &params, DSB, 1);
+        for workers in [2usize, 4, 8] {
+            assert_eq!(
+                sample_sb_with_workers(&g, &params, DSB, workers),
+                want,
+                "{workers} workers changed the result"
+            );
+        }
     }
 
     /// Hypothesis: the pump reaches `a0` exactly on the final step. Starting the

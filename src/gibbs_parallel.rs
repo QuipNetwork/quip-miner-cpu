@@ -17,7 +17,9 @@
 //!   the protocol requires that one seed and one binary reproduce one result on
 //!   any machine.
 
-use std::sync::atomic::{AtomicBool, AtomicI8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI8, Ordering};
+
+use crate::spin_barrier::SpinBarrier;
 
 use quip_miner_core::{IsingGraph, SampleParams, SamplerResult};
 use quip_protocol::scoring::energy_milli;
@@ -215,51 +217,6 @@ pub(crate) fn gibbs_read(
             });
         }
     });
-}
-
-/// Sense-reversing spin barrier.
-///
-/// A class update is one or two microseconds of work per worker, and a sweep
-/// crosses one barrier per class. A mutex-and-condvar barrier costs more than
-/// the work it separates at that granularity, so this spins instead.
-struct SpinBarrier {
-    waiting: AtomicUsize,
-    sense: AtomicBool,
-    workers: usize,
-}
-
-impl SpinBarrier {
-    fn new(workers: usize) -> Self {
-        Self {
-            waiting: AtomicUsize::new(0),
-            sense: AtomicBool::new(false),
-            workers,
-        }
-    }
-
-    /// `local` carries this worker's expected sense and flips on every call.
-    fn wait(&self, local: &mut bool) {
-        *local = !*local;
-        if self.waiting.fetch_add(1, Ordering::AcqRel) + 1 == self.workers {
-            self.waiting.store(0, Ordering::Release);
-            self.sense.store(*local, Ordering::Release);
-        } else {
-            // Spin briefly, then yield. A pure spin collapses under
-            // oversubscription: spinning workers hold cores that runnable
-            // workers need, and the barrier never completes on time. Measured
-            // at 16 workers on a 12-core host, a pure spin ran roughly 90 times
-            // slower than one worker.
-            let mut spins = 0u32;
-            while self.sense.load(Ordering::Acquire) != *local {
-                if spins < 512 {
-                    std::hint::spin_loop();
-                    spins += 1;
-                } else {
-                    std::thread::yield_now();
-                }
-            }
-        }
-    }
 }
 
 /// Resample every node in `part`, which must lie inside one colour class.
