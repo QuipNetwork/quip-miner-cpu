@@ -19,6 +19,12 @@ path = "src/bin/quip_cpu_sa.rs"
 name = "quip-cpu-gibbs"
 path = "src/bin/quip_cpu_gibbs.rs"
 
+# Not feature-gated: discrete SB is the production track. The three other SB
+# variants ship as experimental binaries in a later change.
+[[bin]]
+name = "quip-cpu-sb"
+path = "src/bin/quip_cpu_sb.rs"
+
 # Experimental backends are developer-built only. CI tests and lints them with
 # --all-features; it must never package them into release assets. The feature is
 # empty because the modules compile unconditionally and only the [[bin]] targets
