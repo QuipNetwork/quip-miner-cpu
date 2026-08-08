@@ -95,8 +95,8 @@ under `/usr/bin/time -p` and divide user time by real time. A single-core kernel
 returns a ratio near 1.
 
 `cpu-sa` and `cpu-sb` occupy one core per sample. `cpu-gibbs` occupies
-`DEFAULT_GIBBS_WORKERS`, which is 4: chromatic Gibbs splits each colour class
-across workers, so it spends 4 core-seconds for every wall-clock second.
+`DEFAULT_GIBBS_WORKERS`, which is 4: it hands each worker a whole read, so it
+spends 4 core-seconds for every wall-clock second.
 `CpuSampler::stream_width` divides the model count by the worker count to keep
 the host from oversubscribing itself.
 
@@ -111,127 +111,126 @@ at every size. Both numbers are a starting point, not a tuned setting. The
 adapt envelope for `cpu-sb` allows 256 to 8192 sweeps, and those bounds are
 provisional.
 
-## Results of the first run
+## Results
 
-Measured on darwin-arm64 with 12 performance and 4 efficiency cores. The figure is
+Measured on darwin-arm64 with 12 performance and 4 efficiency cores, under
+`caffeinate`. The figure is
 [`comparisons/kernel_comparison.svg`](comparisons/kernel_comparison.svg). The
 per-sample data is [`comparisons/results.json`](comparisons/results.json).
 
-| kernel | nodes | edges | cores | reads | sweeps | best energy over 30 samples | mean time per sample |
-|--------|------:|------:|------:|------:|-------:|----------------------------:|---------------------:|
-| cpu-sa | 1144 | 9297 | 1 | 16 | 1000 | -3405000 | 234 ms |
-| cpu-gibbs | 1144 | 9297 | 1 | 16 | 1000 | -3389000 | 319 ms |
-| cpu-sb | 1144 | 9297 | 1 | 16 | 1000 | -3399000 | 243 ms |
-| cpu-sa | 2289 | 19578 | 1 | 16 | 1000 | -6968000 | 512 ms |
-| cpu-gibbs | 2289 | 19578 | 1 | 16 | 1000 | -6950000 | 644 ms |
-| cpu-sb | 2289 | 19578 | 1 | 16 | 1000 | -6972000 | 533 ms |
-| cpu-sa | 3433 | 30556 | 1 | 16 | 1000 | -10676000 | 757 ms |
-| cpu-gibbs | 3433 | 30556 | 1 | 16 | 1000 | -10664000 | 941 ms |
-| cpu-sb | 3433 | 30556 | 1 | 16 | 1000 | -10706000 | 824 ms |
-| cpu-sa | 4577 | 41515 | 1 | 16 | 1000 | -14397000 | 1012 ms |
-| cpu-gibbs | 4577 | 41515 | 1 | 16 | 1000 | -14377000 | 1330 ms |
-| cpu-sb | 4577 | 41515 | 1 | 16 | 1000 | -14399000 | 1281 ms |
-| cpu-sa | 5721 | 51891 | 1 | 16 | 1000 | -18031000 | 1255 ms |
-| cpu-gibbs | 5721 | 51891 | 1 | 16 | 1000 | -17985000 | 1677 ms |
-| cpu-sb | 5721 | 51891 | 1 | 16 | 1000 | -18039000 | 1535 ms |
-| cpu-sa | 6866 | 62277 | 1 | 16 | 1000 | -21609000 | 1532 ms |
-| cpu-gibbs | 6866 | 62277 | 1 | 16 | 1000 | -21493000 | 2116 ms |
-| cpu-sb | 6866 | 62277 | 1 | 16 | 1000 | -21601000 | 1817 ms |
-| cpu-sa | 8010 | 72654 | 1 | 16 | 1000 | -24996000 | 1777 ms |
-| cpu-gibbs | 8010 | 72654 | 1 | 16 | 1000 | -24870000 | 2363 ms |
-| cpu-sb | 8010 | 72654 | 1 | 16 | 1000 | -25060000 | 2268 ms |
-| cpu-sa | 9154 | 83030 | 1 | 16 | 1000 | -28694000 | 1879 ms |
-| cpu-gibbs | 9154 | 83030 | 1 | 16 | 1000 | -28636000 | 2596 ms |
-| cpu-sb | 9154 | 83030 | 1 | 16 | 1000 | -28756000 | 2596 ms |
+The `load` column is the 1-minute load average across that row. The host was
+shared with other work, so treat any row above about 20 as an upper bound on
+speed rather than a measurement. Energy does not depend on load and holds
+everywhere. The two rows at 9154 nodes ran at load 119 and 129.
 
-**These timings predate the Gibbs rewrite and are not current.** The energy
-columns still hold, because energy does not depend on machine load. The
-wall-clock column does not: a later rerun moved `cpu-sa`, which did not change
-at all, from 1012 ms to 2191 ms at the pivot. Rerun the ladder on a quiet
-machine before quoting any time from it.
+The parenthesised figure is the core-adjusted cost, which is wall-clock times
+the cores the kernel occupies.
 
-A controlled measurement at the pivot, 16 reads by 1000 sweeps, 7 trials:
-
-| kernel | cores | min | median | max | best energy |
-|--------|------:|----:|-------:|----:|------------:|
-| cpu-sa | 1 | 1529 ms | 1604 ms | 1652 ms | -14319000 |
-| cpu-gibbs | 4 | 1738 ms | 2989 ms | 7300 ms | -14303000 |
-| cpu-sb | 1 | 1894 ms | 1970 ms | 2175 ms | -14323000 |
-
-`cpu-gibbs` spans a factor of 4.2 between its fastest and slowest trial while
-the single-core kernels stay inside 8 percent. See the section on barrier cost.
+| kernel | nodes | edges | cores | reads | sweeps | best energy over 30 samples | mean time per sample | load |
+|--------|------:|------:|------:|------:|-------:|----------------------------:|---------------------:|-----:|
+| cpu-sa | 1144 | 9297 | 1 | 16 | 1000 | -3405000 | 299 ms | 12 |
+| cpu-gibbs | 1144 | 9297 | 4 | 16 | 1000 | -3385000 | 250 ms (1002 ms) | 13 |
+| cpu-sb | 1144 | 9297 | 1 | 16 | 1000 | -3399000 | 284 ms | 14 |
+| cpu-sa | 2289 | 19578 | 1 | 16 | 1000 | -6968000 | 1102 ms | 18 |
+| cpu-gibbs | 2289 | 19578 | 4 | 16 | 1000 | -6942000 | 1117 ms (4467 ms) | 25 |
+| cpu-sb | 2289 | 19578 | 1 | 16 | 1000 | -6972000 | 546 ms | 27 |
+| cpu-sa | 3433 | 30556 | 1 | 16 | 1000 | -10676000 | 1653 ms | 29 |
+| cpu-gibbs | 3433 | 30556 | 4 | 16 | 1000 | -10640000 | 1743 ms (6971 ms) | 30 |
+| cpu-sb | 3433 | 30556 | 1 | 16 | 1000 | -10706000 | 2375 ms | 26 |
+| cpu-sa | 4577 | 41515 | 1 | 16 | 1000 | -14397000 | 1036 ms | 22 |
+| cpu-gibbs | 4577 | 41515 | 4 | 16 | 1000 | -14341000 | 886 ms (3545 ms) | 19 |
+| cpu-sb | 4577 | 41515 | 1 | 16 | 1000 | -14399000 | 1266 ms | 17 |
+| cpu-sa | 5721 | 51891 | 1 | 16 | 1000 | -18031000 | 1407 ms | 14 |
+| cpu-gibbs | 5721 | 51891 | 4 | 16 | 1000 | -17947000 | 1033 ms (4132 ms) | 13 |
+| cpu-sb | 5721 | 51891 | 1 | 16 | 1000 | -18039000 | 1607 ms | 11 |
+| cpu-sa | 6866 | 62277 | 1 | 16 | 1000 | -21609000 | 1565 ms | 12 |
+| cpu-gibbs | 6866 | 62277 | 4 | 16 | 1000 | -21525000 | 1033 ms (4132 ms) | 12 |
+| cpu-sb | 6866 | 62277 | 1 | 16 | 1000 | -21601000 | 1873 ms | 13 |
+| cpu-sa | 8010 | 72654 | 1 | 16 | 1000 | -24996000 | 1818 ms | 12 |
+| cpu-gibbs | 8010 | 72654 | 4 | 16 | 1000 | -24910000 | 1253 ms (5013 ms) | 11 |
+| cpu-sb | 8010 | 72654 | 1 | 16 | 1000 | -25060000 | 2244 ms | 13 |
+| cpu-sa | 9154 | 83030 | 1 | 16 | 1000 | -28694000 | 2513 ms | 46 |
+| cpu-gibbs | 9154 | 83030 | 4 | 16 | 1000 | -28638000 | 4761 ms (19042 ms) | 129 |
+| cpu-sb | 9154 | 83030 | 1 | 16 | 1000 | -28756000 | 2880 ms | 119 |
 
 ### Paired quality difference from `cpu-sa`
 
-A negative value means the kernel reached lower energy than `cpu-sa` on the same
-instances, which is better.
+A negative value means the kernel reached lower energy on the same instances,
+which is better.
 
-| nodes | cpu-sb minus cpu-sa | t | instances where cpu-sb won |
-|------:|--------------------:|----:|---------------------------:|
-| 1144 | +0.073% | +1.86 | 8 of 30 |
-| 2289 | -0.061% | -1.74 | 17 of 30 |
-| 3433 | -0.090% | -2.89 | 20 of 30 |
-| 4577 | -0.051% | -1.78 | 18 of 30 |
-| 5721 | -0.172% | -5.57 | 25 of 30 |
-| 6866 | -0.080% | -3.02 | 22 of 30 |
-| 8010 | -0.173% | -5.94 | 27 of 30 |
-| 9154 | -0.077% | -4.33 | 23 of 30 |
+| nodes | cpu-sb minus cpu-sa | t | cpu-gibbs minus cpu-sa | t |
+|------:|--------------------:|----:|-----------------------:|----:|
+| 1144 | +0.073% | +1.9 | +0.338% | +6.0 |
+| 2289 | -0.061% | -1.7 | +0.296% | +8.3 |
+| 3433 | -0.090% | -2.9 | +0.288% | +9.2 |
+| 4577 | -0.051% | -1.8 | +0.346% | +12.2 |
+| 5721 | -0.172% | -5.6 | +0.388% | +10.8 |
+| 6866 | -0.080% | -3.0 | +0.382% | +11.9 |
+| 8010 | -0.173% | -5.9 | +0.326% | +8.4 |
+| 9154 | -0.077% | -4.3 | +0.284% | +13.5 |
 
-`cpu-gibbs` held between +0.22% and +0.44% at every size. It is slower than
-both other kernels and never reached lower energy.
+`cpu-sb` reaches lower energy than `cpu-sa` at every size above the smallest
+and loses at 1144 nodes. The margin runs from 0.05 to 0.17 percent.
+`cpu-gibbs` is worse at every size, by 0.28 to 0.39 percent, and every one of
+those differences is many standard errors from zero.
 
-### What the first run showed
+### What the run showed
 
-`cpu-sb` costs more time per sample than `cpu-sa` at the pivot and above: 1.26
-times at 4577 nodes and 1.38 times at 9154 nodes. Below about 2300 nodes the two
-cost the same.
+Ranked on core-adjusted cost, `cpu-sa` is cheapest, `cpu-sb` costs 1.1 to 1.4
+times as much, and `cpu-gibbs` costs 3 to 4 times as much because it occupies
+4 cores.
 
-`cpu-sb` reaches lower energy than `cpu-sa` at every size above the smallest,
-and loses at the smallest. The margin is between 0.05% and 0.17%.
+Ranked on wall-clock, the order changes: `cpu-gibbs` finishes a sample fastest
+at 5721 nodes and above, because it spends 4 cores to do it. That is the whole
+reason the cores column exists.
 
-The trade is about 0.1% lower energy for about 30% more time at pivot
-scale. Whether that trade is worth taking depends on the reward curve. At equal
-wall-clock time `cpu-sa` completes about 1.3 times as many reads, and more reads
-also lower the energy a kernel reaches.
+Ranked on solution quality, `cpu-sb` is best, `cpu-sa` is close behind, and
+`cpu-gibbs` is last at every size.
+
+In short, `cpu-sb` buys about 0.1 percent lower energy for 10 to 40 percent
+more core-time than `cpu-sa`, while `cpu-gibbs` buys nothing at 3 to 4 times
+the core-time. Whether the `cpu-sb` trade is worth taking depends on the reward
+curve, and an equal-core-time comparison is still open.
 
 ### Worker scaling for chromatic Gibbs
 
-Pivot topology, 4 reads by 1000 sweeps, median of 5:
+Pivot topology, 16 reads by 1000 sweeps, 7 trials, best case:
 
-| workers | median wall | speedup |
-|--------:|------------:|--------:|
-| 1 | 0.85 s | 1.00 |
-| 2 | 0.42 s | 2.00 |
-| 4 | 0.25 s | 3.38 |
-| 8 | 0.30 s | 2.79 |
-| 12 | 0.27 s | 3.12 |
-| 16 | 1.93 s | 0.44 |
+| workers | Reads (default) | speedup | Colors | speedup |
+|--------:|----------------:|--------:|-------:|--------:|
+| 1 | 1.948 s | 1.00 | 1.948 s | 1.00 |
+| 2 | 0.986 s | 1.97 | 1.120 s | 1.74 |
+| 4 | 0.498 s | 3.91 | 0.941 s | 2.07 |
+| 6 | 0.483 s | 4.03 | 0.784 s | 2.49 |
+| 8 | 0.401 s | 4.86 | 0.814 s | 2.39 |
+| 12 | 0.400 s | 4.87 | 0.826 s | 2.36 |
+| 16 | 0.324 s | 6.02 | 1.785 s | 1.09 |
 
-Four workers is the best setting, at 85 percent efficiency. Sixteen
-oversubscribes a 16-thread host and collapses, so `GibbsConfig::validate`
-refuses a worker count above the reported core count.
+`Reads` rises monotonically to 6.02 and its slowest trial sat within 3 percent
+of its fastest. `Colors` peaks at 2.65 near 5 workers, falls back, and collapses
+at 16, with trials spread by up to a factor of 2.7.
 
-### Barrier cost limits chromatic Gibbs
+The default of 4 workers reaches 3.91, which is 98 percent efficiency. Returns
+fall past that point because only 12 of the 16 cores are performance cores.
 
-Reaching even that speedup took two changes, and the result is still unstable.
+Set the read count at or above the worker count before measuring `Reads`. An
+earlier sweep used 4 reads, which capped it at 4 workers and understated it.
 
-A class update is one or two microseconds of work per worker, and every class
-ends at a barrier. Spawning threads per class cost more than the work itself:
-8 classes over 1000 sweeps is 8000 spawn-and-join cycles per read, and
-throughput fell as workers rose. A persistent pool fixed that. A mutex and
-condvar barrier was still too expensive for a class this small, and four
-workers ran at 0.36 times the speed of one. A sense-reversing spin barrier with a
-bounded spin and a yield fallback is what produces the table above.
+### Why colour splitting loses on a CPU
 
-The remaining variance is scheduling. When the operating system moves one
-worker to an efficiency core, the other three wait at the barrier. One such
-placement costs a great deal across 128000 barriers per sample. Report the Gibbs timings as a distribution with its spread, never as a single
-number.
+A colour class hands each worker one or two microseconds of work, and every
+class ends at a barrier. Reaching even 2.65 took a persistent worker pool in
+place of spawning per class, then a sense-reversing spin barrier in place of a
+mutex and condvar, which had run at 0.36 times the speed of one worker.
+
+Splitting a class is the right shape on a GPU or an FPGA, where the lane count
+far exceeds the class size. On 16 CPU threads the barrier costs more than the
+work it separates. `--gibbs-split-colors` selects it for comparison.
 
 ### Worker scaling for Simulated Bifurcation
 
 Reads are independent trajectories, so splitting 16 reads across threads needs
-no synchronisation and no kernel change. Pivot topology, median of 5:
+no synchronisation. Pivot topology, median of 5:
 
 | threads | median wall | speedup |
 |--------:|------------:|--------:|
@@ -241,11 +240,11 @@ no synchronisation and no kernel change. Pivot topology, median of 5:
 | 8 | 0.41 s | 4.19 |
 | 16 | 0.26 s | 6.54 |
 
-Simulated Bifurcation has no ideal worker count. It scales monotonically to the
-core count with falling efficiency and never collapses, because it has no
-barrier to collapse at. Goto and colleagues make this the central property of
-the method: every particle updates from the previous positions, so the update
-carries no ordering constraint. Let the operator choose the count.
+Simulated Bifurcation has no ideal worker count. It scales to the core count
+with falling efficiency and never collapses, because it has no barrier to
+collapse at. Goto and colleagues make this the central property of the method:
+every particle updates from the previous positions, so the update carries no
+ordering constraint. Let the operator choose the count.
 
 ### Particle-level parallelism for Simulated Bifurcation
 
@@ -263,20 +262,18 @@ across particles:
 | 1 | 140 ms | 1.00 | 429 ms | 1.00 |
 | 2 | 72 ms | 1.95 | 338 ms | 1.27 |
 | 4 | 56 ms | 2.48 | 277 ms | 1.55 |
-| 6 | 114 ms | 1.22 | 199 ms | 2.15 |
 | 8 | 83 ms | 1.69 | 173 ms | 2.48 |
-| 12 | 546 ms | 0.26 | 234 ms | 1.84 |
 | 16 | 660 ms | 0.21 | 783 ms | 0.55 |
 
 Particle-level parallelism peaks near 2.5. The best worker count grows with the
 problem, from 4 workers at 4577 nodes to 8 at 18308, because a larger problem
 puts more work between two barriers. Oversubscription collapses this kernel as
-it collapses Gibbs.
+it collapses colour splitting.
 
-Read-level parallelism reaches 6.54 at 16 threads and never regresses, so
-prefer it whenever the read count reaches the core count. Reach for
-particle-level parallelism when the read count is the smaller number, which is
-where it cuts the latency of a single read.
+Read-level parallelism reaches 6.54 and never regresses, so prefer it whenever
+the read count reaches the core count. Reach for particle-level parallelism
+when the read count is the smaller number, which is where it cuts the latency
+of a single read.
 
 ### Colouring the pivot topology
 
@@ -292,7 +289,7 @@ where it cuts the latency of a single read.
 
 The chromatic number lies between 4 and 7. Greedy returns 8. Class sizes are
 skewed, at 857, 850, 817, 744, 686, 477, 134 and 12, so the smallest class
-caps how many workers it can occupy.
+caps how many workers it can occupy under `Colors`.
 
 The class count is a property of the graph, not a setting. `GibbsConfig`
 carries `max_colors` so a deployment can refuse a topology that colours worse

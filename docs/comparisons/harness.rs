@@ -15,7 +15,7 @@
 //! topology's `allowed_j_milli` set, which is {-1000, +1000} for this fixture.
 
 use quip_miner_core::{Algorithm, IsingGraph, SampleParams};
-use quip_miner_cpu::gibbs_parallel::{sample_gibbs_parallel, DEFAULT_GIBBS_WORKERS};
+use quip_miner_cpu::gibbs_parallel::{sample_gibbs_with, GibbsConfig};
 use quip_miner_cpu::{sample_ising, sample_sb, DSB};
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
@@ -183,7 +183,7 @@ impl Kernel {
     fn best(self, g: &IsingGraph, p: &SampleParams) -> i64 {
         let out = match self {
             Self::Sa => sample_ising(g, p, Algorithm::Sa),
-            Self::Gibbs => sample_gibbs_parallel(g, p, DEFAULT_GIBBS_WORKERS),
+            Self::Gibbs => sample_gibbs_with(g, p, &GibbsConfig::default()).expect("default config"),
             Self::Sb => sample_sb(g, p, DSB),
         };
         out.iter()
@@ -194,6 +194,23 @@ impl Kernel {
 }
 
 const KERNELS: [Kernel; 3] = [Kernel::Sa, Kernel::Gibbs, Kernel::Sb];
+
+/// One-minute load average, so a contaminated row is visible in the data.
+fn load_avg() -> f64 {
+    std::process::Command::new("sysctl")
+        .args(["-n", "vm.loadavg"])
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .and_then(|s| {
+            s.trim()
+                .trim_matches(|c| c == '{' || c == '}' || c == ' ')
+                .split_whitespace()
+                .next()
+                .and_then(|v| v.parse::<f64>().ok())
+        })
+        .unwrap_or(f64::NAN)
+}
 
 fn main() {
     let p = load_pivot();
@@ -213,8 +230,8 @@ fn main() {
         .collect();
 
     let mut rows: Vec<serde_json::Value> = Vec::new();
-    println!("| kernel | nodes | edges | reads | sweeps | best energy (30 samples) | mean time/sample |");
-    println!("|--------|------:|------:|------:|-------:|-------------------------:|-----------------:|");
+    println!("| kernel | nodes | edges | cores | reads | sweeps | best energy (30 samples) | mean time/sample | load |");
+    println!("|--------|------:|------:|------:|------:|-------:|-------------------------:|-----------------:|-----:|");
 
     for f in factors {
         let nodes = ((p.num_nodes as f64) * f).round() as usize;
@@ -228,6 +245,7 @@ fn main() {
         for k in KERNELS {
             let mut best = i64::MAX;
             let mut total = Duration::ZERO;
+            let load_start = load_avg();
             let mut per_sample_best: Vec<i64> = Vec::with_capacity(SAMPLES);
             for (s, g) in instances.iter().enumerate() {
                 let params = SampleParams {
@@ -245,14 +263,20 @@ fn main() {
             let mean_ms = total.as_secs_f64() * 1e3 / SAMPLES as f64;
             let mean_energy =
                 per_sample_best.iter().sum::<i64>() as f64 / SAMPLES as f64;
+            let load = (load_start + load_avg()) / 2.0;
+            let cores = if matches!(k, Kernel::Gibbs) {
+                GibbsConfig::default().workers
+            } else {
+                1
+            };
             println!(
-                "| {} | {nodes} | {} | {READS} | {SWEEPS} | {best} | {mean_ms:.1} ms |",
+                "| {} | {nodes} | {} | {cores} | {READS} | {SWEEPS} | {best} | {mean_ms:.1} ms | {load:.1} |",
                 k.name(),
                 edges.len()
             );
             rows.push(serde_json::json!({
                 "kernel": k.name(),
-                "cores": if matches!(k, Kernel::Gibbs) { DEFAULT_GIBBS_WORKERS } else { 1 },
+                "cores": if matches!(k, Kernel::Gibbs) { GibbsConfig::default().workers } else { 1 },
                 "factor": f,
                 "nodes": nodes,
                 "edges": edges.len(),
@@ -263,6 +287,7 @@ fn main() {
                 "mean_best_energy_milli": mean_energy,
                 "per_sample_best_milli": per_sample_best,
                 "mean_time_ms": mean_ms,
+                "load_avg": (load_start + load_avg()) / 2.0,
             }));
             eprintln!("done {} n={nodes}", k.name());
         }

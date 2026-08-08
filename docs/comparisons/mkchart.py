@@ -13,7 +13,7 @@ above panel A, clear of the data.
 import json
 import statistics as st
 
-rows = json.load(open("merged.json"))["rows"]
+rows = json.load(open("results.json"))["rows"]
 sizes = sorted({r["nodes"] for r in rows})
 by = {(r["kernel"], r["nodes"]): r for r in rows}
 
@@ -22,7 +22,12 @@ COLOR = {"cpu-sa": "#555555", "cpu-gibbs": "#aaaaaa", "cpu-sb": "#1f6fb4"}
 WIDTH = {"cpu-sa": 1.6, "cpu-gibbs": 1.6, "cpu-sb": 2.4}
 PIVOT = 4577
 
-time_ms = {k: [by[(k, n)]["mean_time_ms"] for n in sizes] for k in KERNELS}
+# Core-adjusted cost: wall-clock times the cores the kernel occupies. That is
+# what a miner pays when it fills the machine with models.
+time_ms = {k: [by[(k, n)]["mean_time_ms"] * by[(k, n)]["cores"] for n in sizes] for k in KERNELS}
+# A row measured under heavy load is drawn hollow rather than dropped.
+LOAD_LIMIT = 20.0
+loaded = {k: [by[(k, n)]["load_avg"] > LOAD_LIMIT for n in sizes] for k in KERNELS}
 
 rel, err = {}, {}
 for k in ("cpu-gibbs", "cpu-sb"):
@@ -36,7 +41,7 @@ for k in ("cpu-gibbs", "cpu-sb"):
     rel[k], err[k] = means, ses
 
 # Geometry
-W, ML, MR, MT = 940, 78, 132, 104
+W, ML, MR, MT = 940, 92, 138, 118
 PH, GAP, MB = 250, 74, 62
 H = MT + PH + GAP + PH + MB
 
@@ -45,7 +50,7 @@ def sx(n):
     return ML + (n - x0) / (x1 - x0) * (W - ML - MR)
 
 A_TOP, A_BOT = MT, MT + PH
-a_max = 2800.0
+a_max = 20000.0
 def say(v):
     return A_BOT - v / a_max * PH
 
@@ -77,6 +82,8 @@ add(f'<text x="{ML}" y="26" font-size="15" font-weight="600" fill="#111">'
     'CPU Ising kernels on the Advantage2-System1 topology</text>')
 add(f'<text x="{ML}" y="44" font-size="11" fill="#666">'
     'Zero biases, couplings drawn from {-1, +1}. 16 reads x 1000 sweeps. 30 instances per size, shared across kernels.</text>')
+add(f'<text x="{ML}" y="60" font-size="11" fill="#666">'
+    'cpu-gibbs occupies 4 cores per sample, the others 1. Hollow markers were measured at a 1-minute load above 20.</text>')
 
 # Pivot rule, label in the strip above panel A
 add(f'<line x1="{sx(PIVOT):.1f}" y1="{A_TOP - 36}" x2="{sx(PIVOT):.1f}" y2="{B_BOT}" '
@@ -86,22 +93,26 @@ add(f'<text x="{sx(PIVOT):.1f}" y="{A_TOP - 42}" font-size="10.5" fill="#9a7a45"
 
 # ---------- Panel A ----------
 add(f'<text x="{ML}" y="{A_TOP - 16}" font-size="12" font-weight="600" fill="#111">'
-    'Cost: mean wall-clock per sample</text>')
-add(f'<line x1="{ML}" y1="{say(0)}" x2="{ML}" y2="{say(2600)}" stroke="#111" stroke-width="1"/>')
-for v in (0, 500, 1000, 1500, 2000, 2500):
+    'Cost: core-milliseconds per sample (wall-clock times cores)</text>')
+add(f'<line x1="{ML}" y1="{say(0)}" x2="{ML}" y2="{say(19000)}" stroke="#111" stroke-width="1"/>')
+for v in (0, 5000, 10000, 15000, 19000):
     add(f'<text x="{ML - 8}" y="{say(v) + 3.5:.1f}" font-size="10" fill="#444" '
         f'text-anchor="end">{v}</text>')
-add(f'<text x="{ML - 8}" y="{say(2600) - 12:.1f}" font-size="10" fill="#444" '
-    'text-anchor="end">ms</text>')
+add(f'<text x="{ML - 8}" y="{say(19000) - 12:.1f}" font-size="10" fill="#444" '
+    'text-anchor="end">core-ms</text>')
 
 labels_a = []
 for k in KERNELS:
     pts = " ".join(f"{sx(n):.1f},{say(v):.1f}" for n, v in zip(sizes, time_ms[k]))
     add(f'<polyline points="{pts}" fill="none" stroke="{COLOR[k]}" '
         f'stroke-width="{WIDTH[k]}"/>')
-    for n, v in zip(sizes, time_ms[k]):
-        add(f'<circle cx="{sx(n):.1f}" cy="{say(v):.1f}" r="2.4" fill="{COLOR[k]}"/>')
-    labels_a.append((say(time_ms[k][-1]), k, f"{time_ms[k][-1]:.0f} ms"))
+    for n, v, hot in zip(sizes, time_ms[k], loaded[k]):
+        if hot:
+            add(f'<circle cx="{sx(n):.1f}" cy="{say(v):.1f}" r="3.2" fill="#fff" '
+                f'stroke="{COLOR[k]}" stroke-width="1.4"/>')
+        else:
+            add(f'<circle cx="{sx(n):.1f}" cy="{say(v):.1f}" r="2.4" fill="{COLOR[k]}"/>')
+    labels_a.append((say(time_ms[k][-1]), k, f"{time_ms[k][-1]:.0f} core-ms"))
 for y, k, val in spread(labels_a):
     add(f'<text x="{sx(x1) + 10}" y="{y + 3.5:.1f}" font-size="11" fill="{COLOR[k]}" '
         f'font-weight="600">{k}</text>')

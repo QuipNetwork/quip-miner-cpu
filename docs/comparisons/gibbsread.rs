@@ -1,5 +1,7 @@
+//! Gibbs read-level parallelism: whole reads to whole threads, one worker each,
+//! so the class barrier never runs. Compare against splitting classes.
 use quip_miner_core::{IsingGraph, SampleParams};
-use quip_miner_cpu::gibbs_parallel::{sample_gibbs_with, GibbsConfig, GibbsParallelism};
+use quip_miner_cpu::gibbs_parallel::sample_gibbs_parallel;
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
 use std::time::Instant;
@@ -20,26 +22,30 @@ fn pivot() -> IsingGraph {
 
 fn main() {
     let g = pivot();
-    let p = SampleParams { num_reads: 16, num_sweeps: 1000, seed: 42, ..Default::default() };
-  for (strategy, label) in [(GibbsParallelism::Reads, "Reads (default)"), (GibbsParallelism::Colors, "Colors")] {
-    println!("\n### {label}");
-    println!("| workers | min (best case) | median | max | speedup on min | best energy |");
-    println!("|--------:|----:|-------:|----:|--------:|------------:|");
+    let total = 16usize;
+    println!("| threads | reads each | min | median | max | speedup on min |");
+    println!("|--------:|-----------:|----:|-------:|----:|---------------:|");
     let mut base = 0.0f64;
-    for w in [1usize,2,3,4,5,6,8,10,12,16] {
+    for t in [1usize,2,4,8,16] {
+        let per = total / t;
         let mut ts = Vec::new();
-        let mut best = 0i64;
-        for _ in 0..7 {
+        for _ in 0..9 {
             let t0 = Instant::now();
-            let cfg = GibbsConfig { workers: w, parallelism: strategy, max_colors: None };
-            let r = sample_gibbs_with(&g, &p, &cfg).expect("config");
+            std::thread::scope(|s| {
+                for k in 0..t {
+                    let g = &g;
+                    s.spawn(move || {
+                        let p = SampleParams { num_reads: per, num_sweeps: 1000,
+                                               seed: 42 + k as u64, ..Default::default() };
+                        // One worker per read: no class barrier at all.
+                        sample_gibbs_parallel(g, &p, 1)
+                    });
+                }
+            });
             ts.push(t0.elapsed().as_secs_f64());
-            best = r.iter().map(|x| x.energy_milli).min().unwrap();
         }
         ts.sort_by(|a,b| a.partial_cmp(b).unwrap());
-        let s = ts[0];
-        if w==1 { base = s; }
-        println!("| {w} | {s:.3} s | {:.3} s | {:.3} s | {:.2}x | {best} |", ts[3], ts[6], base/s);
+        if t==1 { base = ts[0]; }
+        println!("| {t} | {per} | {:.3} s | {:.3} s | {:.3} s | {:.2}x |", ts[0], ts[4], ts[8], base/ts[0]);
     }
-  }
 }
