@@ -24,7 +24,12 @@ PIVOT = 4577
 
 # Core-adjusted cost: wall-clock times the cores the kernel occupies. That is
 # what a miner pays when it fills the machine with models.
-time_ms = {k: [by[(k, n)]["mean_time_ms"] * by[(k, n)]["cores"] for n in sizes] for k in KERNELS}
+# Throughput one core delivers. Wall-clock alone rewards a kernel for spending
+# more cores, so rank on this instead.
+time_ms = {
+    k: [1000.0 / (by[(k, n)]["mean_time_ms"] * by[(k, n)]["cores"]) for n in sizes]
+    for k in KERNELS
+}
 # A row measured under heavy load is drawn hollow rather than dropped.
 LOAD_LIMIT = 20.0
 loaded = {k: [by[(k, n)]["load_avg"] > LOAD_LIMIT for n in sizes] for k in KERNELS}
@@ -50,7 +55,7 @@ def sx(n):
     return ML + (n - x0) / (x1 - x0) * (W - ML - MR)
 
 A_TOP, A_BOT = MT, MT + PH
-a_max = 20000.0
+a_max = 3.7
 def say(v):
     return A_BOT - v / a_max * PH
 
@@ -93,13 +98,13 @@ add(f'<text x="{sx(PIVOT):.1f}" y="{A_TOP - 42}" font-size="10.5" fill="#9a7a45"
 
 # ---------- Panel A ----------
 add(f'<text x="{ML}" y="{A_TOP - 16}" font-size="12" font-weight="600" fill="#111">'
-    'Cost: core-milliseconds per sample (wall-clock times cores)</text>')
-add(f'<line x1="{ML}" y1="{say(0)}" x2="{ML}" y2="{say(19000)}" stroke="#111" stroke-width="1"/>')
-for v in (0, 5000, 10000, 15000, 19000):
+    'Throughput: models per second per core, so higher is better</text>')
+add(f'<line x1="{ML}" y1="{say(0)}" x2="{ML}" y2="{say(3.5)}" stroke="#111" stroke-width="1"/>')
+for v in (0, 1.0, 2.0, 3.0, 3.5):
     add(f'<text x="{ML - 8}" y="{say(v) + 3.5:.1f}" font-size="10" fill="#444" '
-        f'text-anchor="end">{v}</text>')
-add(f'<text x="{ML - 8}" y="{say(19000) - 12:.1f}" font-size="10" fill="#444" '
-    'text-anchor="end">core-ms</text>')
+        f'text-anchor="end">{v:.1f}</text>')
+add(f'<text x="{ML - 8}" y="{say(3.5) - 12:.1f}" font-size="10" fill="#444" '
+    'text-anchor="end">per core</text>')
 
 labels_a = []
 for k in KERNELS:
@@ -112,7 +117,7 @@ for k in KERNELS:
                 f'stroke="{COLOR[k]}" stroke-width="1.4"/>')
         else:
             add(f'<circle cx="{sx(n):.1f}" cy="{say(v):.1f}" r="2.4" fill="{COLOR[k]}"/>')
-    labels_a.append((say(time_ms[k][-1]), k, f"{time_ms[k][-1]:.0f} core-ms"))
+    labels_a.append((say(time_ms[k][-1]), k, f"{time_ms[k][-1]:.2f}/s/core"))
 for y, k, val in spread(labels_a):
     add(f'<text x="{sx(x1) + 10}" y="{y + 3.5:.1f}" font-size="11" fill="{COLOR[k]}" '
         f'font-weight="600">{k}</text>')

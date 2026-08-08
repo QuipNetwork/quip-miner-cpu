@@ -81,14 +81,13 @@ between two kernels at all. See the section on reading the numbers.
 ### Cores and adjusted numbers
 
 Record how many cores the kernel occupies for one sample. Report the measured
-wall-clock time first, then the core-adjusted time in parentheses, where the
-adjusted time is the wall-clock time multiplied by the core count. The adjusted
-number is the cost in core-seconds, which is what a miner pays when it runs one
-model per core.
+wall-clock time per sample, and beside it the throughput one core delivers:
 
-A kernel that spreads one sample over 4 cores and finishes in half the time of a
-single-core kernel is twice as fast per sample and twice as expensive per core.
-Only the adjusted number exposes that.
+    models/s/core = 1 / (seconds per sample * cores)
+
+Rank on that second number. A kernel that spreads one sample over 4 cores and
+finishes in half the time of a single-core kernel looks twice as fast per
+sample and returns half as much per core. Wall-clock alone hides the trade.
 
 Confirm the core count by measurement, not by reading the code. Run the kernel
 under `/usr/bin/time -p` and divide user time by real time. A single-core kernel
@@ -123,35 +122,37 @@ shared with other work, so treat any row above about 20 as an upper bound on
 speed rather than a measurement. Energy does not depend on load and holds
 everywhere. The two rows at 9154 nodes ran at load 119 and 129.
 
-The parenthesised figure is the core-adjusted cost, which is wall-clock times
-the cores the kernel occupies.
+`models/s/core` is the throughput one core delivers: one divided by the
+wall-clock seconds per sample, divided again by the cores the sample occupies.
+Rank on that column. Wall-clock alone rewards a kernel for spending more cores,
+and a miner that fills a machine with models cares what each core returns.
 
-| kernel | nodes | edges | cores | reads | sweeps | best energy over 30 samples | mean time per sample | load |
-|--------|------:|------:|------:|------:|-------:|----------------------------:|---------------------:|-----:|
-| cpu-sa | 1144 | 9297 | 1 | 16 | 1000 | -3405000 | 299 ms | 12 |
-| cpu-gibbs | 1144 | 9297 | 4 | 16 | 1000 | -3385000 | 250 ms (1002 ms) | 13 |
-| cpu-sb | 1144 | 9297 | 1 | 16 | 1000 | -3399000 | 284 ms | 14 |
-| cpu-sa | 2289 | 19578 | 1 | 16 | 1000 | -6968000 | 1102 ms | 18 |
-| cpu-gibbs | 2289 | 19578 | 4 | 16 | 1000 | -6942000 | 1117 ms (4467 ms) | 25 |
-| cpu-sb | 2289 | 19578 | 1 | 16 | 1000 | -6972000 | 546 ms | 27 |
-| cpu-sa | 3433 | 30556 | 1 | 16 | 1000 | -10676000 | 1653 ms | 29 |
-| cpu-gibbs | 3433 | 30556 | 4 | 16 | 1000 | -10640000 | 1743 ms (6971 ms) | 30 |
-| cpu-sb | 3433 | 30556 | 1 | 16 | 1000 | -10706000 | 2375 ms | 26 |
-| cpu-sa | 4577 | 41515 | 1 | 16 | 1000 | -14397000 | 1036 ms | 22 |
-| cpu-gibbs | 4577 | 41515 | 4 | 16 | 1000 | -14341000 | 886 ms (3545 ms) | 19 |
-| cpu-sb | 4577 | 41515 | 1 | 16 | 1000 | -14399000 | 1266 ms | 17 |
-| cpu-sa | 5721 | 51891 | 1 | 16 | 1000 | -18031000 | 1407 ms | 14 |
-| cpu-gibbs | 5721 | 51891 | 4 | 16 | 1000 | -17947000 | 1033 ms (4132 ms) | 13 |
-| cpu-sb | 5721 | 51891 | 1 | 16 | 1000 | -18039000 | 1607 ms | 11 |
-| cpu-sa | 6866 | 62277 | 1 | 16 | 1000 | -21609000 | 1565 ms | 12 |
-| cpu-gibbs | 6866 | 62277 | 4 | 16 | 1000 | -21525000 | 1033 ms (4132 ms) | 12 |
-| cpu-sb | 6866 | 62277 | 1 | 16 | 1000 | -21601000 | 1873 ms | 13 |
-| cpu-sa | 8010 | 72654 | 1 | 16 | 1000 | -24996000 | 1818 ms | 12 |
-| cpu-gibbs | 8010 | 72654 | 4 | 16 | 1000 | -24910000 | 1253 ms (5013 ms) | 11 |
-| cpu-sb | 8010 | 72654 | 1 | 16 | 1000 | -25060000 | 2244 ms | 13 |
-| cpu-sa | 9154 | 83030 | 1 | 16 | 1000 | -28694000 | 2513 ms | 46 |
-| cpu-gibbs | 9154 | 83030 | 4 | 16 | 1000 | -28638000 | 4761 ms (19042 ms) | 129 |
-| cpu-sb | 9154 | 83030 | 1 | 16 | 1000 | -28756000 | 2880 ms | 119 |
+| kernel | nodes | edges | cores | reads | sweeps | best energy over 30 samples | mean time per sample | models/s/core | load |
+|--------|------:|------:|------:|------:|-------:|----------------------------:|---------------------:|--------------:|-----:|
+| cpu-sa | 1144 | 9297 | 1 | 16 | 1000 | -3405000 | 299 ms | 3.348 | 12 |
+| cpu-gibbs | 1144 | 9297 | 4 | 16 | 1000 | -3385000 | 250 ms | 0.998 | 13 |
+| cpu-sb | 1144 | 9297 | 1 | 16 | 1000 | -3399000 | 284 ms | 3.520 | 14 |
+| cpu-sa | 2289 | 19578 | 1 | 16 | 1000 | -6968000 | 1102 ms | 0.908 | 18 |
+| cpu-gibbs | 2289 | 19578 | 4 | 16 | 1000 | -6942000 | 1117 ms | 0.224 | 25 |
+| cpu-sb | 2289 | 19578 | 1 | 16 | 1000 | -6972000 | 546 ms | 1.831 | 27 |
+| cpu-sa | 3433 | 30556 | 1 | 16 | 1000 | -10676000 | 1653 ms | 0.605 | 29 |
+| cpu-gibbs | 3433 | 30556 | 4 | 16 | 1000 | -10640000 | 1743 ms | 0.143 | 30 |
+| cpu-sb | 3433 | 30556 | 1 | 16 | 1000 | -10706000 | 2375 ms | 0.421 | 26 |
+| cpu-sa | 4577 | 41515 | 1 | 16 | 1000 | -14397000 | 1036 ms | 0.965 | 22 |
+| cpu-gibbs | 4577 | 41515 | 4 | 16 | 1000 | -14341000 | 886 ms | 0.282 | 19 |
+| cpu-sb | 4577 | 41515 | 1 | 16 | 1000 | -14399000 | 1266 ms | 0.790 | 17 |
+| cpu-sa | 5721 | 51891 | 1 | 16 | 1000 | -18031000 | 1407 ms | 0.711 | 14 |
+| cpu-gibbs | 5721 | 51891 | 4 | 16 | 1000 | -17947000 | 1033 ms | 0.242 | 13 |
+| cpu-sb | 5721 | 51891 | 1 | 16 | 1000 | -18039000 | 1607 ms | 0.622 | 11 |
+| cpu-sa | 6866 | 62277 | 1 | 16 | 1000 | -21609000 | 1565 ms | 0.639 | 12 |
+| cpu-gibbs | 6866 | 62277 | 4 | 16 | 1000 | -21525000 | 1033 ms | 0.242 | 12 |
+| cpu-sb | 6866 | 62277 | 1 | 16 | 1000 | -21601000 | 1873 ms | 0.534 | 13 |
+| cpu-sa | 8010 | 72654 | 1 | 16 | 1000 | -24996000 | 1818 ms | 0.550 | 12 |
+| cpu-gibbs | 8010 | 72654 | 4 | 16 | 1000 | -24910000 | 1253 ms | 0.199 | 11 |
+| cpu-sb | 8010 | 72654 | 1 | 16 | 1000 | -25060000 | 2244 ms | 0.446 | 13 |
+| cpu-sa | 9154 | 83030 | 1 | 16 | 1000 | -28694000 | 2513 ms | 0.398 | 46 |
+| cpu-gibbs | 9154 | 83030 | 4 | 16 | 1000 | -28638000 | 4761 ms | 0.053 | 129 |
+| cpu-sb | 9154 | 83030 | 1 | 16 | 1000 | -28756000 | 2880 ms | 0.347 | 119 |
 
 ### Paired quality difference from `cpu-sa`
 
@@ -176,20 +177,21 @@ those differences is many standard errors from zero.
 
 ### What the run showed
 
-Ranked on core-adjusted cost, `cpu-sa` is cheapest, `cpu-sb` costs 1.1 to 1.4
-times as much, and `cpu-gibbs` costs 3 to 4 times as much because it occupies
-4 cores.
+Ranked on `models/s/core`, `cpu-sa` leads at every size except the smallest,
+`cpu-sb` returns 0.8 to 0.9 times as much on the clean rows, and `cpu-gibbs`
+returns 0.3 to 0.4 times as much, because it occupies 4 cores to finish one
+sample.
 
-Ranked on wall-clock, the order changes: `cpu-gibbs` finishes a sample fastest
-at 5721 nodes and above, because it spends 4 cores to do it. That is the whole
-reason the cores column exists.
+Ranked on wall-clock alone the order changes. `cpu-gibbs` finishes a sample
+fastest at 5721 nodes and above, and buys that latency with 4 cores. That
+inversion is the whole reason the throughput column exists.
 
 Ranked on solution quality, `cpu-sb` is best, `cpu-sa` is close behind, and
 `cpu-gibbs` is last at every size.
 
 In short, `cpu-sb` buys about 0.1 percent lower energy for 10 to 40 percent
-more core-time than `cpu-sa`, while `cpu-gibbs` buys nothing at 3 to 4 times
-the core-time. Whether the `cpu-sb` trade is worth taking depends on the reward
+less throughput per core than `cpu-sa`, while `cpu-gibbs` buys nothing at a
+third of the throughput per core. Whether the `cpu-sb` trade is worth taking depends on the reward
 curve, and an equal-core-time comparison is still open.
 
 ### Worker scaling for chromatic Gibbs
@@ -340,8 +342,8 @@ Use the paired table for that.
    [`comparisons/harness.rs`](comparisons/harness.rs), which needs a name and a
    call that returns the lowest energy over the reads.
 2. Measure the core count. Run one sample under `/usr/bin/time -p` and divide
-   user time by real time. Record the result, and report the core-adjusted time
-   in parentheses when the count is above 1.
+   user time by real time. Record the result, and divide the per-sample
+   throughput by it.
 3. Run the full ladder. Keep `num_reads`, `num_sweeps`, and the instance seeds
    unchanged, or the results do not compare to the preceding table.
 4. Compute the paired difference against `cpu-sa` and its standard error.
