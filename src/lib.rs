@@ -20,7 +20,7 @@ pub mod sb_sampler;
 pub use quip_miner_core::{Algorithm, IsingGraph, SampleParams, SamplerResult};
 pub use sampler_core::sample_ising;
 pub use sb_core::{sample_sb, sample_sb_with_workers, Coupling, SbVariant, BSB, DSB, HBSB, HDSB};
-pub use gibbs_parallel::{ConfigError, GibbsConfig};
+pub use gibbs_parallel::{ConfigError, GibbsConfig, GibbsParallelism};
 pub use sb_sampler::{SbSampler, CPU_SB_IDENTITY};
 
 use quip_miner_core::adapt::AdaptBounds;

@@ -2,7 +2,7 @@
 
 use clap::Parser;
 use quip_miner_core::{run, CommonArgs};
-use quip_miner_cpu::{Algorithm, CpuSampler, GibbsConfig, CPU_GIBBS_IDENTITY};
+use quip_miner_cpu::{Algorithm, CpuSampler, GibbsConfig, GibbsParallelism, CPU_GIBBS_IDENTITY};
 use std::process::ExitCode;
 
 #[derive(Parser)]
@@ -19,6 +19,12 @@ struct Cli {
     /// Refuse any graph needing more than this many colour classes.
     #[arg(long)]
     gibbs_max_colors: Option<usize>,
+
+    /// Split colour classes across the workers instead of giving each worker a
+    /// whole read. Measured slower and far less predictable on a CPU. It suits
+    /// a device with many more lanes than a class has members.
+    #[arg(long)]
+    gibbs_split_colors: bool,
 }
 
 fn main() -> ExitCode {
@@ -26,6 +32,11 @@ fn main() -> ExitCode {
     let gibbs = GibbsConfig {
         workers: cli.gibbs_workers,
         max_colors: cli.gibbs_max_colors,
+        parallelism: if cli.gibbs_split_colors {
+            GibbsParallelism::Colors
+        } else {
+            GibbsParallelism::Reads
+        },
     };
     // Checked before the session opens. A miner that runs at a worker count the
     // host cannot serve does not degrade gently: the class barrier spins, so an
