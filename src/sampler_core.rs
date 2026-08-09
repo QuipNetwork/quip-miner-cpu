@@ -1,9 +1,10 @@
-//! Neal-style SA and single-site heat-bath Gibbs over a geometric beta ladder.
+//! Neal-style simulated annealing over a geometric beta ladder.
 //!
 //! Algorithm notes (match dwave-neal / GPU ports):
 //! - Beta schedule: geometric from auto hot/cold range (or explicit range).
 //! - SA: per-read random restart; sequential Metropolis flips per sweep.
-//! - Gibbs: heat-bath resample `P(s=+1) = 1/(1+exp(2 β h_eff))`.
+//! - Gibbs: dispatched to `crate::gibbs_parallel`, which resamples whole
+//!   colour classes at once. This module holds no Gibbs kernel.
 //! - Solution energies are always scored with
 //!   [`quip_protocol::scoring::energy_milli`] (positive sign, trunc toward 0).
 //! - Parallelism: model-level (one model per core via the streaming pump);
@@ -31,7 +32,7 @@ use rand::{Rng, SeedableRng};
 /// `(u, u)` are skipped (they would pollute `heff[u]` with `u`'s own spin and
 /// break the ΔE formula), and couplings shorter than the edge list are treated
 /// as 0.
-struct CpuGraph {
+pub(crate) struct CpuGraph {
     h: Vec<f64>,
     /// CSR row offsets, length `n + 1`.
     nbr_start: Vec<u32>,
@@ -42,7 +43,7 @@ struct CpuGraph {
 }
 
 impl CpuGraph {
-    fn from_base(g: &IsingGraph) -> Self {
+    pub(crate) fn from_base(g: &IsingGraph) -> Self {
         let n = g.h.len();
         let mut deg = vec![0u32; n];
         for &(u, v) in &g.edges {
@@ -88,13 +89,19 @@ impl CpuGraph {
         }
     }
 
-    fn num_nodes(&self) -> usize {
+    /// Linear bias at `var`.
+    #[inline]
+    pub(crate) fn bias(&self, var: usize) -> f64 {
+        self.h[var]
+    }
+
+    pub(crate) fn num_nodes(&self) -> usize {
         self.h.len()
     }
 
     /// `(neighbor_ids, couplings)` slices for `var`.
     #[inline]
-    fn neighbors(&self, var: usize) -> (&[u32], &[f64]) {
+    pub(crate) fn neighbors(&self, var: usize) -> (&[u32], &[f64]) {
         let s = self.nbr_start[var] as usize;
         let e = self.nbr_start[var + 1] as usize;
         (&self.nbr_node[s..e], &self.nbr_coup[s..e])
@@ -102,7 +109,7 @@ impl CpuGraph {
 }
 
 /// Geometric beta schedule for one sample request (f64 for CPU precision).
-fn build_beta_schedule(graph: &IsingGraph, params: &SampleParams) -> Vec<f64> {
+pub(crate) fn build_beta_schedule(graph: &IsingGraph, params: &SampleParams) -> Vec<f64> {
     let sweeps_per = params.sweeps_per_beta.max(1);
     let num_betas = (params.num_sweeps / sweeps_per).max(1);
     let (hot, cold) = params
@@ -121,7 +128,7 @@ fn spin_sign(s: i8) -> f64 {
 
 /// Local field `h_i + Σ_j J_ij s_j` (full recompute; used once to seed the
 /// incremental `heff` cache).
-fn effective_field(var: usize, spins: &[i8], graph: &CpuGraph) -> f64 {
+pub(crate) fn effective_field(var: usize, spins: &[i8], graph: &CpuGraph) -> f64 {
     let mut heff = graph.h[var];
     let (nodes, coups) = graph.neighbors(var);
     for i in 0..nodes.len() {
@@ -133,7 +140,7 @@ fn effective_field(var: usize, spins: &[i8], graph: &CpuGraph) -> f64 {
 /// Propagate a spin change at `var` (sign delta `ds`) into its neighbors' cached
 /// effective fields. `var`'s own field is unaffected (it excludes its own spin).
 #[inline]
-fn apply_field_delta(graph: &CpuGraph, heff: &mut [f64], var: usize, ds: f64) {
+pub(crate) fn apply_field_delta(graph: &CpuGraph, heff: &mut [f64], var: usize, ds: f64) {
     let (nodes, coups) = graph.neighbors(var);
     for i in 0..nodes.len() {
         heff[nodes[i] as usize] += coups[i] * ds;
@@ -154,23 +161,10 @@ fn metropolis_accept(delta: f64, beta: f64, rng: &mut SmallRng) -> bool {
     rng.gen::<f64>() < accept_prob
 }
 
-/// Heat-bath: sample new spin from conditional Boltzmann.
-fn gibbs_sample_spin(heff: f64, beta: f64, rng: &mut SmallRng) -> i8 {
-    // P(s = +1) = 1 / (1 + exp(2 β h_eff))
-    let arg = (2.0 * beta * heff).clamp(-500.0, 500.0);
-    let p_plus = 1.0 / (1.0 + arg.exp());
-    if rng.gen::<f64>() < p_plus {
-        1
-    } else {
-        -1
-    }
-}
-
 fn anneal_one_read(
     graph: &CpuGraph,
     beta_schedule: &[f64],
     sweeps_per_beta: usize,
-    algorithm: Algorithm,
     rng: &mut SmallRng,
 ) -> Vec<i8> {
     let n = graph.num_nodes();
@@ -195,38 +189,55 @@ fn anneal_one_read(
     // a recompute-every-flip implementation.
     let mut heff: Vec<f64> = (0..n).map(|v| effective_field(v, &spins, graph)).collect();
 
-    match algorithm {
-        Algorithm::Sa => {
-            for &beta in beta_schedule {
-                for _ in 0..sweeps_per_beta {
-                    for var in 0..n {
-                        let s = spin_sign(spins[var]);
-                        let delta = -2.0 * s * heff[var];
-                        if metropolis_accept(delta, beta, rng) {
-                            spins[var] = -spins[var];
-                            apply_field_delta(graph, &mut heff, var, -2.0 * s);
-                        }
-                    }
-                }
-            }
-        }
-        Algorithm::Gibbs => {
-            for &beta in beta_schedule {
-                for _ in 0..sweeps_per_beta {
-                    for var in 0..n {
-                        let new = gibbs_sample_spin(heff[var], beta, rng);
-                        if new != spins[var] {
-                            let ds = spin_sign(new) - spin_sign(spins[var]);
-                            spins[var] = new;
-                            apply_field_delta(graph, &mut heff, var, ds);
-                        }
-                    }
+    for &beta in beta_schedule {
+        for _ in 0..sweeps_per_beta {
+            for var in 0..n {
+                let s = spin_sign(spins[var]);
+                let delta = -2.0 * s * heff[var];
+                if metropolis_accept(delta, beta, rng) {
+                    spins[var] = -spins[var];
+                    apply_field_delta(graph, &mut heff, var, -2.0 * s);
                 }
             }
         }
     }
     spins
 }
+
+/// Descend from a supplied configuration to a local minimum by single-spin
+/// flips, in a fixed sweep order.
+///
+/// Reuses the same incremental effective-field cache as the annealing kernels:
+/// seeded once in `O(edges)`, then each flip updates only its neighbors. Stops
+/// after a full pass with no flip, or when `max_sweeps` passes have run.
+///
+/// Deterministic and RNG-free. The tensor-network backend calls it on every
+/// sampled configuration, so this is the stage that guarantees each returned
+/// configuration is at least locally optimal.
+pub(crate) fn polish_from(spins: &mut [i8], graph: &CpuGraph, max_sweeps: usize) {
+    let n = graph.num_nodes();
+    if n == 0 || spins.len() != n {
+        return;
+    }
+    let mut heff: Vec<f64> = (0..n).map(|v| effective_field(v, spins, graph)).collect();
+    for _ in 0..max_sweeps {
+        let mut moved = false;
+        for var in 0..n {
+            let s = spin_sign(spins[var]);
+            // Strictly downhill only: accepting a zero delta would let the
+            // sweep cycle between equal-energy configurations forever.
+            if -2.0 * s * heff[var] < 0.0 {
+                spins[var] = -spins[var];
+                apply_field_delta(graph, &mut heff, var, -2.0 * s);
+                moved = true;
+            }
+        }
+        if !moved {
+            break;
+        }
+    }
+}
+
 
 fn score_spins(spins: &[i8], graph: &IsingGraph) -> SamplerResult {
     let energy = energy_milli(spins, &graph.h, &graph.j, &graph.edges);
@@ -263,6 +274,16 @@ pub fn sample_ising(
     params: &SampleParams,
     algorithm: Algorithm,
 ) -> Vec<SamplerResult> {
+    if algorithm == Algorithm::Gibbs {
+        // Gibbs runs the chromatic kernel at its default worker count. There is
+        // no sequential Gibbs: the colour classes are the algorithm, not an
+        // optimisation layered over a single-site scan.
+        return crate::gibbs_parallel::sample_gibbs_parallel(
+            graph,
+            params,
+            crate::gibbs_parallel::DEFAULT_GIBBS_WORKERS,
+        );
+    }
     let num_reads = params.num_reads.max(1);
     let cpu = CpuGraph::from_base(graph);
     let beta_schedule = build_beta_schedule(graph, params);
@@ -277,7 +298,7 @@ pub fn sample_ising(
                 .wrapping_add(read_idx as u64)
                 .wrapping_add(1);
             let mut rng = SmallRng::seed_from_u64(seed);
-            let spins = anneal_one_read(&cpu, &beta_schedule, sweeps_per, algorithm, &mut rng);
+            let spins = anneal_one_read(&cpu, &beta_schedule, sweeps_per, &mut rng);
             score_spins(&spins, graph)
         })
         .collect()
@@ -572,4 +593,89 @@ mod tests {
             }
         }
     }
+    // ---- polish_from ----
+
+    #[test]
+    fn polish_descends_a_ferromagnetic_chain_to_a_ground_state() {
+        // Ten-site ferromagnetic chain: every ground state is uniform, and the
+        // ground energy is -9.
+        let n = 10;
+        let edges: Vec<(usize, usize)> = (0..n - 1).map(|i| (i, i + 1)).collect();
+        let g = IsingGraph::new(vec![0.0; n], vec![-1.0; n - 1], edges);
+        let cpu = CpuGraph::from_base(&g);
+        let mut spins = vec![1i8, -1, 1, -1, 1, -1, 1, -1, 1, -1];
+        polish_from(&mut spins, &cpu, 64);
+        assert_eq!(
+            energy_milli(&spins, &g.h, &g.j, &g.edges),
+            -9000,
+            "polish left the chain at {spins:?}"
+        );
+    }
+
+    #[test]
+    fn polish_of_a_fields_only_problem_lands_on_the_exact_optimum() {
+        let h = vec![0.7, -1.2, 0.3, -0.5, 2.0];
+        let g = IsingGraph::new(h.clone(), vec![], vec![]);
+        let cpu = CpuGraph::from_base(&g);
+        let mut spins = vec![1i8; 5];
+        polish_from(&mut spins, &cpu, 8);
+        let want: Vec<i8> = h.iter().map(|&x| if x > 0.0 { -1i8 } else { 1i8 }).collect();
+        assert_eq!(spins, want);
+    }
+
+    #[test]
+    fn polish_never_raises_the_energy_and_stops_at_a_local_minimum() {
+        let g = mixed4();
+        let cpu = CpuGraph::from_base(&g);
+        for start in 0..16u32 {
+            let mut spins: Vec<i8> = (0..4)
+                .map(|i| if (start >> i) & 1 == 0 { 1i8 } else { -1 })
+                .collect();
+            let before = energy_milli(&spins, &g.h, &g.j, &g.edges);
+            polish_from(&mut spins, &cpu, 32);
+            let after = energy_milli(&spins, &g.h, &g.j, &g.edges);
+            assert!(after <= before, "start {start}: {before} -> {after}");
+            // Local minimum: no single flip lowers the energy.
+            for var in 0..4 {
+                let mut probe = spins.clone();
+                probe[var] = -probe[var];
+                assert!(
+                    energy_milli(&probe, &g.h, &g.j, &g.edges) >= after,
+                    "start {start}: flipping {var} lowers the energy below {after}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn polish_is_deterministic_and_respects_its_sweep_budget() {
+        let g = mixed4();
+        let cpu = CpuGraph::from_base(&g);
+        let run = |budget: usize| {
+            let mut spins = vec![1i8, 1, 1, 1];
+            polish_from(&mut spins, &cpu, budget);
+            spins
+        };
+        assert_eq!(run(8), run(8));
+        // A zero budget must leave the configuration untouched.
+        let mut untouched = vec![1i8, 1, 1, 1];
+        polish_from(&mut untouched, &cpu, 0);
+        assert_eq!(untouched, vec![1i8, 1, 1, 1]);
+    }
+
+    #[test]
+    fn polish_is_safe_on_an_empty_graph_and_a_mismatched_length() {
+        let empty = IsingGraph::new(vec![], vec![], vec![]);
+        let cpu = CpuGraph::from_base(&empty);
+        let mut none: Vec<i8> = Vec::new();
+        polish_from(&mut none, &cpu, 8);
+        assert!(none.is_empty());
+
+        let g = mixed4();
+        let cpu = CpuGraph::from_base(&g);
+        let mut short = vec![1i8, -1];
+        polish_from(&mut short, &cpu, 8);
+        assert_eq!(short, vec![1i8, -1], "a length mismatch must be a no-op");
+    }
+
 }
