@@ -12,6 +12,8 @@
 
 mod coloring;
 mod spin_barrier;
+pub mod bptns;
+pub mod bptns_sampler;
 pub mod gibbs_parallel;
 pub mod mps;
 pub mod mps_sampler;
@@ -20,6 +22,8 @@ pub mod sb_core;
 pub mod sb_sampler;
 
 pub use quip_miner_core::{Algorithm, IsingGraph, SampleParams, SamplerResult};
+pub use bptns::{sample_ising_bptns, BptnsConfig};
+pub use bptns_sampler::{BptnsSampler, CPU_BPTNS_IDENTITY};
 pub use mps::{sample_ising_mps, InitMode, MpsConfig};
 pub use mps_sampler::{MpsSampler, CPU_MFA_IDENTITY, CPU_MPS_IDENTITY};
 pub use sampler_core::sample_ising;

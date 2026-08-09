@@ -23,9 +23,12 @@ use state::Mps;
 use std::time::{Duration, Instant};
 
 mod order;
-mod schedule;
+// Shared with the BP-TNS kernel: the schedule keeps `beta_range` and
+// `num_sweeps` meaning the same thing for every tensor-network backend, and
+// the Jacobi SVD stays the crate's one factorization kernel.
+pub(crate) mod schedule;
 mod state;
-mod svd;
+pub(crate) mod svd;
 
 /// Per-model MPS memory cap in bytes, 64 MB. One MPS costs `16 n chi^2` bytes
 /// at 8 bytes per f64 and two physical states. The cap is per model, not per

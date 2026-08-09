@@ -56,6 +56,13 @@ name = "quip-cpu-mfa"
 path = "src/bin/quip_cpu_mfa.rs"
 required-features = ["experimental"]
 
+# BP-gauged tensor network on the problem graph. Experimental track, gated
+# for the same reason as bsb.
+[[bin]]
+name = "quip-cpu-bptns"
+path = "src/bin/quip_cpu_bptns.rs"
+required-features = ["experimental"]
+
 # Experimental backends are developer-built only. CI tests and lints them with
 # --all-features; it must never package them into release assets. The feature is
 # empty because the modules compile unconditionally and only the [[bin]] targets

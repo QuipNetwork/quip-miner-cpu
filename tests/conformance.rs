@@ -278,6 +278,7 @@ const EXPERIMENTAL_BINS: &[(&str, &str)] = &[
     ("quip-cpu-hbsb", "hbsb"),
     ("quip-cpu-mps", "mps"),
     ("quip-cpu-mfa", "mfa"),
+    ("quip-cpu-bptns", "bptns"),
 ];
 
 /// The capabilities, version, and self-check surface of the experimental
@@ -443,6 +444,39 @@ async fn quip_cpu_mps_passes_conformance() {
     );
     let report = drive_miner_bounded(&miner, &format!("unix://{socket}")).await;
     assert!(report.handshake_ok, "mps handshake failed");
+    assert_eq!(
+        report.result_job_ids().len(),
+        3,
+        "expected 3 job results (job-1, job-2, job-hash)"
+    );
+    assert!(report.result_job_ids().iter().any(|id| id == b"job-1"));
+    assert!(report.result_job_ids().iter().any(|id| id == b"job-2"));
+    assert!(report.result_job_ids().iter().any(|id| id == b"job-hash"));
+    assert!(report.has_reject(b"job-bad-h", RejectReason::Malformed));
+    assert!(report.has_reject(b"job-gate", RejectReason::UnsupportedKind));
+    assert!(report.has_reject(b"job-old", RejectReason::Expired));
+    assert_eq!(report.exit_code, 0, "clean shutdown expected");
+}
+
+/// The BP-TNS miner drives the same protocol surface. On the mock
+/// coordinator's small graphs `select_chi` resolves above 1, so this
+/// exercises the gauged gate, the BP pass, and conditioned sampling rather
+/// than only the mean-field path.
+#[cfg(feature = "experimental")]
+#[tokio::test]
+async fn quip_cpu_bptns_passes_conformance() {
+    ensure_built_with(&["quip-cpu-bptns"], &["experimental"]);
+    let miner = profile_bin("quip-cpu-bptns");
+    let socket = format!(
+        "/tmp/quip-cpu-bptns-conf-{}-{}.sock",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let report = drive_miner_bounded(&miner, &format!("unix://{socket}")).await;
+    assert!(report.handshake_ok, "bptns handshake failed");
     assert_eq!(
         report.result_job_ids().len(),
         3,
