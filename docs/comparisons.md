@@ -517,7 +517,7 @@ so that each one changes a component a reader would expect to matter.
 | `cpu-mfa`, annealed | product state, bond dimension 1 | +15.279% | +14.042% |
 | `cpu-mps`, `QUIP_MPS_INIT=random` | no anneal at all | +15.229% | +14.021% |
 | `cpu-mps`, random, second replicate | no anneal, independent sample | +15.254% | +14.106% |
-| `cpu-bptns` | belief-propagation net on the problem graph | +15.287% | +14.103% |
+| `cpu-flatiron` | belief-propagation net on the problem graph | +15.287% | +14.103% |
 
 Paired against `cpu-sa`. Every arm clears the gate on no instance. The whole
 spread is 0.058 points on `chain-h0` and 0.085 on `chain-ternary`, against
@@ -577,7 +577,7 @@ Three explanations were tested and none survives. Do not cite them.
 | --- | --- |
 | Bond dimension held at 1 | `select_chi` returns more than 1 on both real graphs, and the result does not change |
 | Zero-bias symmetry | Real ternary biases recover 1.7 points of a 15 point deficit |
-| Conditioning fidelity | `cpu-bptns` conditions one hop at a time and `cpu-mps` conditions exactly, and both return the same number |
+| Conditioning fidelity | `cpu-flatiron` conditions one hop at a time and `cpu-mps` conditions exactly, and both return the same number |
 
 ## Reading the numbers
 
