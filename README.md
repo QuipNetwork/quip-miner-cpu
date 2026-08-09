@@ -21,6 +21,7 @@ reads are sequential and cache-local. Energies are scored with the canonical
 | `quip-cpu-hbsb` | heated ballistic Simulated Bifurcation | experimental |
 | `quip-cpu-mps` | tensor network: imaginary-time TEBD with exact sampling | experimental |
 | `quip-cpu-mfa` | mean-field annealing (the same kernel at bond dimension 1) | experimental |
+| `quip-cpu-flatiron` | belief-propagation tensor network on the problem graph | experimental |
 
 Every sampler streams jobs through one shared pump, `run_stream_pump` in
 `src/lib.rs`. That pump holds the only copy of the cancellation check before

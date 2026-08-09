@@ -1,6 +1,6 @@
 [package]
 name = "quip-miner-cpu"
-version = "0.3.0-rc4"
+version = "0.3.0-rc5"
 edition = "2021"
 description = "CPU Ising miners: simulated annealing and single-site Gibbs (v0.3)"
 license = "AGPL-3.0-or-later"
@@ -54,6 +54,13 @@ required-features = ["experimental"]
 [[bin]]
 name = "quip-cpu-mfa"
 path = "src/bin/quip_cpu_mfa.rs"
+required-features = ["experimental"]
+
+# BP-gauged tensor network on the problem graph. Experimental track, gated
+# for the same reason as bsb.
+[[bin]]
+name = "quip-cpu-flatiron"
+path = "src/bin/quip_cpu_flatiron.rs"
 required-features = ["experimental"]
 
 # Experimental backends are developer-built only. CI tests and lints them with
