@@ -1,0 +1,174 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1010" height="768" viewBox="0 0 1010 768" font-family="Helvetica,Arial,sans-serif">
+<rect width="1010" height="768" fill="#ffffff"/>
+<text x="92" y="26" font-size="15" font-weight="600" fill="#111">CPU Ising kernels on the Advantage2-System1 topology</text>
+<text x="92" y="44" font-size="11" fill="#666">Zero biases, couplings drawn from {-1, +1}. 16 reads x 1000 sweeps. 30 instances per size, shared across kernels.</text>
+<text x="92" y="60" font-size="11" fill="#666">cpu-gibbs occupies 4 cores per sample, the others 1. Hollow markers were measured at a 1-minute load above 20.</text>
+<text x="92" y="76" font-size="11" fill="#666">cpu-mps and cpu-mfa return identical energies here: the bond budget resolves to 1 on every instance, so both run as a product state.</text>
+<line x1="410.0" y1="96" x2="410.0" y2="706" stroke="#d8b98a" stroke-width="1"/>
+<text x="410.0" y="90" font-size="10.5" fill="#9a7a45" text-anchor="middle">pivot: 4577 nodes, 41515 edges</text>
+<text x="92" y="116" font-size="12" font-weight="600" fill="#111">Throughput: models per second per core, so higher is better</text>
+<line x1="92" y1="382.0" x2="92" y2="132.0" stroke="#111" stroke-width="1"/>
+<text x="84" y="367.7" font-size="10" fill="#444" text-anchor="end">0.03</text>
+<text x="84" y="315.0" font-size="10" fill="#444" text-anchor="end">0.1</text>
+<text x="84" y="266.8" font-size="10" fill="#444" text-anchor="end">0.3</text>
+<text x="84" y="214.0" font-size="10" fill="#444" text-anchor="end">1</text>
+<text x="84" y="165.9" font-size="10" fill="#444" text-anchor="end">3</text>
+<text x="84" y="128.0" font-size="10" fill="#444" text-anchor="end">per core</text>
+<text x="84" y="140.0" font-size="9" fill="#999" text-anchor="end">log scale</text>
+<polyline points="92.0,147.2 198.1,177.7 304.0,194.8 410.0,208.7 516.0,220.7 622.1,229.9 728.0,235.9 834.0,238.8" fill="none" stroke="#555555" stroke-width="1.6"/>
+<circle cx="92.0" cy="147.2" r="2.4" fill="#555555"/>
+<circle cx="198.1" cy="177.7" r="3.2" fill="#fff" stroke="#555555" stroke-width="1.4"/>
+<circle cx="304.0" cy="194.8" r="2.4" fill="#555555"/>
+<circle cx="410.0" cy="208.7" r="2.4" fill="#555555"/>
+<circle cx="516.0" cy="220.7" r="2.4" fill="#555555"/>
+<circle cx="622.1" cy="229.9" r="2.4" fill="#555555"/>
+<circle cx="728.0" cy="235.9" r="2.4" fill="#555555"/>
+<circle cx="834.0" cy="238.8" r="2.4" fill="#555555"/>
+<polyline points="92.0,177.5 198.1,214.8 304.0,233.6 410.0,251.4 516.0,264.8 622.1,266.6 728.0,278.4 834.0,285.8" fill="none" stroke="#aaaaaa" stroke-width="1.6"/>
+<circle cx="92.0" cy="177.5" r="2.4" fill="#aaaaaa"/>
+<circle cx="198.1" cy="214.8" r="3.2" fill="#fff" stroke="#aaaaaa" stroke-width="1.4"/>
+<circle cx="304.0" cy="233.6" r="2.4" fill="#aaaaaa"/>
+<circle cx="410.0" cy="251.4" r="2.4" fill="#aaaaaa"/>
+<circle cx="516.0" cy="264.8" r="2.4" fill="#aaaaaa"/>
+<circle cx="622.1" cy="266.6" r="2.4" fill="#aaaaaa"/>
+<circle cx="728.0" cy="278.4" r="2.4" fill="#aaaaaa"/>
+<circle cx="834.0" cy="285.8" r="2.4" fill="#aaaaaa"/>
+<polyline points="92.0,147.7 198.1,184.6 304.0,201.3 410.0,219.2 516.0,229.4 622.1,235.5 728.0,245.1 834.0,252.3" fill="none" stroke="#1f6fb4" stroke-width="2.4"/>
+<circle cx="92.0" cy="147.7" r="2.4" fill="#1f6fb4"/>
+<circle cx="198.1" cy="184.6" r="3.2" fill="#fff" stroke="#1f6fb4" stroke-width="1.4"/>
+<circle cx="304.0" cy="201.3" r="2.4" fill="#1f6fb4"/>
+<circle cx="410.0" cy="219.2" r="2.4" fill="#1f6fb4"/>
+<circle cx="516.0" cy="229.4" r="2.4" fill="#1f6fb4"/>
+<circle cx="622.1" cy="235.5" r="2.4" fill="#1f6fb4"/>
+<circle cx="728.0" cy="245.1" r="2.4" fill="#1f6fb4"/>
+<circle cx="834.0" cy="252.3" r="2.4" fill="#1f6fb4"/>
+<polyline points="92.0,138.1 198.1,172.8 304.0,192.5 410.0,211.1 516.0,221.0 622.1,227.5 728.0,237.4 834.0,242.8" fill="none" stroke="#c1521d" stroke-width="2.4"/>
+<circle cx="92.0" cy="138.1" r="2.4" fill="#c1521d"/>
+<circle cx="198.1" cy="172.8" r="3.2" fill="#fff" stroke="#c1521d" stroke-width="1.4"/>
+<circle cx="304.0" cy="192.5" r="2.4" fill="#c1521d"/>
+<circle cx="410.0" cy="211.1" r="2.4" fill="#c1521d"/>
+<circle cx="516.0" cy="221.0" r="2.4" fill="#c1521d"/>
+<circle cx="622.1" cy="227.5" r="2.4" fill="#c1521d"/>
+<circle cx="728.0" cy="237.4" r="2.4" fill="#c1521d"/>
+<circle cx="834.0" cy="242.8" r="2.4" fill="#c1521d"/>
+<polyline points="92.0,230.6 198.1,265.5 304.0,296.0 410.0,318.5 516.0,335.8 622.1,350.3 728.0,362.8 834.0,373.5" fill="none" stroke="#4a7c3f" stroke-width="2.4"/>
+<circle cx="92.0" cy="230.6" r="2.4" fill="#4a7c3f"/>
+<circle cx="198.1" cy="265.5" r="2.4" fill="#4a7c3f"/>
+<circle cx="304.0" cy="296.0" r="2.4" fill="#4a7c3f"/>
+<circle cx="410.0" cy="318.5" r="2.4" fill="#4a7c3f"/>
+<circle cx="516.0" cy="335.8" r="2.4" fill="#4a7c3f"/>
+<circle cx="622.1" cy="350.3" r="2.4" fill="#4a7c3f"/>
+<circle cx="728.0" cy="362.8" r="2.4" fill="#4a7c3f"/>
+<circle cx="834.0" cy="373.5" r="2.4" fill="#4a7c3f"/>
+<polyline points="92.0,251.0 198.1,265.2 304.0,296.1 410.0,318.6 516.0,335.9 622.1,350.2 728.0,363.7 834.0,373.4" fill="none" stroke="#8fb082" stroke-width="1.6"/>
+<circle cx="92.0" cy="251.0" r="3.2" fill="#fff" stroke="#8fb082" stroke-width="1.4"/>
+<circle cx="198.1" cy="265.2" r="2.4" fill="#8fb082"/>
+<circle cx="304.0" cy="296.1" r="2.4" fill="#8fb082"/>
+<circle cx="410.0" cy="318.6" r="2.4" fill="#8fb082"/>
+<circle cx="516.0" cy="335.9" r="2.4" fill="#8fb082"/>
+<circle cx="622.1" cy="350.2" r="2.4" fill="#8fb082"/>
+<circle cx="728.0" cy="363.7" r="2.4" fill="#8fb082"/>
+<circle cx="834.0" cy="373.4" r="2.4" fill="#8fb082"/>
+<text x="844.0" y="242.3" font-size="11" fill="#555555" font-weight="600">cpu-sa</text>
+<text x="844.0" y="254.8" font-size="9.5" fill="#777">0.52/s/core</text>
+<text x="844.0" y="272.3" font-size="11" fill="#c1521d" font-weight="600">cpu-bsb</text>
+<text x="844.0" y="284.8" font-size="9.5" fill="#777">0.48/s/core</text>
+<text x="844.0" y="302.3" font-size="11" fill="#1f6fb4" font-weight="600">cpu-sb</text>
+<text x="844.0" y="314.8" font-size="9.5" fill="#777">0.39/s/core</text>
+<text x="844.0" y="332.3" font-size="11" fill="#aaaaaa" font-weight="600">cpu-gibbs</text>
+<text x="844.0" y="344.8" font-size="9.5" fill="#777">0.18/s/core</text>
+<text x="844.0" y="376.9" font-size="11" fill="#8fb082" font-weight="600">cpu-mfa</text>
+<text x="844.0" y="389.4" font-size="9.5" fill="#777">0.02/s/core</text>
+<text x="844.0" y="406.9" font-size="11" fill="#4a7c3f" font-weight="600">cpu-mps</text>
+<text x="844.0" y="419.4" font-size="9.5" fill="#777">0.02/s/core</text>
+<text x="92" y="426" font-size="12" font-weight="600" fill="#111">Quality: paired energy difference from cpu-sa on the same instances</text>
+<text x="92" y="441" font-size="10.5" fill="#666">below the line is lower energy, which is better. Whiskers are +/-1 standard error over 30 paired instances.</text>
+<text x="844.0" y="441" font-size="10" fill="#4a7c3f">cpu-mps and cpu-mfa: +13.8 to +15.7%, off scale</text>
+<line x1="92" y1="456.0" x2="92" y2="706.0" stroke="#111" stroke-width="1"/>
+<text x="84" y="689.8" font-size="10" fill="#444" text-anchor="end">-0.2</text>
+<text x="84" y="656.9" font-size="10" fill="#444" text-anchor="end">-0.1</text>
+<text x="84" y="624.0" font-size="10" fill="#444" text-anchor="end">+0.0</text>
+<text x="84" y="591.1" font-size="10" fill="#444" text-anchor="end">+0.1</text>
+<text x="84" y="558.2" font-size="10" fill="#444" text-anchor="end">+0.2</text>
+<text x="84" y="525.3" font-size="10" fill="#444" text-anchor="end">+0.3</text>
+<text x="84" y="492.4" font-size="10" fill="#444" text-anchor="end">+0.4</text>
+<text x="84" y="444.0" font-size="10" fill="#444" text-anchor="end">%</text>
+<line x1="92" y1="620.5" x2="834.0" y2="620.5" stroke="#555" stroke-width="1" stroke-dasharray="4 3"/>
+<polyline points="92.0,509.2 198.1,523.0 304.0,525.6 410.0,506.7 516.0,492.9 622.1,494.9 728.0,513.3 834.0,527.0" fill="none" stroke="#aaaaaa" stroke-width="1.6"/>
+<line x1="92.0" y1="527.8" x2="92.0" y2="490.6" stroke="#aaaaaa" stroke-width="1"/>
+<circle cx="92.0" cy="509.2" r="2.4" fill="#aaaaaa"/>
+<line x1="198.1" y1="534.8" x2="198.1" y2="511.3" stroke="#aaaaaa" stroke-width="1"/>
+<circle cx="198.1" cy="523.0" r="2.4" fill="#aaaaaa"/>
+<line x1="304.0" y1="536.0" x2="304.0" y2="515.2" stroke="#aaaaaa" stroke-width="1"/>
+<circle cx="304.0" cy="525.6" r="2.4" fill="#aaaaaa"/>
+<line x1="410.0" y1="516.0" x2="410.0" y2="497.4" stroke="#aaaaaa" stroke-width="1"/>
+<circle cx="410.0" cy="506.7" r="2.4" fill="#aaaaaa"/>
+<line x1="516.0" y1="504.8" x2="516.0" y2="481.0" stroke="#aaaaaa" stroke-width="1"/>
+<circle cx="516.0" cy="492.9" r="2.4" fill="#aaaaaa"/>
+<line x1="622.1" y1="505.5" x2="622.1" y2="484.3" stroke="#aaaaaa" stroke-width="1"/>
+<circle cx="622.1" cy="494.9" r="2.4" fill="#aaaaaa"/>
+<line x1="728.0" y1="526.1" x2="728.0" y2="500.6" stroke="#aaaaaa" stroke-width="1"/>
+<circle cx="728.0" cy="513.3" r="2.4" fill="#aaaaaa"/>
+<line x1="834.0" y1="533.9" x2="834.0" y2="520.1" stroke="#aaaaaa" stroke-width="1"/>
+<circle cx="834.0" cy="527.0" r="2.4" fill="#aaaaaa"/>
+<polyline points="92.0,596.4 198.1,640.5 304.0,650.1 410.0,637.2 516.0,677.0 622.1,646.6 728.0,677.5 834.0,645.6" fill="none" stroke="#1f6fb4" stroke-width="2.4"/>
+<line x1="92.0" y1="609.3" x2="92.0" y2="583.4" stroke="#1f6fb4" stroke-width="1"/>
+<circle cx="92.0" cy="596.4" r="2.4" fill="#1f6fb4"/>
+<line x1="198.1" y1="652.1" x2="198.1" y2="629.0" stroke="#1f6fb4" stroke-width="1"/>
+<circle cx="198.1" cy="640.5" r="2.4" fill="#1f6fb4"/>
+<line x1="304.0" y1="660.3" x2="304.0" y2="639.8" stroke="#1f6fb4" stroke-width="1"/>
+<circle cx="304.0" cy="650.1" r="2.4" fill="#1f6fb4"/>
+<line x1="410.0" y1="646.6" x2="410.0" y2="627.8" stroke="#1f6fb4" stroke-width="1"/>
+<circle cx="410.0" cy="637.2" r="2.4" fill="#1f6fb4"/>
+<line x1="516.0" y1="687.1" x2="516.0" y2="666.8" stroke="#1f6fb4" stroke-width="1"/>
+<circle cx="516.0" cy="677.0" r="2.4" fill="#1f6fb4"/>
+<line x1="622.1" y1="655.3" x2="622.1" y2="638.0" stroke="#1f6fb4" stroke-width="1"/>
+<circle cx="622.1" cy="646.6" r="2.4" fill="#1f6fb4"/>
+<line x1="728.0" y1="687.1" x2="728.0" y2="667.9" stroke="#1f6fb4" stroke-width="1"/>
+<circle cx="728.0" cy="677.5" r="2.4" fill="#1f6fb4"/>
+<line x1="834.0" y1="651.5" x2="834.0" y2="639.8" stroke="#1f6fb4" stroke-width="1"/>
+<circle cx="834.0" cy="645.6" r="2.4" fill="#1f6fb4"/>
+<polyline points="92.0,489.5 198.1,531.8 304.0,558.3 410.0,571.9 516.0,487.4 622.1,437.1 728.0,554.8 834.0,587.3" fill="none" stroke="#c1521d" stroke-width="2.4"/>
+<line x1="92.0" y1="513.2" x2="92.0" y2="465.7" stroke="#c1521d" stroke-width="1"/>
+<circle cx="92.0" cy="489.5" r="2.4" fill="#c1521d"/>
+<line x1="198.1" y1="545.4" x2="198.1" y2="518.3" stroke="#c1521d" stroke-width="1"/>
+<circle cx="198.1" cy="531.8" r="2.4" fill="#c1521d"/>
+<line x1="304.0" y1="573.7" x2="304.0" y2="542.9" stroke="#c1521d" stroke-width="1"/>
+<circle cx="304.0" cy="558.3" r="2.4" fill="#c1521d"/>
+<line x1="410.0" y1="580.7" x2="410.0" y2="563.0" stroke="#c1521d" stroke-width="1"/>
+<circle cx="410.0" cy="571.9" r="2.4" fill="#c1521d"/>
+<line x1="516.0" y1="495.8" x2="516.0" y2="479.0" stroke="#c1521d" stroke-width="1"/>
+<circle cx="516.0" cy="487.4" r="2.4" fill="#c1521d"/>
+<line x1="622.1" y1="448.8" x2="622.1" y2="425.4" stroke="#c1521d" stroke-width="1"/>
+<circle cx="622.1" cy="437.1" r="2.4" fill="#c1521d"/>
+<line x1="728.0" y1="565.3" x2="728.0" y2="544.2" stroke="#c1521d" stroke-width="1"/>
+<circle cx="728.0" cy="554.8" r="2.4" fill="#c1521d"/>
+<line x1="834.0" y1="595.0" x2="834.0" y2="579.6" stroke="#c1521d" stroke-width="1"/>
+<circle cx="834.0" cy="587.3" r="2.4" fill="#c1521d"/>
+<text x="844.0" y="530.5" font-size="11" fill="#aaaaaa" font-weight="600">cpu-gibbs</text>
+<text x="844.0" y="543.0" font-size="9.5" fill="#777">+0.28%</text>
+<text x="844.0" y="590.8" font-size="11" fill="#c1521d" font-weight="600">cpu-bsb</text>
+<text x="844.0" y="603.3" font-size="9.5" fill="#777">+0.10%</text>
+<text x="844.0" y="624.0" font-size="11" fill="#555555" font-weight="600">cpu-sa</text>
+<text x="844.0" y="636.5" font-size="9.5" fill="#777">baseline</text>
+<text x="844.0" y="654.0" font-size="11" fill="#1f6fb4" font-weight="600">cpu-sb</text>
+<text x="844.0" y="666.5" font-size="9.5" fill="#777">-0.08%</text>
+<line x1="92" y1="707" x2="834.0" y2="707" stroke="#111" stroke-width="1"/>
+<text x="92.0" y="722" font-size="10" fill="#444" text-anchor="middle">1144</text>
+<text x="92.0" y="734" font-size="8.5" fill="#999" text-anchor="middle">9k</text>
+<text x="198.1" y="722" font-size="10" fill="#444" text-anchor="middle">2289</text>
+<text x="198.1" y="734" font-size="8.5" fill="#999" text-anchor="middle">19k</text>
+<text x="304.0" y="722" font-size="10" fill="#444" text-anchor="middle">3433</text>
+<text x="304.0" y="734" font-size="8.5" fill="#999" text-anchor="middle">30k</text>
+<text x="410.0" y="722" font-size="10" fill="#444" text-anchor="middle">4577</text>
+<text x="410.0" y="734" font-size="8.5" fill="#999" text-anchor="middle">41k</text>
+<text x="516.0" y="722" font-size="10" fill="#444" text-anchor="middle">5721</text>
+<text x="516.0" y="734" font-size="8.5" fill="#999" text-anchor="middle">51k</text>
+<text x="622.1" y="722" font-size="10" fill="#444" text-anchor="middle">6866</text>
+<text x="622.1" y="734" font-size="8.5" fill="#999" text-anchor="middle">62k</text>
+<text x="728.0" y="722" font-size="10" fill="#444" text-anchor="middle">8010</text>
+<text x="728.0" y="734" font-size="8.5" fill="#999" text-anchor="middle">72k</text>
+<text x="834.0" y="722" font-size="10" fill="#444" text-anchor="middle">9154</text>
+<text x="834.0" y="734" font-size="8.5" fill="#999" text-anchor="middle">83k</text>
+<text x="463.0" y="753" font-size="11" fill="#333" text-anchor="middle">nodes (edges below)</text>
+</svg>

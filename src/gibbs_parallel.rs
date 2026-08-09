@@ -1,0 +1,579 @@
+//! Parallel chromatic Gibbs.
+//!
+//! One sweep visits every colour class in order. A class is an independent set,
+//! so every member's conditional distribution depends only on nodes outside the
+//! class, and the whole class resamples at once. Classes run in sequence,
+//! because class `c + 1` reads what class `c` wrote. Workers split the members
+//! of a single class, which is why the worker count does not have to match the
+//! class count.
+//!
+//! Two properties the sequential scan did not have to keep:
+//!
+//! - Fields are recomputed per class rather than patched. The sequential kernel
+//!   patches a shared `heff` after every flip, which several workers cannot do
+//!   at once without racing. Recomputing costs the same `2E` per sweep.
+//! - Randomness is counter-based, keyed on read, sweep, class and node. A
+//!   per-worker generator would make the output depend on the worker count, and
+//!   the protocol requires that one seed and one binary reproduce one result on
+//!   any machine.
+
+use std::sync::atomic::{AtomicI8, Ordering};
+
+use crate::spin_barrier::SpinBarrier;
+
+use quip_miner_core::{IsingGraph, SampleParams, SamplerResult};
+use quip_protocol::scoring::energy_milli;
+
+use crate::coloring::Coloring;
+use crate::sampler_core::CpuGraph;
+
+/// Default workers per model.
+///
+/// Measured as the best setting on the Advantage2-System1 topology: 3.38 times
+/// the throughput of one worker, at 85 percent efficiency. Higher counts scale
+/// worse, because a class update is one or two microseconds of work and every
+/// class ends at a barrier. See `docs/comparisons.md`.
+pub const DEFAULT_GIBBS_WORKERS: usize = 4;
+
+/// A worker or colour setting the miner must not start with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigError {
+    /// Zero workers cannot sample.
+    NoWorkers,
+    /// More workers than the host has cores. The barrier spins, so
+    /// oversubscription does not merely slow the sampler down, it collapses it.
+    /// Measured at 16 workers on a 12-core host, a pure spin ran about 90 times
+    /// slower than one worker.
+    Oversubscribed { requested: usize, available: usize },
+    /// The graph needs more colour classes than the configured budget allows.
+    TooManyColors { needed: usize, allowed: usize },
+}
+
+impl std::fmt::Display for ConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoWorkers => write!(f, "gibbs workers must be at least 1"),
+            Self::Oversubscribed {
+                requested,
+                available,
+            } => write!(
+                f,
+                "gibbs workers ({requested}) exceed the {available} cores this host \
+                 reports. The class barrier spins, so oversubscription collapses throughput"
+            ),
+            Self::TooManyColors { needed, allowed } => write!(
+                f,
+                "this graph needs {needed} colour classes but the configured budget is {allowed}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ConfigError {}
+
+/// Where the workers go.
+///
+/// Both strategies run the same sampler over the same colouring and return the
+/// same spins. They differ only in what the threads divide.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GibbsParallelism {
+    /// One whole read per worker, each read running its classes in sequence.
+    ///
+    /// The default on a CPU. A read carries no barrier, so this neither stalls
+    /// on a preempted worker nor pays a barrier every class. Measured on the
+    /// Advantage2-System1 topology it reached 5.81 times the throughput of one
+    /// worker against 2.7 for [`Self::Colors`], and its slowest trial was about
+    /// 3 times its fastest against about 90 times.
+    #[default]
+    Reads,
+    /// Split each colour class across the workers, one read at a time.
+    ///
+    /// The right shape on a GPU or an FPGA, where thousands of lanes make a
+    /// class worth dividing. On a CPU a class hands each worker one or two
+    /// microseconds of work between barriers, which is less than the barrier
+    /// costs. Kept because it cuts the latency of a single read, which matters
+    /// when the read count is below the worker count.
+    Colors,
+}
+
+/// Worker and colour settings for the chromatic Gibbs sampler.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GibbsConfig {
+    /// Workers splitting each colour class.
+    pub workers: usize,
+    /// What the workers divide.
+    pub parallelism: GibbsParallelism,
+    /// Largest colour count this miner accepts. `None` accepts any colouring.
+    ///
+    /// The class count is a property of the graph, not a setting: a greedy
+    /// colouring of Advantage2-System1 needs 8 classes, and no 4-colouring of
+    /// it was found. Use this to refuse a topology that colours worse than the
+    /// deployment expects, rather than to request a smaller colouring.
+    pub max_colors: Option<usize>,
+}
+
+impl Default for GibbsConfig {
+    fn default() -> Self {
+        Self {
+            workers: DEFAULT_GIBBS_WORKERS,
+            parallelism: GibbsParallelism::Reads,
+            max_colors: None,
+        }
+    }
+}
+
+impl GibbsConfig {
+    /// Reject settings the host cannot serve. Call once at startup.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.workers == 0 {
+            return Err(ConfigError::NoWorkers);
+        }
+        let available = std::thread::available_parallelism().map_or(1, |n| n.get());
+        if self.workers > available {
+            return Err(ConfigError::Oversubscribed {
+                requested: self.workers,
+                available,
+            });
+        }
+        Ok(())
+    }
+}
+
+/// SplitMix64. Counter-based, so a draw depends only on its key and never on
+/// how the work was divided between workers.
+#[inline]
+fn splitmix64(mut z: u64) -> u64 {
+    z = z.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut x = z;
+    x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    x ^ (x >> 31)
+}
+
+/// Uniform draw in `[0, 1)` for one node at one point in the schedule.
+#[inline]
+fn draw_u01(seed: u64, step: u64, node: u32) -> f64 {
+    let key = seed
+        ^ splitmix64(step.wrapping_mul(0x2545_F491_4F6C_DD1D))
+        ^ splitmix64(u64::from(node).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+    // 53 bits into the mantissa, matching the usual f64 uniform construction.
+    (splitmix64(key) >> 11) as f64 * (1.0 / (1u64 << 53) as f64)
+}
+
+/// Heat-bath conditional for one node given its effective field.
+#[inline]
+fn heat_bath_spin(heff: f64, beta: f64, u: f64) -> i8 {
+    let arg = (2.0 * beta * heff).clamp(-500.0, 500.0);
+    let p_plus = 1.0 / (1.0 + arg.exp());
+    if u < p_plus {
+        1
+    } else {
+        -1
+    }
+}
+
+/// Effective field at `var` from the current spins.
+///
+/// Read-only over `spins`, so every worker in a class can call it at once.
+#[inline]
+fn field_at(graph: &CpuGraph, spins: &[AtomicI8], var: usize) -> f64 {
+    let (nodes, coups) = graph.neighbors(var);
+    let mut acc = graph.bias(var);
+    for (&w, &j) in nodes.iter().zip(coups.iter()) {
+        acc += j * f64::from(spins[w as usize].load(Ordering::Relaxed));
+    }
+    acc
+}
+
+/// Run one read of chromatic Gibbs over `beta_schedule`, returning the spins.
+///
+/// `workers` splits each colour class. The result does not depend on it.
+pub(crate) fn gibbs_read(
+    graph: &CpuGraph,
+    coloring: &Coloring,
+    beta_schedule: &[f64],
+    sweeps_per_beta: usize,
+    seed: u64,
+    workers: usize,
+    spins: &[AtomicI8],
+) {
+    let classes = coloring.classes();
+    if classes.is_empty() {
+        return;
+    }
+
+    // One worker needs no pool and no barriers. Measured at the pivot topology,
+    // spawning per class cost more than the class update itself: 8 classes over
+    // 1000 sweeps is 8000 spawn-and-join cycles per read, and throughput fell
+    // as workers rose. The pool below spawns once per read instead, and
+    // synchronises on a barrier at each class boundary.
+    if workers <= 1 {
+        let mut step: u64 = 0;
+        for &beta in beta_schedule {
+            for _ in 0..sweeps_per_beta {
+                for class in classes {
+                    update_range(graph, spins, class, beta, seed, step);
+                    step += 1;
+                }
+            }
+        }
+        return;
+    }
+
+    let barrier = SpinBarrier::new(workers);
+    std::thread::scope(|scope| {
+        for wid in 0..workers {
+            let barrier = &barrier;
+            scope.spawn(move || {
+                let mut step: u64 = 0;
+                let mut sense = false;
+                for &beta in beta_schedule {
+                    for _ in 0..sweeps_per_beta {
+                        for class in classes {
+                            let chunk = class.len().div_ceil(workers);
+                            let start = (wid * chunk).min(class.len());
+                            let end = (start + chunk).min(class.len());
+                            update_range(graph, spins, &class[start..end], beta, seed, step);
+                            step += 1;
+                            // Class `c + 1` reads what class `c` wrote, so every
+                            // worker must finish this class before any worker
+                            // starts the next one.
+                            barrier.wait(&mut sense);
+                        }
+                    }
+                }
+            });
+        }
+    });
+}
+
+/// Resample every node in `part`, which must lie inside one colour class.
+#[inline]
+fn update_range(
+    graph: &CpuGraph,
+    spins: &[AtomicI8],
+    part: &[u32],
+    beta: f64,
+    seed: u64,
+    step: u64,
+) {
+    for &v in part {
+        let h = field_at(graph, spins, v as usize);
+        let u = draw_u01(seed, step, v);
+        spins[v as usize].store(heat_bath_spin(h, beta, u), Ordering::Relaxed);
+    }
+}
+
+/// Sample `num_reads` independent chromatic-Gibbs reads.
+///
+/// `workers` splits each colour class. It changes throughput only: the returned
+/// spins are identical at any worker count.
+///
+/// # Examples
+///
+/// ```
+/// use quip_miner_cpu::gibbs_parallel::sample_gibbs_parallel;
+/// use quip_miner_cpu::{IsingGraph, SampleParams};
+///
+/// let graph = IsingGraph::new(vec![0.0, 0.0], vec![-1.0], vec![(0, 1)]);
+/// let params = SampleParams { num_reads: 2, num_sweeps: 64, seed: 1, ..Default::default() };
+/// let results = sample_gibbs_parallel(&graph, &params, 4);
+/// assert_eq!(results.len(), 2);
+/// ```
+pub fn sample_gibbs_parallel(
+    graph: &IsingGraph,
+    params: &SampleParams,
+    workers: usize,
+) -> Vec<SamplerResult> {
+    sample_gibbs_with(
+        graph,
+        params,
+        &GibbsConfig {
+            workers,
+            parallelism: GibbsParallelism::Reads,
+            max_colors: None,
+        },
+    )
+    .expect("a config with no colour budget cannot fail")
+}
+
+/// Sample under a full [`GibbsConfig`], rejecting a graph that colours worse
+/// than the configured budget.
+pub fn sample_gibbs_with(
+    graph: &IsingGraph,
+    params: &SampleParams,
+    config: &GibbsConfig,
+) -> Result<Vec<SamplerResult>, ConfigError> {
+    let workers = config.workers;
+    let cpu = CpuGraph::from_base(graph);
+    let coloring = Coloring::new(&cpu);
+    if let Some(allowed) = config.max_colors {
+        let needed = coloring.classes().len();
+        if needed > allowed {
+            return Err(ConfigError::TooManyColors { needed, allowed });
+        }
+    }
+    let betas = crate::sampler_core::build_beta_schedule(graph, params);
+    let sweeps_per_beta = params.sweeps_per_beta.max(1);
+    let n = cpu.num_nodes();
+    let num_reads = params.num_reads.max(1);
+
+    let one_read = |read_idx: usize| -> SamplerResult {
+        let seed = params
+            .seed
+            .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            .wrapping_add(read_idx as u64)
+            .wrapping_add(1);
+        // Initial spins come from the same counter-based stream as the
+        // sweeps, so the starting point is worker-count independent too.
+        let spins: Vec<AtomicI8> = (0..n)
+            .map(|v| {
+                let u = draw_u01(seed, u64::MAX, v as u32);
+                AtomicI8::new(if u < 0.5 { 1 } else { -1 })
+            })
+            .collect();
+        // Under `Reads` this worker owns the whole read, so the inner kernel
+        // runs single-threaded and never reaches the class barrier.
+        let inner = match config.parallelism {
+            GibbsParallelism::Reads => 1,
+            GibbsParallelism::Colors => workers,
+        };
+        gibbs_read(&cpu, &coloring, &betas, sweeps_per_beta, seed, inner, &spins);
+        let out: Vec<i8> = spins.iter().map(|a| a.load(Ordering::Relaxed)).collect();
+        SamplerResult {
+            energy_milli: energy_milli(&out, &graph.h, &graph.j, &graph.edges),
+            spins: out,
+        }
+    };
+
+    let results: Vec<SamplerResult> = match config.parallelism {
+        GibbsParallelism::Colors => (0..num_reads).map(one_read).collect(),
+        GibbsParallelism::Reads => {
+            let indices: Vec<usize> = (0..num_reads).collect();
+            let chunk = num_reads.div_ceil(workers.max(1));
+            // Chunks stay contiguous and are collected in order, so result `i`
+            // is always read `i` whatever the worker count.
+            std::thread::scope(|scope| {
+                let handles: Vec<_> = indices
+                    .chunks(chunk.max(1))
+                    .map(|part| scope.spawn(|| part.iter().map(|&i| one_read(i)).collect::<Vec<_>>()))
+                    .collect();
+                handles
+                    .into_iter()
+                    .flat_map(|h| h.join().expect("gibbs read worker"))
+                    .collect()
+            })
+        }
+    };
+    Ok(results)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sampler_core::CpuGraph;
+    use quip_miner_core::IsingGraph;
+
+    fn atomics(vals: &[i8]) -> Vec<AtomicI8> {
+        vals.iter().map(|&v| AtomicI8::new(v)).collect()
+    }
+
+    fn read_back(s: &[AtomicI8]) -> Vec<i8> {
+        s.iter().map(|a| a.load(Ordering::Relaxed)).collect()
+    }
+
+    fn ferro_ring(n: usize) -> IsingGraph {
+        let edges: Vec<(usize, usize)> = (0..n).map(|i| (i, (i + 1) % n)).collect();
+        IsingGraph::new(vec![0.0; n], vec![-1.0; n], edges)
+    }
+
+    /// Hypothesis: the result does not depend on the worker count. This is the
+    /// property that lets an operator tune workers for throughput without
+    /// changing what the miner submits. Without it, a machine with a different
+    /// core count would produce a different answer from the same seed.
+    #[test]
+    fn output_is_independent_of_worker_count() {
+        let g = ferro_ring(64);
+        let cpu = CpuGraph::from_base(&g);
+        let coloring = Coloring::new(&cpu);
+        let betas = vec![0.1, 0.5, 1.0, 2.0];
+
+        let start: Vec<i8> = (0..64).map(|i| if i % 3 == 0 { 1 } else { -1 }).collect();
+        let mut reference = None;
+        for workers in [1usize, 2, 3, 4, 8, 16] {
+            let spins = atomics(&start);
+            gibbs_read(&cpu, &coloring, &betas, 4, 99, workers, &spins);
+            let got = read_back(&spins);
+            match &reference {
+                None => reference = Some(got),
+                Some(want) => assert_eq!(
+                    &got, want,
+                    "worker count {workers} changed the result"
+                ),
+            }
+        }
+    }
+
+    /// Hypothesis: the kernel only ever writes valid wire spins.
+    #[test]
+    fn every_spin_stays_pm1() {
+        let g = ferro_ring(32);
+        let cpu = CpuGraph::from_base(&g);
+        let coloring = Coloring::new(&cpu);
+        let spins = atomics(&[1i8; 32]);
+        gibbs_read(&cpu, &coloring, &[0.5, 1.5], 3, 7, 4, &spins);
+        assert!(read_back(&spins).iter().all(|&s| s == 1 || s == -1));
+    }
+
+    /// Hypothesis: at a high beta the sampler drives a ferromagnetic ring to a
+    /// nearly aligned state. This is the check that the conditional carries the
+    /// right sign: an inverted heat-bath probability would anti-align it.
+    #[test]
+    fn cold_ferromagnet_aligns() {
+        let g = ferro_ring(128);
+        let cpu = CpuGraph::from_base(&g);
+        let coloring = Coloring::new(&cpu);
+        let spins = atomics(&[1i8; 128]);
+        gibbs_read(&cpu, &coloring, &[8.0], 60, 5, 4, &spins);
+        let out = read_back(&spins);
+        let up = out.iter().filter(|&&s| s == 1).count();
+        let aligned = up.max(128 - up);
+        assert!(aligned >= 120, "expected near alignment, got {up} up of 128");
+    }
+
+    /// Hypothesis: a positive bias with no couplings drives the spin negative,
+    /// because the miner minimizes `h_i s_i`.
+    #[test]
+    fn positive_bias_drives_spin_negative() {
+        let g = IsingGraph::new(vec![2.0], vec![], vec![]);
+        let cpu = CpuGraph::from_base(&g);
+        let coloring = Coloring::new(&cpu);
+        let spins = atomics(&[1]);
+        gibbs_read(&cpu, &coloring, &[6.0], 20, 11, 2, &spins);
+        assert_eq!(read_back(&spins), vec![-1]);
+    }
+
+    /// Hypothesis: the two strategies return the same reads in the same order.
+    /// They divide different work, so only this pins that neither reorders a
+    /// result nor changes a seed. A mismatch would make the miner's output
+    /// depend on a throughput setting.
+    #[test]
+    fn both_strategies_return_identical_reads() {
+        let g = ferro_ring(48);
+        let p = SampleParams {
+            num_reads: 7,
+            num_sweeps: 64,
+            seed: 21,
+            ..Default::default()
+        };
+        let by_colors = sample_gibbs_with(
+            &g,
+            &p,
+            &GibbsConfig {
+                workers: 4,
+                parallelism: GibbsParallelism::Colors,
+                max_colors: None,
+            },
+        )
+        .expect("colors");
+        for workers in [1usize, 2, 3, 4, 8] {
+            let by_reads = sample_gibbs_with(
+                &g,
+                &p,
+                &GibbsConfig {
+                    workers,
+                    parallelism: GibbsParallelism::Reads,
+                    max_colors: None,
+                },
+            )
+            .expect("reads");
+            assert_eq!(by_reads, by_colors, "{workers} read workers disagreed");
+        }
+    }
+
+    /// Hypothesis: zero workers is refused. A miner that starts with it would
+    /// sample nothing and report success.
+    #[test]
+    fn zero_workers_is_refused() {
+        let c = GibbsConfig {
+            workers: 0,
+            ..Default::default()
+        };
+        assert_eq!(c.validate(), Err(ConfigError::NoWorkers));
+    }
+
+    /// Hypothesis: asking for more workers than the host has cores is refused
+    /// at startup. The class barrier spins, so oversubscription collapses
+    /// throughput rather than degrading it gently.
+    #[test]
+    fn oversubscription_is_refused() {
+        let available = std::thread::available_parallelism().map_or(1, |n| n.get());
+        let c = GibbsConfig {
+            workers: available + 1,
+            ..Default::default()
+        };
+        assert_eq!(
+            c.validate(),
+            Err(ConfigError::Oversubscribed {
+                requested: available + 1,
+                available
+            })
+        );
+    }
+
+    /// Hypothesis: the default configuration is valid on any host and asks for
+    /// the measured best worker count.
+    #[test]
+    fn the_default_config_is_valid_and_uses_four_workers() {
+        let c = GibbsConfig::default();
+        assert_eq!(c.workers, 4);
+        assert_eq!(c.parallelism, GibbsParallelism::Reads);
+        assert_eq!(c.max_colors, None);
+        assert_eq!(c.validate(), Ok(()));
+    }
+
+    /// Hypothesis: a graph needing more classes than the budget is rejected
+    /// rather than silently sampled with a worse colouring. A triangle needs
+    /// three classes, so a budget of two must fail and a budget of three must
+    /// pass.
+    #[test]
+    fn a_graph_over_the_colour_budget_is_rejected() {
+        let g = IsingGraph::new(vec![0.0; 3], vec![1.0; 3], vec![(0, 1), (1, 2), (0, 2)]);
+        let p = SampleParams {
+            num_reads: 1,
+            num_sweeps: 8,
+            seed: 1,
+            ..Default::default()
+        };
+        let tight = GibbsConfig {
+            workers: 2,
+            max_colors: Some(2),
+            ..Default::default()
+        };
+        assert_eq!(
+            sample_gibbs_with(&g, &p, &tight),
+            Err(ConfigError::TooManyColors {
+                needed: 3,
+                allowed: 2
+            })
+        );
+        let ok = GibbsConfig {
+            workers: 2,
+            max_colors: Some(3),
+            ..Default::default()
+        };
+        assert!(sample_gibbs_with(&g, &p, &ok).is_ok());
+    }
+
+    /// Hypothesis: an empty graph has no classes, so the kernel does nothing
+    /// and does not panic.
+    #[test]
+    fn empty_graph_is_a_no_op() {
+        let g = IsingGraph::new(vec![], vec![], vec![]);
+        let cpu = CpuGraph::from_base(&g);
+        let coloring = Coloring::new(&cpu);
+        let spins: Vec<AtomicI8> = Vec::new();
+        gibbs_read(&cpu, &coloring, &[1.0], 2, 3, 4, &spins);
+        assert!(read_back(&spins).is_empty());
+    }
+}
