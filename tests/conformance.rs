@@ -1,8 +1,31 @@
 //! Protocol conformance: spawn SA and Gibbs miners against quip-mock-coordinator.
 
-use quip_mock_coordinator::driver::drive_miner;
+use quip_mock_coordinator::driver::{drive_miner, DriverReport};
 use quip_proto::v1::RejectReason;
 use std::process::Command;
+use std::sync::LazyLock;
+use tokio::sync::Semaphore;
+
+/// Caps how many miner processes run at once. `cargo test` runs the
+/// `#[tokio::test]` cases in this file concurrently on separate threads by
+/// default, and each miner process (e.g. `quip-cpu-gibbs`) allocates its own
+/// worker threads on top of that. On a small CI runner, enough concurrent
+/// miners can starve one past the mock coordinator's job deadline and drop a
+/// result. These are process-spawning integration tests, so unbounded
+/// parallelism buys little wall-clock time and costs determinism; bound it
+/// here so the fix protects `cargo test` locally too, not just CI. See
+/// qrel-p02.
+static MINER_CONCURRENCY: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(2));
+
+/// Drives a miner process, holding a permit for the duration so at most
+/// [`MINER_CONCURRENCY`] miners run at once.
+async fn drive_miner_bounded(bin_path: &str, socket: &str) -> DriverReport {
+    let _permit = MINER_CONCURRENCY
+        .acquire()
+        .await
+        .expect("semaphore is never closed");
+    drive_miner(bin_path, socket).await
+}
 
 /// Cross-package binary path (deps/ → profile/ → bin).
 fn profile_bin(name: &str) -> String {
@@ -58,7 +81,7 @@ async fn quip_cpu_sa_passes_conformance() {
             .unwrap()
             .as_nanos()
     );
-    let report = drive_miner(&miner, &format!("unix://{socket}")).await;
+    let report = drive_miner_bounded(&miner, &format!("unix://{socket}")).await;
     assert!(report.handshake_ok, "SA handshake failed");
     assert_eq!(
         report.result_job_ids().len(),
@@ -110,7 +133,7 @@ async fn quip_cpu_gibbs_passes_conformance() {
             .unwrap()
             .as_nanos()
     );
-    let report = drive_miner(&miner, &format!("unix://{socket}")).await;
+    let report = drive_miner_bounded(&miner, &format!("unix://{socket}")).await;
     assert!(report.handshake_ok, "Gibbs handshake failed");
     assert_eq!(
         report.result_job_ids().len(),
@@ -138,7 +161,7 @@ async fn quip_cpu_sb_passes_conformance() {
             .unwrap()
             .as_nanos()
     );
-    let report = drive_miner(&miner, &format!("unix://{socket}")).await;
+    let report = drive_miner_bounded(&miner, &format!("unix://{socket}")).await;
     assert!(report.handshake_ok, "SB handshake failed");
     assert_eq!(
         report.result_job_ids().len(),
@@ -202,7 +225,7 @@ async fn quip_cpu_bsb_passes_conformance() {
             .unwrap()
             .as_nanos()
     );
-    let report = drive_miner(&miner, &format!("unix://{socket}")).await;
+    let report = drive_miner_bounded(&miner, &format!("unix://{socket}")).await;
     assert!(report.handshake_ok, "bsb handshake failed");
     assert_eq!(
         report.result_job_ids().len(),
@@ -305,7 +328,7 @@ async fn quip_cpu_hdsb_passes_conformance() {
             .unwrap()
             .as_nanos()
     );
-    let report = drive_miner(&miner, &format!("unix://{socket}")).await;
+    let report = drive_miner_bounded(&miner, &format!("unix://{socket}")).await;
     assert!(report.handshake_ok, "HDSB handshake failed");
     assert_eq!(
         report.result_job_ids().len(),
@@ -362,7 +385,7 @@ async fn quip_cpu_hbsb_passes_conformance() {
             .unwrap()
             .as_nanos()
     );
-    let report = drive_miner(&miner, &format!("unix://{socket}")).await;
+    let report = drive_miner_bounded(&miner, &format!("unix://{socket}")).await;
     assert!(report.handshake_ok, "HBSB handshake failed");
     assert_eq!(
         report.result_job_ids().len(),
@@ -418,7 +441,7 @@ async fn quip_cpu_mps_passes_conformance() {
             .unwrap()
             .as_nanos()
     );
-    let report = drive_miner(&miner, &format!("unix://{socket}")).await;
+    let report = drive_miner_bounded(&miner, &format!("unix://{socket}")).await;
     assert!(report.handshake_ok, "mps handshake failed");
     assert_eq!(
         report.result_job_ids().len(),
@@ -450,7 +473,7 @@ async fn quip_cpu_mfa_passes_conformance() {
             .unwrap()
             .as_nanos()
     );
-    let report = drive_miner(&miner, &format!("unix://{socket}")).await;
+    let report = drive_miner_bounded(&miner, &format!("unix://{socket}")).await;
     assert!(report.handshake_ok, "mfa handshake failed");
     assert_eq!(
         report.result_job_ids().len(),
