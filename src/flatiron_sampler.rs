@@ -10,19 +10,19 @@ use quip_miner_core::{
 };
 use quip_proto::v1::RejectReason;
 
-use crate::bptns::{sample_ising_bptns, BptnsConfig};
+use crate::flatiron::{sample_ising_flatiron, FlatironConfig};
 use crate::mps_sampler::CPU_MPS_ADAPT;
 use crate::run_stream_pump;
 
-/// Backend identity for `quip-cpu-bptns`.
+/// Backend identity for `quip-cpu-flatiron`.
 ///
 /// The envelope matches the MPS identity: both are tensor-network kernels
 /// whose Trotter step costs far more than a Metropolis sweep, and the memory
 /// bounds are the same 64 MB per-model cap. Only the algorithm string
 /// differs, so a campaign can tell the two apart.
-pub const CPU_BPTNS_IDENTITY: BackendIdentity = BackendIdentity {
+pub const CPU_FLATIRON_IDENTITY: BackendIdentity = BackendIdentity {
     backend: "cpu",
-    algorithm: "bptns",
+    algorithm: "flatiron",
     max_nodes: 65_536,
     max_edges: 524_288,
     adapt: CPU_MPS_ADAPT,
@@ -31,22 +31,22 @@ pub const CPU_BPTNS_IDENTITY: BackendIdentity = BackendIdentity {
 /// BP-TNS sampler backend: imaginary-time simple update on the problem
 /// graph, BP marginals, conditioned sampling, greedy polish.
 #[derive(Debug, Clone, Copy)]
-pub struct BptnsSampler {
-    cfg: BptnsConfig,
+pub struct FlatironSampler {
+    cfg: FlatironConfig,
 }
 
-impl BptnsSampler {
+impl FlatironSampler {
     /// Create a BP-TNS sampler with the given configuration.
     ///
     /// # Examples
     ///
     /// ```
-    /// use quip_miner_cpu::{BptnsConfig, BptnsSampler, IsingGraph, SampleParams};
+    /// use quip_miner_cpu::{FlatironConfig, FlatironSampler, IsingGraph, SampleParams};
     /// use quip_miner_core::Sampler;
     /// use quip_proto::v1::RejectReason;
     ///
     /// # fn main() -> Result<(), RejectReason> {
-    /// let sampler = BptnsSampler::new(BptnsConfig::new(8));
+    /// let sampler = FlatironSampler::new(FlatironConfig::new(8));
     /// let graph = IsingGraph::new(vec![0.0, 0.0], vec![-1.0], vec![(0, 1)]);
     /// let params = SampleParams { num_reads: 2, num_sweeps: 64, seed: 1, ..Default::default() };
     /// let results = sampler.sample(&graph, &params)?;
@@ -54,18 +54,18 @@ impl BptnsSampler {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn new(cfg: BptnsConfig) -> Self {
+    pub fn new(cfg: FlatironConfig) -> Self {
         Self { cfg }
     }
 }
 
-impl Sampler for BptnsSampler {
+impl Sampler for FlatironSampler {
     fn sample(
         &self,
         graph: &IsingGraph,
         params: &SampleParams,
     ) -> Result<Vec<SamplerResult>, RejectReason> {
-        Ok(sample_ising_bptns(graph, params, &self.cfg))
+        Ok(sample_ising_flatiron(graph, params, &self.cfg))
     }
 
     /// One model per core, matching the other CPU backends.
@@ -82,7 +82,7 @@ impl Sampler for BptnsSampler {
         let cfg = self.cfg;
         run_stream_pump(
             self.stream_width(),
-            move |graph, params| sample_ising_bptns(graph, params, &cfg),
+            move |graph, params| sample_ising_flatiron(graph, params, &cfg),
             jobs,
             out,
             cancel,
@@ -96,8 +96,8 @@ mod tests {
     use quip_miner_core::StreamOutcome;
     use std::time::Duration;
 
-    fn test_cfg() -> BptnsConfig {
-        BptnsConfig {
+    fn test_cfg() -> FlatironConfig {
+        FlatironConfig {
             chi_max: 8,
             time_budget_ms: 0,
             flop_budget: 1.25e9,
@@ -118,21 +118,21 @@ mod tests {
     }
 
     #[test]
-    fn bptns_identity_advertises_the_documented_envelope() {
-        assert_eq!(CPU_BPTNS_IDENTITY.backend, "cpu");
-        assert_eq!(CPU_BPTNS_IDENTITY.algorithm, "bptns");
-        assert_eq!(CPU_BPTNS_IDENTITY.max_nodes, 65_536);
-        assert_eq!(CPU_BPTNS_IDENTITY.max_edges, 524_288);
-        assert_eq!(CPU_BPTNS_IDENTITY.adapt.min_sweeps, 64);
-        assert_eq!(CPU_BPTNS_IDENTITY.adapt.max_sweeps, 1024);
+    fn flatiron_identity_advertises_the_documented_envelope() {
+        assert_eq!(CPU_FLATIRON_IDENTITY.backend, "cpu");
+        assert_eq!(CPU_FLATIRON_IDENTITY.algorithm, "flatiron");
+        assert_eq!(CPU_FLATIRON_IDENTITY.max_nodes, 65_536);
+        assert_eq!(CPU_FLATIRON_IDENTITY.max_edges, 524_288);
+        assert_eq!(CPU_FLATIRON_IDENTITY.adapt.min_sweeps, 64);
+        assert_eq!(CPU_FLATIRON_IDENTITY.adapt.max_sweeps, 1024);
     }
 
     #[test]
-    fn bptns_sampler_samples_and_reports_consensus_energies() {
-        let sampler = BptnsSampler::new(test_cfg());
+    fn flatiron_sampler_samples_and_reports_consensus_energies() {
+        let sampler = FlatironSampler::new(test_cfg());
         let results = sampler
             .sample(&tiny_ferro(), &tiny_params(4))
-            .expect("BptnsSampler::sample must not reject");
+            .expect("FlatironSampler::sample must not reject");
         assert_eq!(results.len(), 4);
         for r in &results {
             assert_eq!(r.spins.len(), 2);
@@ -141,17 +141,17 @@ mod tests {
     }
 
     #[test]
-    fn bptns_stream_width_is_at_least_one() {
-        assert!(BptnsSampler::new(test_cfg()).stream_width() >= 1);
+    fn flatiron_stream_width_is_at_least_one() {
+        assert!(FlatironSampler::new(test_cfg()).stream_width() >= 1);
     }
 
     #[tokio::test]
-    async fn bptns_sample_stream_one_job_round_trip() {
-        let sampler = BptnsSampler::new(test_cfg());
+    async fn flatiron_sample_stream_one_job_round_trip() {
+        let sampler = FlatironSampler::new(test_cfg());
         let (job_tx, job_rx) = tokio::sync::mpsc::channel::<StreamJob>(1);
         let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<StreamResult>(1);
 
-        let job_id = b"job-bptns-1".to_vec();
+        let job_id = b"job-flatiron-1".to_vec();
         job_tx
             .send(StreamJob {
                 job_id: job_id.clone(),
@@ -189,8 +189,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bptns_sample_stream_skips_a_cancelled_generation_without_sampling() {
-        let sampler = BptnsSampler::new(test_cfg());
+    async fn flatiron_sample_stream_skips_a_cancelled_generation_without_sampling() {
+        let sampler = FlatironSampler::new(test_cfg());
         let (job_tx, job_rx) = tokio::sync::mpsc::channel::<StreamJob>(1);
         let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<StreamResult>(1);
 
@@ -199,7 +199,7 @@ mod tests {
 
         job_tx
             .send(StreamJob {
-                job_id: b"job-bptns-cancelled".to_vec(),
+                job_id: b"job-flatiron-cancelled".to_vec(),
                 graph: tiny_ferro(),
                 params: tiny_params(1),
                 generation: 7,
@@ -216,7 +216,7 @@ mod tests {
             .await
             .expect("timeout waiting for StreamResult")
             .expect("output channel closed without a result");
-        assert_eq!(got.job_id, b"job-bptns-cancelled".to_vec());
+        assert_eq!(got.job_id, b"job-flatiron-cancelled".to_vec());
         assert!(
             matches!(got.outcome, StreamOutcome::Cancelled),
             "an abandoned generation must be dropped before sampling"

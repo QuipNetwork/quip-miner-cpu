@@ -1,4 +1,4 @@
-//! CPU BP-TNS miner (`quip-cpu-bptns`), experimental.
+//! CPU BP-TNS miner (`quip-cpu-flatiron`), experimental.
 //!
 //! Build with `cargo build --release --features experimental`. The bond
 //! dimension is chosen per job from the memory and flop budgets and capped
@@ -8,7 +8,7 @@
 
 use clap::Parser;
 use quip_miner_core::{run, CommonArgs};
-use quip_miner_cpu::{BptnsConfig, BptnsSampler, CPU_BPTNS_IDENTITY};
+use quip_miner_cpu::{FlatironConfig, FlatironSampler, CPU_FLATIRON_IDENTITY};
 use std::process::ExitCode;
 
 #[derive(Parser)]
@@ -20,7 +20,7 @@ struct Cli {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    run(CPU_BPTNS_IDENTITY, &cli.common, || {
-        Ok(BptnsSampler::new(BptnsConfig::new(8)))
+    run(CPU_FLATIRON_IDENTITY, &cli.common, || {
+        Ok(FlatironSampler::new(FlatironConfig::new(8)))
     })
 }

@@ -278,7 +278,7 @@ const EXPERIMENTAL_BINS: &[(&str, &str)] = &[
     ("quip-cpu-hbsb", "hbsb"),
     ("quip-cpu-mps", "mps"),
     ("quip-cpu-mfa", "mfa"),
-    ("quip-cpu-bptns", "bptns"),
+    ("quip-cpu-flatiron", "flatiron"),
 ];
 
 /// The capabilities, version, and self-check surface of the experimental
@@ -464,11 +464,11 @@ async fn quip_cpu_mps_passes_conformance() {
 /// than only the mean-field path.
 #[cfg(feature = "experimental")]
 #[tokio::test]
-async fn quip_cpu_bptns_passes_conformance() {
-    ensure_built_with(&["quip-cpu-bptns"], &["experimental"]);
-    let miner = profile_bin("quip-cpu-bptns");
+async fn quip_cpu_flatiron_passes_conformance() {
+    ensure_built_with(&["quip-cpu-flatiron"], &["experimental"]);
+    let miner = profile_bin("quip-cpu-flatiron");
     let socket = format!(
-        "/tmp/quip-cpu-bptns-conf-{}-{}.sock",
+        "/tmp/quip-cpu-flatiron-conf-{}-{}.sock",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -476,7 +476,7 @@ async fn quip_cpu_bptns_passes_conformance() {
             .as_nanos()
     );
     let report = drive_miner_bounded(&miner, &format!("unix://{socket}")).await;
-    assert!(report.handshake_ok, "bptns handshake failed");
+    assert!(report.handshake_ok, "flatiron handshake failed");
     assert_eq!(
         report.result_job_ids().len(),
         3,

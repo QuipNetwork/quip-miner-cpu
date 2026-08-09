@@ -10,6 +10,13 @@
 //! of real time, and conditioned sampling instead of contraction, because a
 //! miner needs configurations. Both adaptations are ours, not the paper's.
 //!
+//! The name points at the group whose work this follows. It does not mean the
+//! module reproduces their results, and a poor result here is not a finding
+//! about their paper. They report on how well a classical tensor network
+//! reproduces quantum annealing dynamics. This kernel is scored on the energy
+//! it reaches on a mining job, which is a different task that the paper never
+//! claims to do.
+//!
 //! Cost model, and why the production topology degenerates: a site tensor
 //! holds `2 chi^degree` values and one BP iteration costs
 //! `O(N chi^(degree + 1))`, so cost is exponential in vertex degree. The
@@ -46,7 +53,7 @@ const SVD_FLOP_CONST: f64 = 50.0;
 
 /// Per-job knobs for the BP-TNS kernel.
 #[derive(Debug, Clone, Copy)]
-pub struct BptnsConfig {
+pub struct FlatironConfig {
     /// Upper bound on the bond dimension. The budget caps may lower it.
     pub chi_max: usize,
     /// Wall-clock safety valve for the anneal, in milliseconds. `0` disables
@@ -58,7 +65,7 @@ pub struct BptnsConfig {
     pub flop_budget: f64,
 }
 
-impl BptnsConfig {
+impl FlatironConfig {
     /// Documented defaults for one binary invocation.
     pub fn new(chi_max: usize) -> Self {
         Self {
@@ -76,7 +83,7 @@ impl BptnsConfig {
 /// bytes each). Flops count one truncation per bond per step at the Jacobi
 /// constant. When even bond dimension 1 misses the flop budget the job still
 /// runs at 1 and relies on the wall-clock valve: no job is ever rejected.
-pub(crate) fn select_chi(net: &NetGraph, steps: usize, cfg: &BptnsConfig) -> usize {
+pub(crate) fn select_chi(net: &NetGraph, steps: usize, cfg: &FlatironConfig) -> usize {
     let chi_max = cfg.chi_max.max(1);
     if net.num_nodes() == 0 || net.bonds.is_empty() {
         return chi_max;
@@ -121,7 +128,7 @@ fn anneal(
     params: &SampleParams,
     steps: usize,
     chi: usize,
-    cfg: &BptnsConfig,
+    cfg: &FlatironConfig,
 ) -> (Vec<SiteTensor>, Vec<Vec<f64>>) {
     let sched = schedule::build(graph, params, steps);
     let mut tensors: Vec<SiteTensor> = net.adj.iter().map(|a| SiteTensor::plus(a.len())).collect();
@@ -207,18 +214,18 @@ fn score(spins: &[i8], graph: &IsingGraph) -> SamplerResult {
 /// # Examples
 ///
 /// ```
-/// use quip_miner_cpu::{sample_ising_bptns, BptnsConfig, IsingGraph, SampleParams};
+/// use quip_miner_cpu::{sample_ising_flatiron, FlatironConfig, IsingGraph, SampleParams};
 ///
 /// let graph = IsingGraph::new(vec![0.0, 0.0], vec![-1.0], vec![(0, 1)]);
 /// let params = SampleParams { num_reads: 4, num_sweeps: 64, seed: 1, ..Default::default() };
-/// let results = sample_ising_bptns(&graph, &params, &BptnsConfig::new(8));
+/// let results = sample_ising_flatiron(&graph, &params, &FlatironConfig::new(8));
 /// assert_eq!(results.len(), 4);
 /// assert!(results.iter().all(|r| r.energy_milli == -1000));
 /// ```
-pub fn sample_ising_bptns(
+pub fn sample_ising_flatiron(
     graph: &IsingGraph,
     params: &SampleParams,
-    cfg: &BptnsConfig,
+    cfg: &FlatironConfig,
 ) -> Vec<SamplerResult> {
     let num_reads = params.num_reads.max(1);
     let n = graph.h.len();
@@ -257,8 +264,8 @@ mod tests {
     use quip_protocol::scoring::energy_milli as score_energy;
     use rand::Rng;
 
-    fn cfg(chi_max: usize) -> BptnsConfig {
-        BptnsConfig {
+    fn cfg(chi_max: usize) -> FlatironConfig {
+        FlatironConfig {
             chi_max,
             time_budget_ms: 0,
             flop_budget: 1.25e9,
@@ -373,14 +380,14 @@ mod tests {
     #[test]
     fn sampling_returns_one_well_formed_result_per_read() {
         let g = ferro_chain(12);
-        let results = sample_ising_bptns(&g, &params(8, 64, 42), &cfg(8));
+        let results = sample_ising_flatiron(&g, &params(8, 64, 42), &cfg(8));
         assert_results_well_formed(&results, &g, 8);
     }
 
     #[test]
     fn an_empty_graph_returns_empty_spins_with_zero_energy() {
         let g = IsingGraph::new(vec![], vec![], vec![]);
-        let results = sample_ising_bptns(&g, &params(3, 64, 1), &cfg(8));
+        let results = sample_ising_flatiron(&g, &params(3, 64, 1), &cfg(8));
         assert_eq!(results.len(), 3);
         assert!(results.iter().all(|r| r.spins.is_empty() && r.energy_milli == 0));
     }
@@ -388,14 +395,14 @@ mod tests {
     #[test]
     fn zero_reads_still_produce_one_result() {
         let g = ferro_chain(6);
-        assert_eq!(sample_ising_bptns(&g, &params(0, 64, 3), &cfg(8)).len(), 1);
+        assert_eq!(sample_ising_flatiron(&g, &params(0, 64, 3), &cfg(8)).len(), 1);
     }
 
     #[test]
     fn a_fields_only_problem_is_solved_exactly() {
         let h = vec![0.7, -1.2, 0.3, -0.5, 2.0, -0.1, 0.9, -1.7];
         let g = IsingGraph::new(h.clone(), vec![], vec![]);
-        let results = sample_ising_bptns(&g, &params(8, 64, 21), &cfg(8));
+        let results = sample_ising_flatiron(&g, &params(8, 64, 21), &cfg(8));
         let want: Vec<i8> = h.iter().map(|&x| if x > 0.0 { -1i8 } else { 1 }).collect();
         for r in &results {
             assert_eq!(r.spins, want, "fields-only must be exact on every read");
@@ -410,7 +417,7 @@ mod tests {
     #[test]
     fn a_ferromagnetic_chain_reaches_its_ground_state_through_conditioning() {
         let g = ferro_chain(16);
-        let results = sample_ising_bptns(&g, &params(8, 64, 22), &cfg(8));
+        let results = sample_ising_flatiron(&g, &params(8, 64, 22), &cfg(8));
         assert_results_well_formed(&results, &g, 8);
         assert_eq!(best_energy(&results), -15_000);
     }
@@ -418,7 +425,7 @@ mod tests {
     #[test]
     fn a_duplicate_edge_merges_and_still_reaches_the_doubled_optimum() {
         let g = IsingGraph::new(vec![0.0, 0.0], vec![-1.0, -1.0], vec![(0, 1), (0, 1)]);
-        let results = sample_ising_bptns(&g, &params(4, 64, 13), &cfg(8));
+        let results = sample_ising_flatiron(&g, &params(4, 64, 13), &cfg(8));
         assert_results_well_formed(&results, &g, 4);
         assert!(results.iter().all(|r| r.energy_milli == -2000));
     }
@@ -430,7 +437,7 @@ mod tests {
             vec![1.0, -1.0],
             vec![(0, 0), (0, 9), (0, 1), (1, 2)],
         );
-        let results = sample_ising_bptns(&g, &params(4, 32, 11), &cfg(8));
+        let results = sample_ising_flatiron(&g, &params(4, 32, 11), &cfg(8));
         assert_eq!(results.len(), 4);
         for r in &results {
             assert_eq!(r.spins.len(), 3);
@@ -458,7 +465,7 @@ mod tests {
         for seed in 0..25u64 {
             let g = random_sparse(12, 24, 3000 + seed);
             let optimum = brute_force_min(&g);
-            let results = sample_ising_bptns(&g, &params(16, 96, seed), &cfg(4));
+            let results = sample_ising_flatiron(&g, &params(16, 96, seed), &cfg(4));
             let got = best_energy(&results);
             assert!(got >= optimum, "seed {seed}: energy below the optimum");
             if got == optimum {
@@ -478,16 +485,16 @@ mod tests {
     #[test]
     fn the_same_seed_produces_byte_identical_results() {
         let g = random_sparse(24, 60, 808);
-        let first = sample_ising_bptns(&g, &params(16, 96, 71), &cfg(4));
-        let second = sample_ising_bptns(&g, &params(16, 96, 71), &cfg(4));
+        let first = sample_ising_flatiron(&g, &params(16, 96, 71), &cfg(4));
+        let second = sample_ising_flatiron(&g, &params(16, 96, 71), &cfg(4));
         assert_eq!(first, second);
     }
 
     #[test]
     fn different_seeds_produce_different_results() {
         let g = random_sparse(24, 60, 808);
-        let a = sample_ising_bptns(&g, &params(16, 96, 71), &cfg(4));
-        let b = sample_ising_bptns(&g, &params(16, 96, 72), &cfg(4));
+        let a = sample_ising_flatiron(&g, &params(16, 96, 71), &cfg(4));
+        let b = sample_ising_flatiron(&g, &params(16, 96, 72), &cfg(4));
         assert_ne!(
             a.iter().map(|r| &r.spins).collect::<Vec<_>>(),
             b.iter().map(|r| &r.spins).collect::<Vec<_>>(),
@@ -498,7 +505,7 @@ mod tests {
     #[test]
     fn seed_zero_still_diversifies_across_reads() {
         let g = random_sparse(24, 70, 909);
-        let results = sample_ising_bptns(&g, &params(16, 96, 0), &cfg(4));
+        let results = sample_ising_flatiron(&g, &params(16, 96, 0), &cfg(4));
         let distinct: std::collections::BTreeSet<&Vec<i8>> =
             results.iter().map(|r| &r.spins).collect();
         assert!(distinct.len() > 1, "every read identical at seed 0");
@@ -507,12 +514,12 @@ mod tests {
     #[test]
     fn a_fired_valve_still_returns_complete_polished_results() {
         let g = random_sparse(60, 150, 707);
-        let stopped = BptnsConfig {
+        let stopped = FlatironConfig {
             chi_max: 4,
             time_budget_ms: 1,
             flop_budget: 1.25e9,
         };
-        let results = sample_ising_bptns(&g, &params(8, 256, 61), &stopped);
+        let results = sample_ising_flatiron(&g, &params(8, 256, 61), &stopped);
         assert_results_well_formed(&results, &g, 8);
         for r in &results {
             for var in 0..g.h.len() {
@@ -529,14 +536,14 @@ mod tests {
     #[test]
     fn a_generous_valve_does_not_change_the_answer_on_a_small_problem() {
         let g = ferro_chain(12);
-        let with_valve = BptnsConfig {
+        let with_valve = FlatironConfig {
             chi_max: 8,
             time_budget_ms: 60_000,
             flop_budget: 1.25e9,
         };
         assert_eq!(
-            sample_ising_bptns(&g, &params(8, 64, 67), &cfg(8)),
-            sample_ising_bptns(&g, &params(8, 64, 67), &with_valve),
+            sample_ising_flatiron(&g, &params(8, 64, 67), &cfg(8)),
+            sample_ising_flatiron(&g, &params(8, 64, 67), &with_valve),
             "a valve that never fires must not change the output"
         );
     }
@@ -568,12 +575,12 @@ mod tests {
             }
             j.pop();
             let g = IsingGraph::new(h, j, edges);
-            let c = BptnsConfig {
+            let c = FlatironConfig {
                 chi_max,
                 time_budget_ms: 0,
                 flop_budget: 1.25e9,
             };
-            let results = sample_ising_bptns(&g, &params(num_reads, num_sweeps, seed), &c);
+            let results = sample_ising_flatiron(&g, &params(num_reads, num_sweeps, seed), &c);
             prop_assert_eq!(results.len(), num_reads);
             for r in &results {
                 prop_assert_eq!(r.spins.len(), g.h.len());
@@ -601,15 +608,15 @@ mod tests {
                 j.push(c);
             }
             let g = IsingGraph::new(h, j, edges);
-            let c = BptnsConfig {
+            let c = FlatironConfig {
                 chi_max: 3,
                 time_budget_ms: 0,
                 flop_budget: 1.25e9,
             };
             let p = params(4, 24, seed);
             prop_assert_eq!(
-                sample_ising_bptns(&g, &p, &c),
-                sample_ising_bptns(&g, &p, &c)
+                sample_ising_flatiron(&g, &p, &c),
+                sample_ising_flatiron(&g, &p, &c)
             );
         }
     }
