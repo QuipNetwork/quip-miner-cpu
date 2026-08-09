@@ -67,6 +67,11 @@ uniform random product state instead. Both values share the same sampler and the
 same polish stage, so a comparison between them isolates the effect of the
 seeding strategy alone.
 
+The commands below need an `isingmark` that accepts `--backend cpu-mfa`.
+`isingmark` reads that flag against a fixed built-in list, so an older build
+rejects the name before it starts a run. Build the two experimental binaries
+onto `PATH` first, as the Build section describes.
+
 Hypothesis H3 asks whether the annealed seed reaches a better result than the
 random seed at equal wall-clock cost. Run the two arms with the same seed and
 the same single-cell parameter grid, so `isingmark` draws the same 200 problems

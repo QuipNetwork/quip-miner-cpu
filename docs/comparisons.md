@@ -64,9 +64,17 @@ kernel has to solve as one problem.
 
 ### Instances
 
-Set every bias to zero. Ternary biases make the instance too easy. A per-spin
-greedy pass over the biases alone already lands close to the best answer, so the
-measurement reports that greedy pass rather than the kernel.
+Set every bias to zero, and note what that choice costs. The pivot fixture
+carries `allowed_h_milli` of `[-1000, 0, 1000]`, so this ladder keeps the
+fixture's edges and drops its bias set.
+
+The original reason was that ternary biases make the instance too easy, because
+a per-spin greedy pass over the biases alone lands close to the best answer. The
+replayed `chain-ternary` problems show that reason is too strong. Kernels still
+separate there, and `cpu-sb` still beats `cpu-sa` at a `t` of 3.9 in its favour.
+The zero-bias
+choice also hides a defect: it never exercises the ancilla path, where the two
+continuous-coupling variants fail.
 
 Zero biases also exercise the pure-coupling path. For Simulated Bifurcation that
 path carries no ancilla particle and no ancilla force loop.
@@ -217,28 +225,32 @@ percent. Every one of those differences is many standard errors from zero.
 with problem size. This is two orders of magnitude larger than any other effect
 in the table.
 
-### Why the tensor-network kernels lose on this dataset
+### Why the tensor-network kernels lose on this ladder
 
-The datasets here carry no linear bias. That is close to the worst case for a
-mean-field method, and the ladder measures the two tensor-network binaries in
-their weakest regime.
+Two mechanisms act on this ladder. Both are real, and the corpus replay below
+shows that neither one explains the size of the loss.
 
-Two facts combine. First, `select_chi` returns 1 for every instance on this
-ladder: the flop budget allows `cbrt(1.25e9 / (50 * steps * span_sum))`, and the
-span sum after reverse Cuthill-McKee is 7.5 million at the pivot, which puts the
-result below 1. Both binaries run as a product state.
+First, `select_chi` returns 1 for every instance on this ladder: the flop budget
+allows `cbrt(1.25e9 / (50 * steps * span_sum))`, and the span sum after reverse
+Cuthill-McKee is 7.5 million at the pivot, which puts the result below 1. Both
+binaries run as a product state, so they return identical energies at
+every size here.
 
 Second, a product state cannot break a symmetry. With no bias, every coupling
 gate is symmetric under the global spin flip, so its best rank-1 factor is the
 symmetric vector. The annealed state stays at the symmetric point for the whole
 schedule, and a sample drawn there is a fair coin per site. Only the greedy
-polish does useful work, and a strict-descent polish cannot cross the
-energy plateau that a domain wall sits on.
+polish does useful work, and a strict-descent polish cannot cross the energy
+plateau that a domain wall sits on. The unit tests measure the deviation from
+the symmetric point as exactly zero, so this mechanism is confirmed, not
+inferred.
 
-A dataset with nonzero biases removes the degeneracy and the anneal starts to
-carry information. Measuring that is filed as separate work. Read the rows here
-as a lower bound on the two tensor-network binaries, not as their general
-performance.
+Both mechanisms were later tested directly on replayed chain problems, and both
+failed to account for the result. On the real graphs `select_chi` returns more
+than 1, so the tensor network runs, and the two binaries no longer agree on any
+instance. Real ternary biases recover 1.7 points of a 15 point deficit. The
+cause of the remaining deficit is open. Do not cite either mechanism as the
+explanation.
 
 ### What the run showed
 
@@ -401,6 +413,100 @@ The class count is a property of the graph, not a setting. `GibbsConfig`
 carries `max_colors` so a deployment can refuse a topology that colours worse
 than it expects. It cannot request a smaller colouring.
 
+## Replayed chain problems
+
+The ladder above draws its own instances. This second measurement replays
+problems the chain actually posed, which removes the question of whether the
+synthetic instances represent the real workload. It answers a different
+question from the ladder, and where the two disagree, this one governs.
+
+### Method
+
+Two corpora ship with isingmark, each holding instances harvested from chain
+and verified against their blocks. Each pairs with the topology its instances
+were drawn against.
+
+| Corpus | Instances | Nodes | Edges | `allowed_h_milli` |
+| --- | --- | --- | --- | --- |
+| `chain-h0` | 4658 | 4577 | 41515 | `[0]` |
+| `chain-ternary` | 3148 | 4578 | 41531 | `[-1000, 0, 1000]` |
+
+The two buckets are different graphs, not one graph under two field settings.
+`chain-ternary` carries one more node and 16 more edges. A comparison between
+the corpora mixes the bias set with the topology, and no result below
+attributes a difference between corpora to bias alone.
+
+Each corpus is ranked hardest first, by the lowest energy any miner reached on
+chain. These runs take the hardest 50, which are the instances that decide
+whether a miner earns anything. Every kernel gets the identical 50 instances at
+`--hardness 0.5`, so reads and sweeps match across kernels.
+
+Two baselines come with each instance. `energy_milli` is the best energy any
+miner reached on chain. `max_energy_milli` is the difficulty gate: a solution at
+or below it passed. The gate is the operational measure, because it counts
+accepted solutions rather than fractional energy.
+
+`energy_milli` is a competitive baseline, not ground truth. Each corpus faced a
+different field of miners, so gate-pass rates do not compare across corpora.
+Paired kernel-to-kernel differences share a baseline and cancel it, so use those
+for any claim about kernel quality.
+
+### Results
+
+Paired against `cpu-sa` on the identical instances. A negative number is better
+than `cpu-sa`. Every verdict below replicated across two independent runs.
+
+| kernel | `chain-h0` | t | `chain-ternary` | t |
+| --- | --- | --- | --- | --- |
+| `cpu-sb` | -0.156% | -6.3 | -0.075% | -3.9 |
+| `cpu-hdsb` | -0.127% | -5.5 | -0.047% | -2.9 |
+| `cpu-gibbs` | -0.027% | -1.1 | -0.005% | -0.3 |
+| `cpu-bsb` | -0.137% | -5.3 | +0.196% | +8.1 |
+| `cpu-hbsb` | +0.078% | +3.4 | +0.141% | +7.3 |
+| `cpu-mps` | +15.254% | +208 | +14.080% | +220 |
+| `cpu-mfa` | +15.279% | +228 | +14.042% | +208 |
+
+Gate-pass rate on the hardest 50, which is the operational measure:
+
+| kernel | `chain-h0` | `chain-ternary` |
+| --- | --- | --- |
+| `cpu-sb` | 20% | 68% |
+| `cpu-hdsb` | 14% | 64% |
+| `cpu-sa` | 8% | 64% |
+| `cpu-gibbs` | 8% | 64% |
+| `cpu-bsb` | 20% | 64% |
+| `cpu-hbsb` | 0% | 62% |
+| `cpu-mps`, `cpu-mfa` | 0% | 0% |
+
+### What the replay changes
+
+`cpu-sb` wins on real problems by a wider margin than the ladder showed, and it
+wins on both corpora. The production track holds.
+
+`cpu-bsb` changes sign between the corpora. It beats `cpu-sa` on `chain-h0` and
+loses to it on `chain-ternary`, both at high significance and both replicated.
+The ladder ranked it below `cpu-sa` at every size. Three datasets give three
+verdicts, so treat the ladder ranking for this kernel as superseded.
+
+The split follows the coupling function exactly. `cpu-sb` and `cpu-hdsb` use
+`Coupling::Discrete` and win on both corpora. `cpu-bsb` and `cpu-hbsb` use
+`Coupling::Continuous` and lose whenever biases are present.
+
+`sb_core.rs` carries linear biases on an ancilla particle at index `n`, and the
+force term reads `f += g.h[i] * coupled[n]`. Under `Coupling::Discrete` the
+ancilla contributes `sgn(x_n)`, so each bias contributes exactly `h_i`. Under
+`Coupling::Continuous` it contributes the raw position `x_n`, so one shared
+scalar multiplies every linear bias in the problem. The gauge fix uses only the
+sign of that position, so its magnitude carries no meaning. On `chain-h0` there
+are no biases, the ancilla does not exist, and the continuous variants are
+unaffected. This explains the sign change, and it is filed as a defect.
+
+The tensor-network binaries fail on both corpora and clear the gate on no
+instance. `select_chi` returns more than 1 on both real graphs, which the
+differing per-instance energies confirm, so the tensor network runs here. It
+buys nothing: `cpu-mps` and `cpu-mfa` stay within noise of each other on both
+corpora.
+
 ## Reading the numbers
 
 ### Pair the comparison, or the effect disappears
@@ -440,11 +546,22 @@ Use the paired table for that.
 - Random cross-tile edges above the pivot. Those instances are no longer a
   hardware graph. Treat the sizes above 4577 nodes as a scaling study.
 - One instance family. The same 30 instances appear at every size, so a kernel
-  that suits this family looks good at all eight sizes together. A second family
-  under a different topology seed would settle that.
-- Zero biases throughout. That is the weakest case for a mean-field method, so
-  the `cpu-mps` and `cpu-mfa` rows are a lower bound rather than a general
-  result.
+  that suits this family looks good at all eight sizes together. The replayed
+  chain problems are the second family, and they overturn the ladder ranking for
+  `cpu-bsb`.
+- Zero biases throughout the ladder. That hides the ancilla defect in the
+  continuous-coupling variants, and it holds `select_chi` at 1, so the ladder
+  never measures the tensor-network binaries running a tensor network.
+
+Limits that apply to the replayed chain problems:
+
+- Wall-clock time is not reported. The host runs other work, and two timing
+  attempts were lost to competing load. Quality is unaffected, because fixed
+  reads and sweeps make the energies independent of load.
+- The hardest 50 of each corpus. That is the decision-relevant slice, and it is
+  too small to resolve a difference below about 0.1%.
+- Gate-pass rates do not compare across corpora, because each corpus faced a
+  different field of miners.
 
 ## Adding a kernel to the comparison
 
@@ -467,10 +584,16 @@ target, because it must never enter the release binaries.
 
 ## Open work
 
-- An equal wall-clock comparison at every size on the ladder.
-- The same ladder against a dataset with nonzero biases, so `cpu-mps` and
-  `cpu-mfa` are measured outside the regime where mean-field cannot break a
-  symmetry.
+- An equal wall-clock comparison at every size on the ladder. Measure it on an
+  isolated host, or record processor time per model rather than elapsed time.
+  Elapsed time on a shared workstation has failed twice.
+- The cause of the tensor-network deficit. Bond dimension and the zero-bias
+  symmetry are both eliminated, so the reason is open. The cheapest next test
+  replays the `QUIP_MPS_INIT=random` arm on the same 50 hardest instances. If a
+  random start and the same polish also land near the annealed result, the
+  anneal contributes nothing and the deficit belongs to the greedy polish.
+- The ancilla defect in `Coupling::Continuous`. Clamp the ancilla to its sign
+  under both coupling forms and re-measure `cpu-bsb` on `chain-ternary`.
 - A sweep of `num_sweeps` for `cpu-sb` across its adapt envelope of 256 to 8192,
   to find its operating point before any further comparison.
 - A multi-threaded run through the streaming pump, to confirm that the
