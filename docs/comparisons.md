@@ -72,12 +72,11 @@ The original reason was that ternary biases make the instance too easy, because
 a per-spin greedy pass over the biases alone lands close to the best answer. The
 replayed `chain-ternary` problems show that reason is too strong. Kernels still
 separate there, and `cpu-sb` still beats `cpu-sa` at a `t` of 3.9 in its favour.
-The zero-bias
-choice also hides a defect: it never exercises the ancilla path, where the two
-continuous-coupling variants fail.
 
-Zero biases also exercise the pure-coupling path. For Simulated Bifurcation that
-path carries no ancilla particle and no ancilla force loop.
+Zero biases exercise the pure-coupling path. For Simulated Bifurcation that path
+carries no ancilla particle and no ancilla force loop. That is a real saving in
+the kernel under test, and it is also the blind spot: the ladder never reaches
+the ancilla path, which is where both continuous-coupling variants fail.
 
 Draw each coupling uniformly from `allowed_j_milli`, which is `{-1, +1}` for
 this fixture.
@@ -248,9 +247,9 @@ inferred.
 Both mechanisms were later tested directly on replayed chain problems, and both
 failed to account for the result. On the real graphs `select_chi` returns more
 than 1, so the tensor network runs, and the two binaries no longer agree on any
-instance. Real ternary biases recover 1.7 points of a 15 point deficit. The
-cause of the remaining deficit is open. Do not cite either mechanism as the
-explanation.
+instance. Real ternary biases recover 1.7 points of a 15 point deficit. Neither
+mechanism explains the loss. The section on the greedy polish below carries the
+measured cause.
 
 ### What the run showed
 
@@ -507,6 +506,79 @@ differing per-instance energies confirm, so the tensor network runs here. It
 buys nothing: `cpu-mps` and `cpu-mfa` stay within noise of each other on both
 corpora.
 
+### The greedy polish sets the tensor-network result
+
+Five arms were measured on the same 50 hardest instances of each corpus, chosen
+so that each one changes a component a reader would expect to matter.
+
+| arm | what it changes | `chain-h0` | `chain-ternary` |
+| --- | --- | --- | --- |
+| `cpu-mps`, annealed | tensor network, bond dimension above 1 | +15.254% | +14.080% |
+| `cpu-mfa`, annealed | product state, bond dimension 1 | +15.279% | +14.042% |
+| `cpu-mps`, `QUIP_MPS_INIT=random` | no anneal at all | +15.229% | +14.021% |
+| `cpu-mps`, random, second replicate | no anneal, independent sample | +15.254% | +14.106% |
+| `cpu-bptns` | belief-propagation net on the problem graph | +15.287% | +14.103% |
+
+Paired against `cpu-sa`. Every arm clears the gate on no instance. The whole
+spread is 0.058 points on `chain-h0` and 0.085 on `chain-ternary`, against
+standard errors near 0.07, so the five arms are one measurement.
+
+Across those rows the bond dimension changes and the anneal is removed
+entirely. The network geometry changes from a reverse Cuthill-McKee chain to a
+net on the raw problem graph. The conditioning changes from exact
+right-canonical sampling to a one-hop approximation. The last row is a separate
+kernel, audited against its source paper. None of it moves the answer.
+
+One component is common to all five: `polish_from` in
+[`sampler_core.rs`](../src/sampler_core.rs), the strict-descent greedy sweep
+that runs after sampling.
+
+> On these instances every tensor-network state we can afford is uninformative.
+> Annealed or random, MPS chain or belief-propagation net, bond dimension 1 or
+> above, the sampled configuration carries no usable signal and the output
+> quality is set entirely by the greedy polish that follows. The tensor network
+> is not losing to annealing. It is not participating. This covers the bond
+> dimensions affordable on a degree-18 hardware graph under the 64 MB per-model
+> cap, not the method in principle: the published results use coordination at
+> most 6, where a bond dimension of 32 is affordable, and the per-site cost of
+> `16 * chi^degree` bytes makes that regime unreachable here.
+
+The claim is about transfer, not about the code. An audit against the
+source paper found the gate arithmetic, the message update, and the parallel
+edge merge all correct, so a poor result here reports on the method rather than
+on the code.
+
+### The diversity metric confirms this through a second channel
+
+Each record carries `diversity_milli`, the mean pairwise flip-invariant Hamming
+distance between a job's returned solutions, normalized by spin width. Reads
+drawn as fair coins score near 500. Median over the 50 hardest:
+
+| corpus | physical kernels | tensor-network family |
+| --- | --- | --- |
+| `chain-h0` | 404 to 447 | 487 |
+| `chain-ternary` | 234 to 289 | 478 to 479 |
+
+The tensor-network family sits at the fair-coin level on both corpora, and it
+does not move when the initialization mode or the network type changes. That is
+the uniform-random signature, measured on a channel that could have contradicted
+the energy result.
+
+The `chain-ternary` row carries the mechanism. Real biases pull the physical
+kernels' reads toward each other and their diversity falls to 234. The
+tensor-network family does not move. The biases reach the physical kernels'
+states and never reach the tensor-network samples.
+
+### Mechanisms eliminated by measurement
+
+Three explanations were tested and none survives. Do not cite them.
+
+| mechanism | how it was eliminated |
+| --- | --- |
+| Bond dimension held at 1 | `select_chi` returns more than 1 on both real graphs, and the result does not change |
+| Zero-bias symmetry | Real ternary biases recover 1.7 points of a 15 point deficit |
+| Conditioning fidelity | `cpu-bptns` conditions one hop at a time and `cpu-mps` conditions exactly, and both return the same number |
+
 ## Reading the numbers
 
 ### Pair the comparison, or the effect disappears
@@ -587,11 +659,15 @@ target, because it must never enter the release binaries.
 - An equal wall-clock comparison at every size on the ladder. Measure it on an
   isolated host, or record processor time per model rather than elapsed time.
   Elapsed time on a shared workstation has failed twice.
-- The cause of the tensor-network deficit. Bond dimension and the zero-bias
-  symmetry are both eliminated, so the reason is open. The cheapest next test
-  replays the `QUIP_MPS_INIT=random` arm on the same 50 hardest instances. If a
-  random start and the same polish also land near the annealed result, the
-  anneal contributes nothing and the deficit belongs to the greedy polish.
+- A better polish for the tensor-network kernels. The greedy polish sets their
+  result, so any gain has to come from there. A polish that accepts an
+  energy-neutral move would cross the domain-wall plateau that strict descent
+  cannot. Measure it before adopting it, because strict descent is what makes
+  the current polish stop.
+- Whether any affordable state carries signal on a degree-18 graph. Every
+  measured arm samples at the fair-coin level. A bond dimension that would
+  change this needs `16 * chi^degree` bytes per site, so answering the question
+  needs a different network geometry rather than a larger budget.
 - The ancilla defect in `Coupling::Continuous`. Clamp the ancilla to its sign
   under both coupling forms and re-measure `cpu-bsb` on `chain-ternary`.
 - A sweep of `num_sweeps` for `cpu-sb` across its adapt envelope of 256 to 8192,
