@@ -491,14 +491,34 @@ The split follows the coupling function exactly. `cpu-sb` and `cpu-hdsb` use
 `Coupling::Discrete` and win on both corpora. `cpu-bsb` and `cpu-hbsb` use
 `Coupling::Continuous` and lose whenever biases are present.
 
-`sb_core.rs` carries linear biases on an ancilla particle at index `n`, and the
-force term reads `f += g.h[i] * coupled[n]`. Under `Coupling::Discrete` the
-ancilla contributes `sgn(x_n)`, so each bias contributes exactly `h_i`. Under
-`Coupling::Continuous` it contributes the raw position `x_n`, so one shared
-scalar multiplies every linear bias in the problem. The gauge fix uses only the
-sign of that position, so its magnitude carries no meaning. On `chain-h0` there
-are no biases, the ancilla does not exist, and the continuous variants are
-unaffected. This explains the sign change, and it is filed as a defect.
+That split is an observation. The mechanism first proposed for it has since
+been tested and refuted, so the cause is open.
+
+The proposal was this. `sb_core.rs` carries linear biases on an ancilla particle
+at index `n`, and the force term reads `f += g.h[i] * coupled[n]`. Under
+`Coupling::Discrete` the ancilla contributes `sgn(x_n)`, so each bias
+contributes exactly `h_i`. Under `Coupling::Continuous` it contributes the raw
+position `x_n`, so one shared number scales every linear bias in the problem.
+That number starts near zero, and the gauge fix reads only the sign of the
+position, so the magnitude carries no meaning of its own. On `chain-h0` there
+are no biases and no ancilla, which fits the sign change.
+
+Clamping the ancilla to its sign under both coupling forms tests that
+proposal directly, and it does not hold. On the 50 hardest `chain-ternary`
+problems
+`cpu-bsb` moves from +0.196% and +0.184% across two runs to +0.209% paired
+against `cpu-sa`, and the gate-pass rate holds at 64%. The change is not an
+improvement.
+
+The same run shows what the ancilla is doing instead. Read diversity falls from
+234 to 64, so clamping does change the kernel, and what it removes is
+exploration. A bias that grows with `x_n` is weak while the couplings organize
+the frustrated structure and strong once that structure settles, which is an
+annealing schedule for the linear biases rather than a leak. Removing it costs
+diversity and returns no energy.
+
+The coupling split is real and replicated, and no mechanism accounts for it
+yet. Do not repeat the clamp.
 
 The tensor-network binaries fail on both corpora and clear the gate on no
 instance. `select_chi` returns more than 1 on both real graphs, which the
@@ -621,8 +641,9 @@ Use the paired table for that.
   that suits this family looks good at all eight sizes together. The replayed
   chain problems are the second family, and they overturn the ladder ranking for
   `cpu-bsb`.
-- Zero biases throughout the ladder. That hides the ancilla defect in the
-  continuous-coupling variants, and it holds `select_chi` at 1, so the ladder
+- Zero biases throughout the ladder. That hides the ancilla path, where the
+  continuous-coupling variants fail, and it holds `select_chi` at 1, so the
+  ladder
   never measures the tensor-network binaries running a tensor network.
 
 Limits that apply to the replayed chain problems:
@@ -668,8 +689,10 @@ target, because it must never enter the release binaries.
   measured arm samples at the fair-coin level. A bond dimension that would
   change this needs `16 * chi^degree` bytes per site, so answering the question
   needs a different network geometry rather than a larger budget.
-- The ancilla defect in `Coupling::Continuous`. Clamp the ancilla to its sign
-  under both coupling forms and re-measure `cpu-bsb` on `chain-ternary`.
+- Why `Coupling::Continuous` loses once biases are present. Clamping the ancilla
+  to its sign is refuted, so start from the diversity result: the ancilla ramps
+  the linear biases through the schedule, and an explicit ramp is the next thing
+  to measure against the implicit one.
 - A sweep of `num_sweeps` for `cpu-sb` across its adapt envelope of 256 to 8192,
   to find its operating point before any further comparison.
 - A multi-threaded run through the streaming pump, to confirm that the
