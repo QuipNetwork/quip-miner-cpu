@@ -452,30 +452,53 @@ for any claim about kernel quality.
 
 ### Results
 
-Paired against `cpu-sa` on the identical instances. A negative number is better
-than `cpu-sa`. Every verdict below replicated across two independent runs.
+Quality and cost together, on the identical instances. Every run used 36 reads
+and 550 sweeps, which the harness chose. Those are not the ladder settings, so
+do not compare a number here against a ladder number.
 
-| kernel | `chain-h0` | t | `chain-ternary` | t |
-| --- | --- | --- | --- | --- |
-| `cpu-sb` | -0.156% | -6.3 | -0.075% | -3.9 |
-| `cpu-hdsb` | -0.127% | -5.5 | -0.047% | -2.9 |
-| `cpu-gibbs` | -0.027% | -1.1 | -0.005% | -0.3 |
-| `cpu-bsb` | -0.137% | -5.3 | +0.196% | +8.1 |
-| `cpu-hbsb` | +0.078% | +3.4 | +0.141% | +7.3 |
-| `cpu-mps` | +15.254% | +208 | +14.080% | +220 |
-| `cpu-mfa` | +15.279% | +228 | +14.042% | +208 |
+`gap` is the distance to the best energy chain reached, and `paired` is the
+per-instance difference from `cpu-sa`, where negative beats `cpu-sa`. `wall` is
+the median latency of one job. `jobs/min` is run-level throughput with the
+harness overlapping jobs across cores, so a kernel that spends more cores per
+job ranks better on `wall` and worse on `jobs/min`.
 
-Gate-pass rate on the hardest 50, which is the operational measure:
+`chain-h0`:
 
-| kernel | `chain-h0` | `chain-ternary` |
-| --- | --- | --- |
-| `cpu-sb` | 20% | 68% |
-| `cpu-hdsb` | 14% | 64% |
-| `cpu-sa` | 8% | 64% |
-| `cpu-gibbs` | 8% | 64% |
-| `cpu-bsb` | 20% | 64% |
-| `cpu-hbsb` | 0% | 62% |
-| `cpu-mps`, `cpu-mfa` | 0% | 0% |
+| kernel | gap | paired | t | gate | wall | jobs/min | diversity |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `cpu-sb` | +0.547% | -0.149% | -6.1 | 24% | 2378 ms | 196.7 | 440 |
+| `cpu-hdsb` | +0.578% | -0.118% | -4.9 | 24% | 2354 ms | 199.7 | 440 |
+| `cpu-bsb` | +0.627% | -0.068% | -3.0 | 14% | 2014 ms | 237.0 | 406 |
+| `cpu-sa` | +0.695% | — | — | 10% | 1726 ms | 267.4 | 446 |
+| `cpu-gibbs` | +0.726% | +0.031% | +1.4 | 8% | 3548 ms | 69.2 | 446 |
+| `cpu-hbsb` | +0.797% | +0.103% | +3.7 | 8% | 2455 ms | 183.5 | 443 |
+| `cpu-mfa` | +15.820% | +15.231% | +260 | 0% | 2074 ms | 228.1 | 487 |
+| `cpu-mps` | +15.851% | +15.262% | +240 | 0% | 2064 ms | 228.3 | 487 |
+| `cpu-flatiron` | +15.948% | +15.360% | +284 | 0% | 2276 ms | 205.4 | 487 |
+
+`chain-ternary`:
+
+| kernel | gap | paired | t | gate | wall | jobs/min | diversity |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `cpu-hdsb` | +0.030% | -0.075% | -4.5 | 66% | 2508 ms | 188.1 | 268 |
+| `cpu-sb` | +0.035% | -0.070% | -3.7 | 68% | 2316 ms | 198.5 | 275 |
+| `cpu-gibbs` | +0.074% | -0.030% | -1.6 | 64% | 3734 ms | 71.5 | 287 |
+| `cpu-sa` | +0.105% | — | — | 64% | 1925 ms | 249.6 | 289 |
+| `cpu-hbsb` | +0.229% | +0.125% | +5.6 | 64% | 2603 ms | 190.4 | 273 |
+| `cpu-bsb` | +0.297% | +0.193% | +7.4 | 64% | 2138 ms | 222.1 | 79 |
+| `cpu-mps` | +14.056% | +13.966% | +201 | 0% | 2066 ms | 229.4 | 478 |
+| `cpu-flatiron` | +14.073% | +13.983% | +228 | 0% | 2245 ms | 206.2 | 478 |
+| `cpu-mfa` | +14.121% | +14.032% | +226 | 0% | 2070 ms | 228.8 | 478 |
+
+Every quality verdict here replicated across three independent runs, and the
+`cpu-bsb` sign change replicated in both directions. Read the third decimal of
+the paired column as noise. `cpu-bsb` on `chain-h0` moved from −0.137% to
+−0.068% between rounds while keeping its sign and significance.
+
+The cost columns come from one round on an otherwise idle host, one kernel at a
+time. Two earlier attempts at wall-clock ran while other work shared the
+machine and are discarded. They reported `cpu-hdsb` at 9658 ms against 2354 ms
+here, so they measured the host rather than the kernel.
 
 ### What the replay changes
 
@@ -510,15 +533,18 @@ problems
 against `cpu-sa`, and the gate-pass rate holds at 64%. The change is not an
 improvement.
 
-The same run shows what the ancilla is doing instead. Read diversity falls from
-234 to 64, so clamping does change the kernel, and what it removes is
-exploration. A bias that grows with `x_n` is weak while the couplings organize
-the frustrated structure and strong once that structure settles, which is an
-annealing schedule for the linear biases rather than a leak. Removing it costs
-diversity and returns no energy.
+The same run appeared to show what the ancilla does instead, and that reading
+has since failed as well. Read diversity for `cpu-bsb` on `chain-ternary` sits
+at 234 and 226 across the first two runs, and at 64 and 79 across two later
+ones. The clamp is present in one of the later pair and absent from the other,
+so the clamp does not account for the change. Every other kernel holds within
+2 milli across all four runs, so whatever moved reaches `cpu-bsb` alone. Paired
+energy does not move at all, at +0.196%, +0.184%, +0.209% and +0.193%.
 
 The coupling split is real and replicated, and no mechanism accounts for it
-yet. Do not repeat the clamp.
+yet. Do not repeat the clamp. The `cpu-bsb` diversity change is a second open
+question. Answering it needs the exact build behind each number identified
+first, which the recorded runs do not pin down.
 
 The tensor-network binaries fail on both corpora and clear the gate on no
 instance. `select_chi` returns more than 1 on both real graphs, which the
@@ -576,8 +602,12 @@ drawn as fair coins score near 500. Median over the 50 hardest:
 
 | corpus | physical kernels | tensor-network family |
 | --- | --- | --- |
-| `chain-h0` | 404 to 447 | 487 |
-| `chain-ternary` | 234 to 289 | 478 to 479 |
+| `chain-h0` | 406 to 446 | 487 |
+| `chain-ternary` | 79 to 289 | 478 |
+
+The `chain-ternary` floor of 79 belongs to `cpu-bsb` alone, and it is the
+unexplained change described above. Every other physical kernel in that row
+sits between 268 and 289.
 
 The tensor-network family sits at the fair-coin level on both corpora, and it
 does not move when the initialization mode or the network type changes. That is
@@ -585,7 +615,7 @@ the uniform-random signature, measured on a channel that could have contradicted
 the energy result.
 
 The `chain-ternary` row carries the mechanism. Real biases pull the physical
-kernels' reads toward each other and their diversity falls to 234. The
+kernels' reads toward each other and their diversity falls to 268 to 289. The
 tensor-network family does not move. The biases reach the physical kernels'
 states and never reach the tensor-network samples.
 
@@ -648,9 +678,13 @@ Use the paired table for that.
 
 Limits that apply to the replayed chain problems:
 
-- Wall-clock time is not reported. The host runs other work, and two timing
-  attempts were lost to competing load. Quality is unaffected, because fixed
-  reads and sweeps make the energies independent of load.
+- Wall-clock time comes from a single round, where the two earlier attempts
+  were lost to competing load. Quality replicates across three rounds, because
+  fixed reads and sweeps make the energies independent of load. Cost does not,
+  so treat the cost columns as one measurement.
+- Cost is measured with the harness overlapping jobs across cores. That is the
+  production shape, and it means `wall` is latency under self-contention rather
+  than the cost of one job on an idle machine.
 - The hardest 50 of each corpus. That is the decision-relevant slice, and it is
   too small to resolve a difference below about 0.1%.
 - Gate-pass rates do not compare across corpora, because each corpus faced a
@@ -677,9 +711,12 @@ target, because it must never enter the release binaries.
 
 ## Open work
 
-- An equal wall-clock comparison at every size on the ladder. Measure it on an
-  isolated host, or record processor time per model rather than elapsed time.
-  Elapsed time on a shared workstation has failed twice.
+- An equal wall-clock comparison at every size on the ladder. The replay now
+  has clean cost numbers, and the ladder does not. Measure it on an idle host
+  one kernel at a time, which is what the replay round did.
+- Why `cpu-bsb` read diversity on `chain-ternary` fell from 234 to 79 between
+  rounds while its energy held. No other kernel moved, and the ancilla clamp is
+  ruled out. Start by pinning the build behind each recorded round.
 - A better polish for the tensor-network kernels. The greedy polish sets their
   result, so any gain has to come from there. A polish that accepts an
   energy-neutral move would cross the domain-wall plateau that strict descent
