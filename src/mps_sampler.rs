@@ -126,7 +126,7 @@ impl Sampler for MpsSampler {
         let cfg = self.cfg;
         run_stream_pump(
             self.stream_width(),
-            move |graph, params| sample_ising_mps(graph, params, &cfg),
+            move |graph, params, _, _| Ok(sample_ising_mps(graph, params, &cfg)),
             jobs,
             out,
             cancel,
@@ -423,5 +423,4 @@ mod tests {
             "random seeding must reach a different sample set than the annealed path here"
         );
     }
-
 }

@@ -11,7 +11,6 @@
 //! propagation cannot drift between them.
 
 mod coloring;
-mod spin_barrier;
 pub mod flatiron;
 pub mod flatiron_sampler;
 pub mod gibbs_parallel;
@@ -20,15 +19,16 @@ pub mod mps_sampler;
 pub mod sampler_core;
 pub mod sb_core;
 pub mod sb_sampler;
+mod spin_barrier;
 
-pub use quip_miner_core::{Algorithm, IsingGraph, SampleParams, SamplerResult};
 pub use flatiron::{sample_ising_flatiron, FlatironConfig};
 pub use flatiron_sampler::{FlatironSampler, CPU_FLATIRON_IDENTITY};
+pub use gibbs_parallel::{ConfigError, GibbsConfig, GibbsParallelism};
 pub use mps::{sample_ising_mps, InitMode, MpsConfig};
 pub use mps_sampler::{MpsSampler, CPU_MFA_IDENTITY, CPU_MPS_IDENTITY};
+pub use quip_miner_core::{Algorithm, IsingGraph, SampleParams, SamplerResult};
 pub use sampler_core::sample_ising;
 pub use sb_core::{sample_sb, sample_sb_with_workers, Coupling, SbVariant, BSB, DSB, HBSB, HDSB};
-pub use gibbs_parallel::{ConfigError, GibbsConfig, GibbsParallelism};
 pub use sb_sampler::{
     SbSampler, CPU_BSB_IDENTITY, CPU_HBSB_IDENTITY, CPU_HDSB_IDENTITY, CPU_SB_IDENTITY,
 };
@@ -75,7 +75,9 @@ pub const CPU_GIBBS_IDENTITY: BackendIdentity = BackendIdentity {
 ///
 /// Runs `width` worker threads over an MPMC hand-off: this thread pulls from
 /// the async job channel and each worker takes one model at a time. Cancelled
-/// generations are dropped here, before a worker ever touches the graph.
+/// generations are dropped here, before a worker ever touches the graph. The
+/// kernel also receives the guard so a long in-flight attempt can abort at
+/// its own checkpoints.
 ///
 /// Both `CpuSampler` and `SbSampler` call this, so the cancellation and
 /// panic-propagation semantics cannot drift between binaries.
@@ -86,7 +88,16 @@ fn run_stream_pump<K>(
     out: tokio::sync::mpsc::Sender<StreamResult>,
     cancel: CancelGuard,
 ) where
-    K: Fn(&IsingGraph, &SampleParams) -> Vec<SamplerResult> + Send + Sync + Clone + 'static,
+    K: Fn(
+            &IsingGraph,
+            &SampleParams,
+            &CancelGuard,
+            u64,
+        ) -> Result<Vec<SamplerResult>, sampler_core::SampleCancelled>
+        + Send
+        + Sync
+        + Clone
+        + 'static,
 {
     let (work_tx, work_rx) = crossbeam_channel::bounded::<StreamJob>(width);
     let workers: Vec<_> = (0..width)
@@ -94,15 +105,19 @@ fn run_stream_pump<K>(
             let work_rx = work_rx.clone();
             let out = out.clone();
             let kernel = kernel.clone();
+            let cancel = cancel.clone();
             std::thread::spawn(move || {
                 for j in work_rx.iter() {
                     let t0 = std::time::Instant::now();
-                    let result = Ok(kernel(&j.graph, &j.params));
+                    let outcome = match kernel(&j.graph, &j.params, &cancel, j.generation) {
+                        Ok(samples) => StreamOutcome::Completed(Ok(samples)),
+                        Err(sampler_core::SampleCancelled) => StreamOutcome::Cancelled,
+                    };
                     let device_access_time_us = t0.elapsed().as_micros() as u64;
                     if out
                         .blocking_send(StreamResult {
                             job_id: j.job_id,
-                            outcome: StreamOutcome::Completed(result),
+                            outcome,
                             device_access_time_us,
                         })
                         .is_err()
@@ -240,11 +255,16 @@ impl Sampler for CpuSampler {
         let gibbs = self.gibbs;
         run_stream_pump(
             self.stream_width(),
-            move |g, p| {
+            move |g, p, guard, generation| {
                 if algorithm == Algorithm::Gibbs {
-                    gibbs_parallel::sample_gibbs_with(g, p, &gibbs).unwrap_or_default()
+                    Ok(gibbs_parallel::sample_gibbs_with(g, p, &gibbs).unwrap_or_default())
                 } else {
-                    sample_ising(g, p, algorithm)
+                    sampler_core::sample_ising_cancellable(
+                        g,
+                        p,
+                        algorithm,
+                        Some((guard, generation)),
+                    )
                 }
             },
             jobs,
@@ -373,7 +393,7 @@ mod tests {
         let pump = tokio::task::spawn_blocking(move || {
             run_stream_pump(
                 2,
-                |g, p| sample_ising(g, p, Algorithm::Sa),
+                |g, p, _, _| Ok(sample_ising(g, p, Algorithm::Sa)),
                 job_rx,
                 out_tx,
                 cancel,
@@ -395,5 +415,92 @@ mod tests {
             .await
             .expect("timeout waiting for run_stream_pump to exit")
             .expect("spawn_blocking join");
+    }
+
+    /// An in-flight SA job must abort at a sweep checkpoint instead of
+    /// running to completion. The job returns `Cancelled` so the coordinator
+    /// credit path stays the same as the dequeue cancel.
+    #[tokio::test]
+    async fn in_flight_sa_attempt_cancels_at_sweep_checkpoint() {
+        let sampler = CpuSampler::new(Algorithm::Sa);
+        let (job_tx, job_rx) = tokio::sync::mpsc::channel::<StreamJob>(1);
+        let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<StreamResult>(1);
+        let cancel = CancelGuard::default();
+        let cancel_for_pump = cancel.clone();
+
+        // A 400-node chain with many sweeps cannot finish in the cancel
+        // window. A two-node job can, and that would hide a missing
+        // mid-sweep check behind a Completed result.
+        let n = 400;
+        let h = vec![0.0; n];
+        let j = vec![-1.0; n - 1];
+        let edges: Vec<(usize, usize)> = (0..n - 1).map(|i| (i, i + 1)).collect();
+        let graph = IsingGraph::new(h, j, edges);
+
+        job_tx
+            .send(StreamJob {
+                job_id: b"job-long".to_vec(),
+                graph,
+                params: SampleParams {
+                    num_reads: 1,
+                    num_sweeps: 2_000_000,
+                    seed: 7,
+                    ..Default::default()
+                },
+                generation: 3,
+            })
+            .await
+            .expect("send StreamJob");
+        drop(job_tx);
+
+        let pump = tokio::task::spawn_blocking(move || {
+            sampler.sample_stream(job_rx, out_tx, cancel_for_pump);
+        });
+
+        // Leave dequeue and enter the sweep loop, then abandon the generation.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        cancel.cancel_through(3);
+
+        let got = tokio::time::timeout(Duration::from_secs(2), out_rx.recv())
+            .await
+            .expect("in-flight cancel did not abort the job promptly")
+            .expect("output channel closed without a result");
+        assert!(
+            matches!(got.outcome, StreamOutcome::Cancelled),
+            "abandoned job must emit Cancelled, got {:?}",
+            std::mem::discriminant(&got.outcome)
+        );
+
+        tokio::time::timeout(Duration::from_secs(5), pump)
+            .await
+            .expect("timeout waiting for sample_stream to exit")
+            .expect("spawn_blocking join");
+    }
+
+    /// A live CancelGuard that never fires must not change the RNG stream or
+    /// the flip order. Results stay bit-identical to [`sample_ising`].
+    #[test]
+    fn uncancelled_guard_matches_sample_ising_bit_for_bit() {
+        let graph = tiny_ferro();
+        let params = SampleParams {
+            num_reads: 4,
+            num_sweeps: 64,
+            seed: 99,
+            ..Default::default()
+        };
+        let baseline = sample_ising(&graph, &params, Algorithm::Sa);
+        let guard = CancelGuard::default();
+        let live = sampler_core::sample_ising_cancellable(
+            &graph,
+            &params,
+            Algorithm::Sa,
+            Some((&guard, 4)),
+        )
+        .expect("a live generation must not cancel");
+        assert_eq!(baseline.len(), live.len());
+        for (a, b) in baseline.iter().zip(live.iter()) {
+            assert_eq!(a.spins, b.spins);
+            assert_eq!(a.energy_milli, b.energy_milli);
+        }
     }
 }

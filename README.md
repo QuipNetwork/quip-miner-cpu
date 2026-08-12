@@ -24,10 +24,13 @@ reads are sequential and cache-local. Energies are scored with the canonical
 | `quip-cpu-flatiron` | belief-propagation tensor network on the problem graph | experimental |
 
 Every sampler streams jobs through one shared pump, `run_stream_pump` in
-`src/lib.rs`. That pump holds the only copy of the cancellation check before
-dispatch and of the panic re-raise on worker join. The SB kernel and its
-sampler live in `src/sb_core.rs` and `src/sb_sampler.rs`, separate from the
-annealing path.
+`src/lib.rs`. That pump drops a cancelled generation before a worker touches
+the graph. The SA kernel also polls the cancel guard once per sweep (one
+`Relaxed` load, never per spin flip). A long in-flight job of 80 to 300
+seconds then stops at the next sweep. The kernel emits
+`StreamOutcome::Cancelled`, the same outcome as the dequeue path. The SB
+kernel and its sampler live in `src/sb_core.rs` and `src/sb_sampler.rs`,
+separate from the annealing path.
 
 Prebuilt binaries are attached to each
 [Release](https://gitlab.com/quip.network/quip-miner-cpu/-/releases) for
