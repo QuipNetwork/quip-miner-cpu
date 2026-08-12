@@ -81,7 +81,7 @@ impl Sampler for FlatironSampler {
     ) {
         let cfg = self.cfg;
         run_stream_pump(
-            self.stream_width(),
+            || self.stream_width(),
             move |graph, params, _, _| Ok(sample_ising_flatiron(graph, params, &cfg)),
             jobs,
             out,

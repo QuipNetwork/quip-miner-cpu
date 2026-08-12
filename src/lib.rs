@@ -38,6 +38,9 @@ use quip_miner_core::{
     BackendIdentity, CancelGuard, Sampler, StreamJob, StreamOutcome, StreamResult,
 };
 use quip_proto::v1::RejectReason;
+use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 const DEFAULT_MAX_NODES: u32 = 100_000;
 const DEFAULT_MAX_EDGES: u32 = 1_000_000;
@@ -86,15 +89,20 @@ pub const CPU_GIBBS_IDENTITY: BackendIdentity = BackendIdentity {
 /// kernel also receives the guard so a long in-flight attempt can abort at
 /// its own checkpoints.
 ///
+/// The pump waits for the first job before it reads `width`. The session
+/// applies `Configure.backend_toml` before any job, so a `num_cpus` setting
+/// is visible when the workers start.
+///
 /// Both `CpuSampler` and `SbSampler` call this, so the cancellation and
 /// panic-propagation semantics cannot drift between binaries.
-fn run_stream_pump<K>(
-    width: usize,
+fn run_stream_pump<K, F>(
+    width: F,
     kernel: K,
     mut jobs: tokio::sync::mpsc::Receiver<StreamJob>,
     out: tokio::sync::mpsc::Sender<StreamResult>,
     cancel: CancelGuard,
 ) where
+    F: FnOnce() -> usize,
     K: Fn(
             &IsingGraph,
             &SampleParams,
@@ -106,6 +114,10 @@ fn run_stream_pump<K>(
         + Clone
         + 'static,
 {
+    let Some(first) = jobs.blocking_recv() else {
+        return;
+    };
+    let width = width().max(1);
     let (work_tx, work_rx) = crossbeam_channel::bounded::<StreamJob>(width);
     let workers: Vec<_> = (0..width)
         .map(|_| {
@@ -137,7 +149,15 @@ fn run_stream_pump<K>(
         .collect();
     drop(work_rx);
 
-    while let Some(j) = jobs.blocking_recv() {
+    let mut pending = Some(first);
+    loop {
+        let j = match pending.take() {
+            Some(j) => j,
+            None => match jobs.blocking_recv() {
+                Some(j) => j,
+                None => break,
+            },
+        };
         // Abandoned generations are dropped here, before a worker ever
         // touches the graph: a reseed can leave the queue full of stale
         // nonces, and sampling one would waste the round for nothing.
@@ -172,11 +192,68 @@ fn run_stream_pump<K>(
     }
 }
 
-/// CPU sampler backend. No device, no governor, uncapped reads.
+/// Why a `num_cpus` setting cannot be applied.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NumCpusError {
+    /// Operator set zero or a negative count.
+    NonPositive {
+        /// The value from `backend_toml`.
+        requested: i64,
+    },
+    /// The TOML is not a table this backend can read.
+    InvalidToml,
+}
+
+impl std::fmt::Display for NumCpusError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NonPositive { requested } => {
+                write!(f, "num_cpus must be a positive integer, got {requested}")
+            }
+            Self::InvalidToml => write!(f, "backend_toml is not valid TOML"),
+        }
+    }
+}
+
+/// CPU `[cpu]` subsection of `Configure.backend_toml`.
+#[derive(serde::Deserialize, Default)]
+struct CpuBackendConfig {
+    num_cpus: Option<i64>,
+    #[serde(flatten)]
+    unknown: BTreeMap<String, toml::Value>,
+}
+
+fn host_parallelism() -> usize {
+    std::thread::available_parallelism().map_or(1, |n| n.get())
+}
+
+/// Cap a requested core budget at the host parallelism. Never returns 0.
+fn resolve_core_budget(requested: usize, available: usize) -> usize {
+    requested.min(available).max(1)
+}
+
+/// Read `num_cpus` from `backend_toml`. `None` means the key is absent.
+fn parse_num_cpus(backend_toml: &str) -> Result<Option<usize>, NumCpusError> {
+    if backend_toml.trim().is_empty() {
+        return Ok(None);
+    }
+    let cfg: CpuBackendConfig =
+        toml::from_str(backend_toml).map_err(|_| NumCpusError::InvalidToml)?;
+    quip_miner_core::config::warn_unknown_fields("cpu", cfg.unknown.keys());
+    match cfg.num_cpus {
+        None => Ok(None),
+        Some(n) if n <= 0 => Err(NumCpusError::NonPositive { requested: n }),
+        Some(n) => Ok(Some(usize::try_from(n).unwrap_or(usize::MAX))),
+    }
+}
+
+/// CPU sampler backend. No device, no governor, uncapped reads.
+#[derive(Debug, Clone)]
 pub struct CpuSampler {
     algorithm: Algorithm,
     gibbs: GibbsConfig,
+    /// 0 means use host parallelism.
+    num_cpus: Arc<AtomicUsize>,
 }
 
 impl CpuSampler {
@@ -208,6 +285,7 @@ impl CpuSampler {
         Self {
             algorithm,
             gibbs: GibbsConfig::default(),
+            num_cpus: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -219,6 +297,43 @@ impl CpuSampler {
     pub fn with_gibbs_config(self, gibbs: GibbsConfig) -> Self {
         Self { gibbs, ..self }
     }
+
+    fn core_budget(&self) -> usize {
+        match self.num_cpus.load(Ordering::Acquire) {
+            0 => host_parallelism(),
+            n => n,
+        }
+    }
+
+    fn apply_num_cpus(&self, backend_toml: &str) -> Result<(), NumCpusError> {
+        let Some(requested) = parse_num_cpus(backend_toml)? else {
+            return Ok(());
+        };
+        let available = host_parallelism();
+        let budget = resolve_core_budget(requested, available);
+        if budget < requested {
+            tracing::debug!(
+                requested,
+                available,
+                budget,
+                "num_cpus exceeds host parallelism; clamped"
+            );
+        }
+        self.num_cpus.store(budget, Ordering::Release);
+        Ok(())
+    }
+}
+
+/// Refuse a bad `num_cpus` at handshake. A typo must not look like it worked.
+#[expect(
+    clippy::exit,
+    clippy::print_stderr,
+    reason = "a zero or negative num_cpus is an operator typo; refuse to start \
+              rather than silently fall back"
+)]
+fn reject_num_cpus(e: NumCpusError) -> ! {
+    eprintln!("configuration error: {e}");
+    std::process::exit(64);
 }
 
 impl Sampler for CpuSampler {
@@ -243,12 +358,23 @@ impl Sampler for CpuSampler {
     /// cache lines and measured slower. Chromatic Gibbs already spends
     /// `gibbs.workers` cores inside one model, so it runs proportionally fewer
     /// models to keep the machine from oversubscribing itself.
+    ///
+    /// `num_cpus` from `Configure.backend_toml` replaces host parallelism as
+    /// this core budget. Absent, the host value is used. A value larger than
+    /// the host is clamped.
     fn stream_width(&self) -> usize {
-        let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+        let cores = self.core_budget();
         if self.algorithm == Algorithm::Gibbs {
             (cores / self.gibbs.workers.max(1)).max(1)
         } else {
             cores
+        }
+    }
+
+    fn apply_config(&self, backend_toml: &str) {
+        if let Err(e) = self.apply_num_cpus(backend_toml) {
+            tracing::error!(error = %e, "cpu num_cpus rejected");
+            reject_num_cpus(e);
         }
     }
 
@@ -261,7 +387,7 @@ impl Sampler for CpuSampler {
         let algorithm = self.algorithm;
         let gibbs = self.gibbs;
         run_stream_pump(
-            self.stream_width(),
+            || self.stream_width(),
             move |g, p, guard, generation| {
                 if algorithm == Algorithm::Gibbs {
                     Ok(gibbs_parallel::sample_gibbs_with(g, p, &gibbs).unwrap_or_default())
@@ -284,7 +410,7 @@ impl Sampler for CpuSampler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use quip_miner_core::{StreamJob, StreamOutcome, StreamResult};
+    use quip_miner_core::{Sampler, StreamJob, StreamOutcome, StreamResult};
     use std::time::Duration;
 
     fn tiny_ferro() -> IsingGraph {
@@ -323,6 +449,56 @@ mod tests {
     fn stream_width_is_at_least_one() {
         let sampler = CpuSampler::new(Algorithm::Gibbs);
         assert!(sampler.stream_width() >= 1);
+    }
+
+    #[test]
+    fn apply_config_num_cpus_sets_stream_width() {
+        let sampler = CpuSampler::new(Algorithm::Sa);
+        sampler.apply_config("num_cpus = 1");
+        assert_eq!(sampler.stream_width(), 1);
+    }
+
+    #[test]
+    fn apply_config_absent_num_cpus_keeps_default_width() {
+        let sampler = CpuSampler::new(Algorithm::Sa);
+        let default_width = sampler.stream_width();
+        sampler.apply_config("");
+        assert_eq!(sampler.stream_width(), default_width);
+        sampler.apply_config("num_sweeps = 128");
+        assert_eq!(sampler.stream_width(), default_width);
+    }
+
+    #[test]
+    fn parse_num_cpus_rejects_zero_and_negative() {
+        assert_eq!(
+            parse_num_cpus("num_cpus = 0"),
+            Err(NumCpusError::NonPositive { requested: 0 })
+        );
+        assert_eq!(
+            parse_num_cpus("num_cpus = -3"),
+            Err(NumCpusError::NonPositive { requested: -3 })
+        );
+    }
+
+    #[test]
+    fn parse_num_cpus_absent_is_none() {
+        assert_eq!(parse_num_cpus("").unwrap(), None);
+        assert_eq!(parse_num_cpus("num_sweeps = 128").unwrap(), None);
+    }
+
+    #[test]
+    fn resolve_core_budget_clamps_oversized() {
+        assert_eq!(resolve_core_budget(32, 8), 8);
+        assert_eq!(resolve_core_budget(4, 8), 4);
+        assert_eq!(resolve_core_budget(1, 8), 1);
+    }
+
+    #[test]
+    fn apply_config_oversized_num_cpus_clamps_to_default_width() {
+        let sampler = CpuSampler::new(Algorithm::Sa);
+        let default_width = sampler.stream_width();
+        sampler.apply_config("num_cpus = 1000000");
+        assert_eq!(sampler.stream_width(), default_width);
     }
 
     #[tokio::test]
@@ -399,7 +575,7 @@ mod tests {
 
         let pump = tokio::task::spawn_blocking(move || {
             run_stream_pump(
-                2,
+                || 2,
                 |g, p, _, _| Ok(sample_ising(g, p, Algorithm::Sa)),
                 job_rx,
                 out_tx,

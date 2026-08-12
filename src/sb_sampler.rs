@@ -143,7 +143,7 @@ impl Sampler for SbSampler {
     ) {
         let variant = self.variant;
         run_stream_pump(
-            self.stream_width(),
+            || self.stream_width(),
             move |g, p, _, _| Ok(sample_sb(g, p, variant)),
             jobs,
             out,

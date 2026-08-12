@@ -118,6 +118,29 @@ git dependencies pinned to a `shared-vX.Y.Z` tag of `quip-protocol`.
 quip-cpu-sa --quip-coordinator unix:///run/quip/coord.sock
 ```
 
+### `num_cpus`
+
+The coordinator `[cpu]` section may set `num_cpus`. That key travels in
+`Configure.backend_toml`. The miner reads it in `apply_config`.
+
+| Value | Effect |
+|-------|--------|
+| Absent | Use `available_parallelism()` as the core budget. |
+| Positive integer | Use that count as the core budget. |
+| Larger than the host | Clamp to the host parallelism. Log the clamp at `debug`. |
+| Zero or negative | Refuse the setting. Exit 64 at handshake. |
+
+The budget bounds sampler concurrency:
+
+- SA: stream worker count. Each worker runs one model. Reads inside a
+  model are sequential. Total threads equal `num_cpus`.
+- Gibbs: stream worker count is `num_cpus / gibbs.workers`. Each in-flight
+  model uses `gibbs.workers` threads (default 4). The product stays at or
+  below `num_cpus`, except when `num_cpus` is smaller than `gibbs.workers`.
+  Then one model still uses `gibbs.workers` threads.
+
+Other CPU binaries (SB, MPS, Flatiron) do not read `num_cpus`.
+
 **Driver / fixed-input (run in isolation, no chain).** Use the coordinator's
 `drive` harness pointed at the binary — `--source random` for golden-drawn
 problems, `--source list <jsonl>` for a fixed replay:
