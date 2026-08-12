@@ -42,14 +42,21 @@ use quip_proto::v1::RejectReason;
 const DEFAULT_MAX_NODES: u32 = 100_000;
 const DEFAULT_MAX_EDGES: u32 = 1_000_000;
 
-/// CPU adapt envelope (from `CPU/sa_miner.py`).
+/// CPU adapt envelope.
+///
+/// Sized so one SA attempt on an Advantage2-scale graph finishes inside a
+/// typical cancelled round. The previous bounds came from the Python GPU
+/// miner. They asked for about four times the Metal work on a CPU. One
+/// read of 3324 sweeps took 571 ms on that topology. 415 reads at that
+/// depth is about 4 minutes serial, and longer once 16 workers share the
+/// machine. A 6-minute reseed then cancels the attempt before it returns.
 const CPU_ADAPT: AdaptBounds = AdaptBounds {
     min_sweeps: 64,
-    max_sweeps: 4096,
+    max_sweeps: 1024,
     min_reads: 64,
-    max_reads: 512,
-    reads_solution_min_factor: 4,
-    reads_solution_max_factor: 8,
+    max_reads: 128,
+    reads_solution_min_factor: 0,
+    reads_solution_max_factor: 0,
     reads_solution_floor_factor: 0,
 };
 
@@ -502,5 +509,26 @@ mod tests {
             assert_eq!(a.spins, b.spins);
             assert_eq!(a.energy_milli, b.energy_milli);
         }
+    }
+
+    /// A CPU attempt on the logged Advantage2 problem must finish inside a
+    /// cancelled round. One read of 3324 sweeps took 571 ms on that
+    /// topology. Sixteen workers slowed a small batch by about 3x. Serial
+    /// time must stay under 120 s so a 6-minute reseed still sees a
+    /// completed attempt after that contention.
+    #[test]
+    fn cpu_adapt_attempt_fits_a_cancelled_round() {
+        use quip_miner_core::adapt::adapt_params;
+
+        let p = adapt_params(-14_518_191, 1, 4577, 41515, &[0], &CPU_ADAPT);
+        let product = u64::from(p.num_reads) * u64::from(p.num_sweeps);
+        const MS_PER_SWEEP_READ: f64 = 571.0 / 3324.0;
+        let serial_ms = product as f64 * MS_PER_SWEEP_READ;
+        assert!(
+            serial_ms < 120_000.0,
+            "CPU adapt asks for {product} sweep-reads ({serial_ms:.0} ms serial) \
+             at the logged problem; that misses a 6-minute cancelled round \
+             once 16 workers share the machine"
+        );
     }
 }
