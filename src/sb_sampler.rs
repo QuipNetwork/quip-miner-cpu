@@ -33,9 +33,9 @@ pub(crate) const CPU_SB_ADAPT: AdaptBounds = AdaptBounds {
     min_sweeps: 256,
     max_sweeps: 8192,
     min_reads: 64,
-    max_reads: 512,
-    reads_solution_min_factor: 4,
-    reads_solution_max_factor: 8,
+    max_reads: 128,
+    reads_solution_min_factor: 0,
+    reads_solution_max_factor: 0,
     reads_solution_floor_factor: 0,
 };
 
@@ -143,8 +143,8 @@ impl Sampler for SbSampler {
     ) {
         let variant = self.variant;
         run_stream_pump(
-            self.stream_width(),
-            move |g, p| sample_sb(g, p, variant),
+            || self.stream_width(),
+            move |g, p, _, _| Ok(sample_sb(g, p, variant)),
             jobs,
             out,
             cancel,
@@ -186,9 +186,9 @@ mod tests {
         assert_eq!(CPU_SB_IDENTITY.adapt.min_sweeps, 256);
         assert_eq!(CPU_SB_IDENTITY.adapt.max_sweeps, 8192);
         assert_eq!(CPU_SB_IDENTITY.adapt.min_reads, 64);
-        assert_eq!(CPU_SB_IDENTITY.adapt.max_reads, 512);
-        assert_eq!(CPU_SB_IDENTITY.adapt.reads_solution_min_factor, 4);
-        assert_eq!(CPU_SB_IDENTITY.adapt.reads_solution_max_factor, 8);
+        assert_eq!(CPU_SB_IDENTITY.adapt.max_reads, 128);
+        assert_eq!(CPU_SB_IDENTITY.adapt.reads_solution_min_factor, 0);
+        assert_eq!(CPU_SB_IDENTITY.adapt.reads_solution_max_factor, 0);
         assert_eq!(CPU_SB_IDENTITY.adapt.reads_solution_floor_factor, 0);
     }
 
@@ -288,5 +288,4 @@ mod tests {
         assert_eq!(CPU_HBSB_IDENTITY.max_nodes, 100_000);
         assert_eq!(CPU_HBSB_IDENTITY.max_edges, 1_000_000);
     }
-
 }

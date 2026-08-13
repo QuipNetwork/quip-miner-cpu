@@ -24,10 +24,13 @@ reads are sequential and cache-local. Energies are scored with the canonical
 | `quip-cpu-flatiron` | belief-propagation tensor network on the problem graph | experimental |
 
 Every sampler streams jobs through one shared pump, `run_stream_pump` in
-`src/lib.rs`. That pump holds the only copy of the cancellation check before
-dispatch and of the panic re-raise on worker join. The SB kernel and its
-sampler live in `src/sb_core.rs` and `src/sb_sampler.rs`, separate from the
-annealing path.
+`src/lib.rs`. That pump drops a cancelled generation before a worker touches
+the graph. The SA kernel also polls the cancel guard once per sweep (one
+`Relaxed` load, never per spin flip). A long in-flight job of 80 to 300
+seconds then stops at the next sweep. The kernel emits
+`StreamOutcome::Cancelled`, the same outcome as the dequeue path. The SB
+kernel and its sampler live in `src/sb_core.rs` and `src/sb_sampler.rs`,
+separate from the annealing path.
 
 Prebuilt binaries are attached to each
 [Release](https://gitlab.com/quip.network/quip-miner-cpu/-/releases) for
@@ -114,6 +117,29 @@ git dependencies pinned to a `shared-vX.Y.Z` tag of `quip-protocol`.
 ```sh
 quip-cpu-sa --quip-coordinator unix:///run/quip/coord.sock
 ```
+
+### `num_cpus`
+
+The coordinator `[cpu]` section may set `num_cpus`. That key travels in
+`Configure.backend_toml`. The miner reads it in `apply_config`.
+
+| Value | Effect |
+|-------|--------|
+| Absent | Use `available_parallelism()` as the core budget. |
+| Positive integer | Use that count as the core budget. |
+| Larger than the host | Clamp to the host parallelism. Log the clamp at `debug`. |
+| Zero or negative | Refuse the setting. Exit 64 at handshake. |
+
+The budget bounds sampler concurrency:
+
+- SA: stream worker count. Each worker runs one model. Reads inside a
+  model are sequential. Total threads equal `num_cpus`.
+- Gibbs: stream worker count is `num_cpus / gibbs.workers`. Each in-flight
+  model uses `gibbs.workers` threads (default 4). The product stays at or
+  below `num_cpus`, except when `num_cpus` is smaller than `gibbs.workers`.
+  Then one model still uses `gibbs.workers` threads.
+
+Other CPU binaries (SB, MPS, Flatiron) do not read `num_cpus`.
 
 **Driver / fixed-input (run in isolation, no chain).** Use the coordinator's
 `drive` harness pointed at the binary — `--source random` for golden-drawn

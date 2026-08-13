@@ -16,7 +16,7 @@
 //! base graph.
 
 use quip_miner_core::beta::{default_ising_beta_range, geometric_beta_schedule};
-use quip_miner_core::{Algorithm, IsingGraph, SampleParams, SamplerResult};
+use quip_miner_core::{Algorithm, CancelGuard, IsingGraph, SampleParams, SamplerResult};
 use quip_protocol::scoring::energy_milli;
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
@@ -161,16 +161,21 @@ fn metropolis_accept(delta: f64, beta: f64, rng: &mut SmallRng) -> bool {
     rng.gen::<f64>() < accept_prob
 }
 
+/// Marker returned when a cancel checkpoint fires mid-attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SampleCancelled;
+
 fn anneal_one_read(
     graph: &CpuGraph,
     beta_schedule: &[f64],
     sweeps_per_beta: usize,
     rng: &mut SmallRng,
-) -> Vec<i8> {
+    cancel: Option<(&CancelGuard, u64)>,
+) -> Result<Vec<i8>, SampleCancelled> {
     let n = graph.num_nodes();
     let mut spins = random_spins(n, rng);
     if n == 0 {
-        return spins;
+        return Ok(spins);
     }
 
     // Incremental effective-field cache: `heff[var]` stays equal to
@@ -191,6 +196,13 @@ fn anneal_one_read(
 
     for &beta in beta_schedule {
         for _ in 0..sweeps_per_beta {
+            // One Relaxed load per sweep, never per spin flip. A sweep is
+            // O(n) work, so this is the budget the protocol comment asked for.
+            if let Some((guard, generation)) = cancel {
+                if guard.is_cancelled(generation) {
+                    return Err(SampleCancelled);
+                }
+            }
             for var in 0..n {
                 let s = spin_sign(spins[var]);
                 let delta = -2.0 * s * heff[var];
@@ -201,7 +213,7 @@ fn anneal_one_read(
             }
         }
     }
-    spins
+    Ok(spins)
 }
 
 /// Descend from a supplied configuration to a local minimum by single-spin
@@ -238,7 +250,6 @@ pub(crate) fn polish_from(spins: &mut [i8], graph: &CpuGraph, max_sweeps: usize)
     }
 }
 
-
 fn score_spins(spins: &[i8], graph: &IsingGraph) -> SamplerResult {
     let energy = energy_milli(spins, &graph.h, &graph.j, &graph.edges);
     SamplerResult {
@@ -274,15 +285,29 @@ pub fn sample_ising(
     params: &SampleParams,
     algorithm: Algorithm,
 ) -> Vec<SamplerResult> {
+    sample_ising_cancellable(graph, params, algorithm, None).unwrap_or_default()
+}
+
+/// Same kernel as [`sample_ising`], with optional cancel checkpoints.
+///
+/// When `cancel` is `None`, the RNG stream and flip order match
+/// [`sample_ising`] bit for bit. When it is `Some` and the guard never
+/// fires, the only added work is one `Ordering::Relaxed` load per sweep.
+pub(crate) fn sample_ising_cancellable(
+    graph: &IsingGraph,
+    params: &SampleParams,
+    algorithm: Algorithm,
+    cancel: Option<(&CancelGuard, u64)>,
+) -> Result<Vec<SamplerResult>, SampleCancelled> {
     if algorithm == Algorithm::Gibbs {
-        // Gibbs runs the chromatic kernel at its default worker count. There is
-        // no sequential Gibbs: the colour classes are the algorithm, not an
-        // optimisation layered over a single-site scan.
-        return crate::gibbs_parallel::sample_gibbs_parallel(
+        // Gibbs keeps its own worker/barrier loop. A mid-sweep return from
+        // one worker would stall the class barrier, so this path still
+        // runs the full job. The SA path is the long attempt.
+        return Ok(crate::gibbs_parallel::sample_gibbs_parallel(
             graph,
             params,
             crate::gibbs_parallel::DEFAULT_GIBBS_WORKERS,
-        );
+        ));
     }
     let num_reads = params.num_reads.max(1);
     let cpu = CpuGraph::from_base(graph);
@@ -290,18 +315,23 @@ pub fn sample_ising(
     let sweeps_per = params.sweeps_per_beta.max(1);
     let base_seed = params.seed;
 
-    (0..num_reads)
-        .map(|read_idx| {
-            // Distinct stream per read; seed 0 still diversifies via read index.
-            let seed = base_seed
-                .wrapping_mul(0x9E37_79B9_7F4A_7C15)
-                .wrapping_add(read_idx as u64)
-                .wrapping_add(1);
-            let mut rng = SmallRng::seed_from_u64(seed);
-            let spins = anneal_one_read(&cpu, &beta_schedule, sweeps_per, &mut rng);
-            score_spins(&spins, graph)
-        })
-        .collect()
+    let mut results = Vec::with_capacity(num_reads);
+    for read_idx in 0..num_reads {
+        if let Some((guard, generation)) = cancel {
+            if guard.is_cancelled(generation) {
+                return Err(SampleCancelled);
+            }
+        }
+        // Distinct stream per read; seed 0 still diversifies via read index.
+        let seed = base_seed
+            .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            .wrapping_add(read_idx as u64)
+            .wrapping_add(1);
+        let mut rng = SmallRng::seed_from_u64(seed);
+        let spins = anneal_one_read(&cpu, &beta_schedule, sweeps_per, &mut rng, cancel)?;
+        results.push(score_spins(&spins, graph));
+    }
+    Ok(results)
 }
 
 #[cfg(test)]
@@ -619,7 +649,10 @@ mod tests {
         let cpu = CpuGraph::from_base(&g);
         let mut spins = vec![1i8; 5];
         polish_from(&mut spins, &cpu, 8);
-        let want: Vec<i8> = h.iter().map(|&x| if x > 0.0 { -1i8 } else { 1i8 }).collect();
+        let want: Vec<i8> = h
+            .iter()
+            .map(|&x| if x > 0.0 { -1i8 } else { 1i8 })
+            .collect();
         assert_eq!(spins, want);
     }
 
@@ -677,5 +710,4 @@ mod tests {
         polish_from(&mut short, &cpu, 8);
         assert_eq!(short, vec![1i8, -1], "a length mismatch must be a no-op");
     }
-
 }

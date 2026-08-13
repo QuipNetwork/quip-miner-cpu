@@ -1,6 +1,6 @@
 [package]
 name = "quip-miner-cpu"
-version = "0.3.0-rc5"
+version = "0.3.0-rc6"
 edition = "2021"
 description = "CPU Ising miners: simulated annealing and single-site Gibbs (v0.3)"
 license = "AGPL-3.0-or-later"
@@ -110,6 +110,9 @@ clap = { version = "4", features = ["derive"] }
 crossbeam-channel = "0.5.16"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "signal", "io-util", "sync"] }
 rand = { version = "0.8", features = ["small_rng"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+tracing = "0.1"
 
 [dev-dependencies]
 proptest = "1.11.0"
