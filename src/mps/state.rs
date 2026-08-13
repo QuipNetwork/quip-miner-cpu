@@ -76,8 +76,7 @@ impl Mps {
                     }
                     for p in 0..2 {
                         for r in 0..dr {
-                            next[(c * 2 + p) * dr + r] +=
-                                av * self.site[k][(l * 2 + p) * dr + r];
+                            next[(c * 2 + p) * dr + r] += av * self.site[k][(l * 2 + p) * dr + r];
                         }
                     }
                 }
@@ -411,7 +410,10 @@ mod tests {
         assert_eq!(dense.len(), 32);
         let want = (0.5f64).powf(2.5);
         for (i, &x) in dense.iter().enumerate() {
-            assert!((x - want).abs() <= 1e-15, "amplitude {i} = {x}, want {want}");
+            assert!(
+                (x - want).abs() <= 1e-15,
+                "amplitude {i} = {x}, want {want}"
+            );
         }
         let norm: f64 = dense.iter().map(|x| x * x).sum();
         assert!((norm - 1.0).abs() <= 1e-14, "norm = {norm}");
@@ -951,9 +953,8 @@ mod tests {
         };
 
         let exact = run(exact_chi);
-        let overlap = |v: &[f64]| -> f64 {
-            v.iter().zip(&exact).map(|(a, b)| a * b).sum::<f64>().abs()
-        };
+        let overlap =
+            |v: &[f64]| -> f64 { v.iter().zip(&exact).map(|(a, b)| a * b).sum::<f64>().abs() };
         let at_four = run(4);
         let at_one = run(1);
         assert!(
@@ -1017,7 +1018,9 @@ mod tests {
         mps.right_canonicalize(8);
         let draw = |seed: u64| {
             let mut rng = SmallRng::seed_from_u64(seed);
-            (0..16).map(|_| mps.sample_one(&mut rng)).collect::<Vec<_>>()
+            (0..16)
+                .map(|_| mps.sample_one(&mut rng))
+                .collect::<Vec<_>>()
         };
         assert_eq!(draw(99), draw(99));
     }
@@ -1071,5 +1074,4 @@ mod tests {
             "chi-squared {chi2} exceeds the 1-in-10^4 threshold for 63 degrees of freedom"
         );
     }
-
 }

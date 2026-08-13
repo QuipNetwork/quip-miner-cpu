@@ -1046,5 +1046,4 @@ mod tests {
             "a symmetry-breaking field must let the bond-1 path reach the ground state"
         );
     }
-
 }

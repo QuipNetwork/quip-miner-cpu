@@ -31,11 +31,10 @@ impl NetGraph {
     /// merge into one bond instead of two gates, which is exact here.
     pub(crate) fn from_graph(g: &IsingGraph) -> Self {
         let n = g.h.len();
-        let h: Vec<f64> = g
-            .h
-            .iter()
-            .map(|&x| if x.is_finite() { x } else { 0.0 })
-            .collect();
+        let h: Vec<f64> =
+            g.h.iter()
+                .map(|&x| if x.is_finite() { x } else { 0.0 })
+                .collect();
 
         let mut raw: Vec<(u32, u32, f64)> = Vec::with_capacity(g.edges.len());
         for (k, &(u, v)) in g.edges.iter().enumerate() {
@@ -91,11 +90,7 @@ mod tests {
 
     #[test]
     fn a_clean_graph_maps_one_bond_per_edge() {
-        let g = IsingGraph::new(
-            vec![0.5, -0.25, 0.0],
-            vec![1.0, -2.0],
-            vec![(0, 1), (2, 1)],
-        );
+        let g = IsingGraph::new(vec![0.5, -0.25, 0.0], vec![1.0, -2.0], vec![(0, 1), (2, 1)]);
         let net = NetGraph::from_graph(&g);
         assert_eq!(net.bonds, vec![(0, 1, 1.0), (1, 2, -2.0)]);
         assert_eq!(net.adj[0], vec![(0, 1)]);

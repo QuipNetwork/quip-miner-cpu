@@ -189,7 +189,11 @@ impl SbGraph {
         // or j makes the sum itself non-finite. Either way the kernel runs with
         // no coupling force and returns valid spins; the scorer decides.
         let c0_narrow = c0_f64 as Real;
-        let c0 = if c0_narrow.is_finite() { c0_narrow } else { 0.0 };
+        let c0 = if c0_narrow.is_finite() {
+            c0_narrow
+        } else {
+            0.0
+        };
         Self {
             h: g.h.iter().map(|&b| b as Real).collect(),
             nbr_start,
@@ -413,7 +417,8 @@ fn sb_run_parallel(
                             let (nodes, coups) = g.neighbors(i);
                             let mut acc: Real = 0.0;
                             for (&v, &coup) in nodes.iter().zip(coups.iter()) {
-                                acc += coup * Real::from_bits(ca[v as usize].load(Ordering::Relaxed));
+                                acc +=
+                                    coup * Real::from_bits(ca[v as usize].load(Ordering::Relaxed));
                             }
                             if g.has_bias {
                                 acc += g.h[i] * Real::from_bits(ca[n].load(Ordering::Relaxed));
@@ -977,7 +982,9 @@ mod tests {
                 }
             }
         }
-        let j: Vec<f64> = (0..edges.len()).map(|_| rng.gen_range(-1.0..=1.0)).collect();
+        let j: Vec<f64> = (0..edges.len())
+            .map(|_| rng.gen_range(-1.0..=1.0))
+            .collect();
         IsingGraph::new(h, j, edges)
     }
 
@@ -1302,7 +1309,8 @@ mod tests {
     fn c0_is_zero_when_the_problem_carries_no_scale() {
         let empty = SbGraph::from_base(&IsingGraph::new(vec![], vec![], vec![]));
         assert_eq!(empty.c0, 0.0);
-        let all_zero = SbGraph::from_base(&IsingGraph::new(vec![0.0, 0.0], vec![0.0], vec![(0, 1)]));
+        let all_zero =
+            SbGraph::from_base(&IsingGraph::new(vec![0.0, 0.0], vec![0.0], vec![(0, 1)]));
         assert_eq!(all_zero.c0, 0.0);
         let single = SbGraph::from_base(&IsingGraph::new(vec![0.0], vec![], vec![]));
         assert_eq!(single.c0, 0.0);
@@ -1521,5 +1529,4 @@ mod tests {
             "heating must not drive a momentum non-finite: {y:?}"
         );
     }
-
 }

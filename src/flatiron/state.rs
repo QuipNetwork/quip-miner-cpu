@@ -204,46 +204,45 @@ pub(crate) fn apply_zz(
     }
 
     let cap = chi.max(1);
-    let (new_u, new_lam, new_v, keep) =
-        match jacobi_svd(&theta, rows_u, rows_v, JACOBI_MAX_SWEEPS) {
-            Some(svd) => {
-                let s0 = svd.s.first().copied().unwrap_or(0.0);
-                let floor = if s0 > 0.0 { KEEP_CUTOFF * s0 } else { 0.0 };
-                let counted = svd.s.iter().filter(|&&x| x > floor).count();
-                let keep = counted.clamp(1, svd.k.min(cap));
-                let mut u = vec![0.0; rows_u * keep];
-                for r in 0..rows_u {
-                    u[r * keep..(r + 1) * keep]
-                        .copy_from_slice(&svd.u[r * svd.k..r * svd.k + keep]);
+    let (new_u, new_lam, new_v, keep) = match jacobi_svd(&theta, rows_u, rows_v, JACOBI_MAX_SWEEPS)
+    {
+        Some(svd) => {
+            let s0 = svd.s.first().copied().unwrap_or(0.0);
+            let floor = if s0 > 0.0 { KEEP_CUTOFF * s0 } else { 0.0 };
+            let counted = svd.s.iter().filter(|&&x| x > floor).count();
+            let keep = counted.clamp(1, svd.k.min(cap));
+            let mut u = vec![0.0; rows_u * keep];
+            for r in 0..rows_u {
+                u[r * keep..(r + 1) * keep].copy_from_slice(&svd.u[r * svd.k..r * svd.k + keep]);
+            }
+            let mut v = vec![0.0; rows_v * keep];
+            for c in 0..rows_v {
+                for b in 0..keep {
+                    v[c * keep + b] = svd.vt[b * rows_v + c];
                 }
-                let mut v = vec![0.0; rows_v * keep];
+            }
+            let lam: Vec<f64> = if s0 > 0.0 {
+                svd.s[..keep].iter().map(|&x| x / s0).collect()
+            } else {
+                vec![1.0; keep]
+            };
+            (u, lam, v, keep)
+        }
+        None => {
+            // Jacobi did not converge: fall back to the crate's QR path,
+            // which keeps an isometry on the `u` side and folds the
+            // weights into `v`. The bond weights become uniform.
+            let f = truncated_svd(&theta, rows_u, rows_v, cap);
+            let keep = f.k.max(1);
+            let mut v = vec![0.0; rows_v * keep];
+            for b in 0..f.k {
                 for c in 0..rows_v {
-                    for b in 0..keep {
-                        v[c * keep + b] = svd.vt[b * rows_v + c];
-                    }
+                    v[c * keep + b] = f.carry[b * rows_v + c];
                 }
-                let lam: Vec<f64> = if s0 > 0.0 {
-                    svd.s[..keep].iter().map(|&x| x / s0).collect()
-                } else {
-                    vec![1.0; keep]
-                };
-                (u, lam, v, keep)
             }
-            None => {
-                // Jacobi did not converge: fall back to the crate's QR path,
-                // which keeps an isometry on the `u` side and folds the
-                // weights into `v`. The bond weights become uniform.
-                let f = truncated_svd(&theta, rows_u, rows_v, cap);
-                let keep = f.k.max(1);
-                let mut v = vec![0.0; rows_v * keep];
-                for b in 0..f.k {
-                    for c in 0..rows_v {
-                        v[c * keep + b] = f.carry[b * rows_v + c];
-                    }
-                }
-                (f.q, vec![1.0; keep], v, keep)
-            }
-        };
+            (f.q, vec![1.0; keep], v, keep)
+        }
+    };
 
     tu.dematricize(bu, &new_u, keep);
     tv.dematricize(bv, &new_v, keep);

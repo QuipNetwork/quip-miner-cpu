@@ -338,7 +338,15 @@ pub fn sample_gibbs_with(
             GibbsParallelism::Reads => 1,
             GibbsParallelism::Colors => workers,
         };
-        gibbs_read(&cpu, &coloring, &betas, sweeps_per_beta, seed, inner, &spins);
+        gibbs_read(
+            &cpu,
+            &coloring,
+            &betas,
+            sweeps_per_beta,
+            seed,
+            inner,
+            &spins,
+        );
         let out: Vec<i8> = spins.iter().map(|a| a.load(Ordering::Relaxed)).collect();
         SamplerResult {
             energy_milli: energy_milli(&out, &graph.h, &graph.j, &graph.edges),
@@ -356,7 +364,9 @@ pub fn sample_gibbs_with(
             std::thread::scope(|scope| {
                 let handles: Vec<_> = indices
                     .chunks(chunk.max(1))
-                    .map(|part| scope.spawn(|| part.iter().map(|&i| one_read(i)).collect::<Vec<_>>()))
+                    .map(|part| {
+                        scope.spawn(|| part.iter().map(|&i| one_read(i)).collect::<Vec<_>>())
+                    })
                     .collect();
                 handles
                     .into_iter()
@@ -406,10 +416,7 @@ mod tests {
             let got = read_back(&spins);
             match &reference {
                 None => reference = Some(got),
-                Some(want) => assert_eq!(
-                    &got, want,
-                    "worker count {workers} changed the result"
-                ),
+                Some(want) => assert_eq!(&got, want, "worker count {workers} changed the result"),
             }
         }
     }
@@ -438,7 +445,10 @@ mod tests {
         let out = read_back(&spins);
         let up = out.iter().filter(|&&s| s == 1).count();
         let aligned = up.max(128 - up);
-        assert!(aligned >= 120, "expected near alignment, got {up} up of 128");
+        assert!(
+            aligned >= 120,
+            "expected near alignment, got {up} up of 128"
+        );
     }
 
     /// Hypothesis: a positive bias with no couplings drives the spin negative,

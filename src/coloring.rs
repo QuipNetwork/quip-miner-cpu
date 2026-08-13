@@ -127,7 +127,11 @@ mod tests {
         assert_eq!(colored(&path).0.classes().len(), 2, "a path is bipartite");
 
         let triangle = IsingGraph::new(vec![0.0; 3], vec![1.0; 3], vec![(0, 1), (1, 2), (0, 2)]);
-        assert_eq!(colored(&triangle).0.classes().len(), 3, "a triangle needs three");
+        assert_eq!(
+            colored(&triangle).0.classes().len(),
+            3,
+            "a triangle needs three"
+        );
     }
 
     /// Hypothesis: a graph with no edges colours in one class, so the sampler
