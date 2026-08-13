@@ -90,11 +90,7 @@ pub(crate) fn select_chi(net: &NetGraph, steps: usize, cfg: &FlatironConfig) -> 
     }
     for chi in (2..=chi_max).rev() {
         let c = chi as f64;
-        let mem: f64 = net
-            .adj
-            .iter()
-            .map(|a| 16.0 * c.powi(a.len() as i32))
-            .sum();
+        let mem: f64 = net.adj.iter().map(|a| 16.0 * c.powi(a.len() as i32)).sum();
         // `mem` can be infinite at high degree; both infinity and NaN must
         // fail the cap, so compare in the direction that rejects them.
         if mem > MEM_CAP_BYTES || mem.is_nan() {
@@ -334,7 +330,10 @@ mod tests {
         );
         let net = NetGraph::from_graph(&g);
         let got = select_chi(&net, 64, &cfg(8));
-        assert!(got >= 2, "an 8-ring at 64 steps affords chi >= 2, got {got}");
+        assert!(
+            got >= 2,
+            "an 8-ring at 64 steps affords chi >= 2, got {got}"
+        );
         assert_eq!(select_chi(&net, 64, &cfg(1)), 1);
     }
 
@@ -359,7 +358,14 @@ mod tests {
     fn an_edgeless_graph_is_capped_only_by_chi_max() {
         let net = NetGraph::from_graph(&IsingGraph::new(vec![0.0; 64], vec![], vec![]));
         assert_eq!(select_chi(&net, 64, &cfg(8)), 8);
-        assert_eq!(select_chi(&NetGraph::from_graph(&IsingGraph::new(vec![], vec![], vec![])), 64, &cfg(4)), 4);
+        assert_eq!(
+            select_chi(
+                &NetGraph::from_graph(&IsingGraph::new(vec![], vec![], vec![])),
+                64,
+                &cfg(4)
+            ),
+            4
+        );
     }
 
     #[test]
@@ -389,13 +395,18 @@ mod tests {
         let g = IsingGraph::new(vec![], vec![], vec![]);
         let results = sample_ising_flatiron(&g, &params(3, 64, 1), &cfg(8));
         assert_eq!(results.len(), 3);
-        assert!(results.iter().all(|r| r.spins.is_empty() && r.energy_milli == 0));
+        assert!(results
+            .iter()
+            .all(|r| r.spins.is_empty() && r.energy_milli == 0));
     }
 
     #[test]
     fn zero_reads_still_produce_one_result() {
         let g = ferro_chain(6);
-        assert_eq!(sample_ising_flatiron(&g, &params(0, 64, 3), &cfg(8)).len(), 1);
+        assert_eq!(
+            sample_ising_flatiron(&g, &params(0, 64, 3), &cfg(8)).len(),
+            1
+        );
     }
 
     #[test]

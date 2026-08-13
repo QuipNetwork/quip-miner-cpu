@@ -383,6 +383,18 @@ mod tests {
     use super::*;
     use rand::rngs::SmallRng;
     use rand::{Rng, SeedableRng};
+    use std::sync::{Mutex, MutexGuard};
+
+    /// `SVD_FALLBACKS` is process-global, so a test that measures a delta across
+    /// it cannot run beside another test that increments it. Every test that
+    /// forces the fallback takes this lock for the duration of the call.
+    static FALLBACK_PATH: Mutex<()> = Mutex::new(());
+
+    /// A panic inside one fallback test poisons the lock. Recover the guard, so
+    /// the sibling tests report their own results instead of the poisoning.
+    fn lock_fallback_path() -> MutexGuard<'static, ()> {
+        FALLBACK_PATH.lock().unwrap_or_else(|e| e.into_inner())
+    }
 
     fn random_matrix(m: usize, n: usize, seed: u64) -> Vec<f64> {
         let mut rng = SmallRng::seed_from_u64(seed);
@@ -632,6 +644,7 @@ mod tests {
     #[test]
     fn non_convergence_falls_back_to_qr_and_counts_the_event() {
         let a = random_matrix(6, 4, 99);
+        let _guard = lock_fallback_path();
         let before = svd_fallback_count();
         // A zero sweep budget forces the fallback deterministically; a
         // pathological matrix would be a flaky way to reach the same path.
@@ -650,6 +663,7 @@ mod tests {
     #[test]
     fn the_qr_fallback_still_produces_an_isometry_when_the_bond_is_capped() {
         let a = random_matrix(8, 6, 1234);
+        let _guard = lock_fallback_path();
         let f = truncated_svd_sweeps(&a, 8, 6, 2, 0);
         assert_eq!(f.k, 2);
         assert_columns_orthonormal(&f.q, 8, 2, "Q of the capped QR fallback");
@@ -669,13 +683,18 @@ mod tests {
             a[i * 3 + 1] = col1[i];
             a[i * 3 + 2] = 2.0 * col0[i];
         }
+        let _guard = lock_fallback_path();
         let f = truncated_svd_sweeps(&a, 4, 3, 3, 0);
         assert_eq!(f.k, 3);
         assert_columns_orthonormal(&f.q, 4, 3, "Q with a dependent column");
         let back = product(&f.q, &f.carry, 4, 3, 3);
         for i in 0..12 {
-            assert!((back[i] - a[i]).abs() <= 1e-12, "entry {i}: {} vs {}", back[i], a[i]);
+            assert!(
+                (back[i] - a[i]).abs() <= 1e-12,
+                "entry {i}: {} vs {}",
+                back[i],
+                a[i]
+            );
         }
     }
-
 }

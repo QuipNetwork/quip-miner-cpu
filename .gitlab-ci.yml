@@ -38,7 +38,11 @@ cache:
 test:
   stage: test
   script:
-    - rustup component add clippy
+    - rustup component add clippy rustfmt
+    # Formatting is checked first: it is the cheapest job to fail and it never
+    # depends on a build. Without it the tree drifts silently, because no other
+    # job reads formatting.
+    - cargo fmt --all -- --check
     # --all-features keeps the experimental backends inside the zero-warnings
     # gate even though CI never packages their binaries.
     - cargo test --release --all-features

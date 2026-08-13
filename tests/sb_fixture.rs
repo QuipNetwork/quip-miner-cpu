@@ -117,7 +117,7 @@ fn observed() -> Value {
         .collect();
     json!({
         "_comment": "Local regression fixture for the SB kernel. Not a consensus \
-artifact. Regenerate with UPDATE_FIXTURE=1 when a kernel constant changes.",
+    artifact. Regenerate with UPDATE_FIXTURE=1 when a kernel constant changes.",
         "cases": entries,
     })
 }
