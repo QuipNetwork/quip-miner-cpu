@@ -10,8 +10,9 @@
 //! - `seed`        seeds sampling and polish, per-read derivation as for SA.
 //!
 //! Cancellation: `run_stream_pump`'s kernel closure cannot see a job's
-//! generation, so the kernel takes no cancellation closure. Per-job latency is
-//! bounded by the wall-clock valve below plus the pump's dequeue check.
+//! generation, so the kernel takes no cancellation closure. Per-job work is
+//! bounded by `MpsConfig::anneal_work_budget`, which is a function of the
+//! problem rather than of the clock, plus the pump's dequeue check.
 
 use crate::sampler_core::{polish_from, CpuGraph};
 use order::ChainProblem;
@@ -41,6 +42,22 @@ const MPS_MEMORY_CAP_BYTES: f64 = 6.7e7;
 /// by a factor of three.
 const JACOBI_FLOP_CONST: f64 = 50.0;
 
+/// Work budget for the anneal, in the same model units as
+/// `MpsConfig::flop_budget`: `JACOBI_FLOP_CONST * steps * span_sum * chi^3`.
+///
+/// Sized to the two-second envelope the wall-clock valve used to impose. The
+/// Advantage2-System1 pivot (4577 nodes, span sum 7_544_619) sits at chi 1 and
+/// affords `floor(1.2e11 / (50 * 7_544_619))` = 318 steps, which is above
+/// `MAX_TROTTER_STEPS`. So the pivot still walks its full anneal, measuring
+/// near 2.1 s on the reference machine, and the budget binds only on jobs wider
+/// than the pivot, holding those to the same envelope.
+///
+/// It is separate from `flop_budget` because that one is sized for a far
+/// smaller envelope. The two were never consistent: at the pivot `flop_budget`
+/// wants chi 0.14, which floors to 1 and overshoots its own budget by about
+/// 380x. That overshoot is exactly the gap the clock used to cover.
+pub(crate) const ANNEAL_WORK_BUDGET: f64 = 1.2e11;
+
 /// Which starting configurations the reads come from. `QUIP_MPS_INIT` selects
 /// it, and the H3 experiment compares the two arms at equal wall clock.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,14 +75,31 @@ pub struct MpsConfig {
     pub chi_max: usize,
     /// Where the reads start.
     pub init: InitMode,
-    /// Wall-clock safety valve per job, in milliseconds. `0` disables it, which
-    /// is what the determinism tests use.
+    /// Wall-clock cut-off per job, in milliseconds. `0` disables it, and the
+    /// shipped configuration disables it.
+    ///
+    /// [`Self::anneal_work_budget`] is what bounds the anneal. Setting this
+    /// non-zero adds a hard latency ceiling and forfeits reproducibility: it
+    /// truncates the anneal at a step number that depends on machine speed,
+    /// load, and build profile, so the same seed stops giving the same answer.
+    /// The kernel logs a warning whenever it fires. Use it only when a latency
+    /// ceiling matters more than a comparable result.
     pub time_budget_ms: u64,
     /// Deterministic per-job flop budget that selects the bond dimension. It is
     /// deliberately not a measured elapsed time: choosing the bond dimension
     /// from the clock would make the same seed produce different output on a
     /// fast machine than on a slow one.
     pub flop_budget: f64,
+    /// Deterministic per-job work budget that bounds the number of Trotter
+    /// steps, in the same units as [`Self::flop_budget`].
+    ///
+    /// [`select_chi`] can only spend the flop budget through the bond
+    /// dimension, and the bond dimension floors at 1. A job whose model cost
+    /// exceeds the budget at chi 1 has no lever left, so without this the
+    /// anneal ran to `MAX_TROTTER_STEPS` however long that took and only the
+    /// clock stopped it. This is the second lever, and it is a function of the
+    /// problem rather than of the machine.
+    pub anneal_work_budget: f64,
 }
 
 impl MpsConfig {
@@ -80,8 +114,16 @@ impl MpsConfig {
         Self {
             chi_max,
             init,
-            time_budget_ms: 2000,
+            // Off. `anneal_work_budget` bounds the anneal, and it does so as
+            // a function of the problem, so the same job gives the same answer
+            // on any machine and in any build profile. A clock bound cannot:
+            // the fixture in `tests/mps_cross_process.rs` runs in 1.9 s
+            // release and 31 s debug on the reference machine, so any budget
+            // that fits production would fire on every debug test run and make
+            // the kernel behave differently from the one that ships.
+            time_budget_ms: 0,
             flop_budget: 1.25e9,
+            anneal_work_budget: ANNEAL_WORK_BUDGET,
         }
     }
 }
@@ -114,6 +156,42 @@ pub(crate) fn select_chi(n: usize, span_sum: u64, steps: usize, cfg: &MpsConfig)
     }
 }
 
+/// Trotter steps for one job: the most the deterministic work budget affords at
+/// the chosen bond dimension, never more than `steps` and never below 1.
+///
+/// This is the companion to [`select_chi`]. That function spends the budget
+/// through the bond dimension and cannot go below 1, so a job wide enough to
+/// exceed the budget at chi 1 used to run every step it was asked for and let
+/// the wall clock cut it short. Cutting by the clock makes the same seed give
+/// different output on a different machine, or on the same machine under load.
+/// Cutting by the budget gives the same answer everywhere.
+pub(crate) fn select_steps(steps: usize, span_sum: u64, chi: usize, budget: f64) -> usize {
+    if steps == 0 {
+        return 0;
+    }
+    if span_sum == 0 || !budget.is_finite() || budget <= 0.0 {
+        return steps;
+    }
+    let chi = chi.max(1) as f64;
+    let per_step = JACOBI_FLOP_CONST * span_sum as f64 * chi * chi * chi;
+    if per_step <= 0.0 {
+        return steps;
+    }
+    let affordable = (budget / per_step).floor();
+    if !affordable.is_finite() || affordable < 1.0 {
+        return 1;
+    }
+    // `affordable` is finite and >= 1 here, so the cast is in range once it is
+    // capped by `steps`.
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "value is finite, >= 1, and immediately capped by steps"
+    )]
+    let affordable = affordable.min(steps as f64) as usize;
+    affordable.clamp(1, steps)
+}
+
 fn score(spins: &[i8], graph: &IsingGraph) -> SamplerResult {
     SamplerResult {
         spins: spins.to_vec(),
@@ -135,19 +213,32 @@ fn anneal(
     chi: usize,
     cfg: &MpsConfig,
 ) -> Mps {
+    // The schedule keeps its full length: the ramp still has to reach a zero
+    // transverse field. Only the number of steps actually walked is budgeted,
+    // so a truncated anneal stops early on the same ramp rather than annealing
+    // a different one.
     let sched = schedule::build(graph, params, steps);
+    let budgeted = select_steps(steps, chain.span_sum(), chi, cfg.anneal_work_budget);
     let mut mps = Mps::plus_state(chain.h.len());
-    // Wall-clock safety valve. It is the one source of non-determinism, and it
-    // is confined to overload: it changes result quality, never validity. A
-    // budget of 0 disables it, which is what the determinism tests use.
+    // Wall-clock backstop. `budgeted` is what bounds the anneal in normal
+    // operation; this only catches a job the cost model under-predicts badly.
+    // It is the one remaining source of non-determinism, so firing it is worth
+    // a warning: that job's output cannot be reproduced.
     let deadline = if cfg.time_budget_ms == 0 {
         None
     } else {
         Instant::now().checked_add(Duration::from_millis(cfg.time_budget_ms))
     };
-    for k in 0..steps {
+    for k in 0..budgeted {
         if let Some(limit) = deadline {
             if Instant::now() >= limit {
+                tracing::warn!(
+                    step = k,
+                    budgeted_steps = budgeted,
+                    time_budget_ms = cfg.time_budget_ms,
+                    "tensor-network anneal hit the wall-clock backstop; this job's \
+                     output depends on machine speed and load and is not reproducible"
+                );
                 break;
             }
         }
@@ -187,8 +278,10 @@ fn anneal(
 /// let cfg = MpsConfig {
 ///     chi_max: 8,
 ///     init: InitMode::Anneal,
-///     time_budget_ms: 2000,
+///     // The clock takes no part: the work budget below bounds the anneal.
+///     time_budget_ms: 0,
 ///     flop_budget: 1.25e9,
+///     anneal_work_budget: 1.2e11,
 /// };
 /// let results = sample_ising_mps(&graph, &params, &cfg);
 /// assert_eq!(results.len(), 4);
@@ -267,8 +360,10 @@ mod tests {
         let cfg = MpsConfig::from_env(32);
         assert_eq!(cfg.chi_max, 32);
         assert_eq!(cfg.init, InitMode::Anneal);
-        assert_eq!(cfg.time_budget_ms, 2000);
+        // The shipped kernel takes no input from the clock.
+        assert_eq!(cfg.time_budget_ms, 0);
         assert!((cfg.flop_budget - 1.25e9).abs() < 1.0);
+        assert!((cfg.anneal_work_budget - ANNEAL_WORK_BUDGET).abs() < 1.0);
 
         std::env::set_var("QUIP_MPS_INIT", "random");
         assert_eq!(MpsConfig::from_env(8).init, InitMode::Random);
@@ -292,6 +387,7 @@ mod tests {
             init: InitMode::Anneal,
             time_budget_ms: 0,
             flop_budget: 1.25e9,
+            anneal_work_budget: ANNEAL_WORK_BUDGET,
         }
     }
 
@@ -316,6 +412,55 @@ mod tests {
         // advantage2-system1 after reverse Cuthill-McKee: 4577 nodes,
         // span sum 7_544_619. No affordable bond dimension above 1 exists.
         assert_eq!(select_chi(4577, 7_544_619, 64, &cfg(32)), 1);
+    }
+
+    #[test]
+    fn the_step_budget_leaves_the_production_topology_a_full_anneal() {
+        // The pivot at chi 1: 1.2e11 / (50 * 7_544_619) = 318.1 -> 318, above
+        // the 256-step cap, so nothing is trimmed. This is the job that used to
+        // land either side of the 2000 ms valve depending on machine load.
+        assert_eq!(
+            select_steps(256, 7_544_619, 1, ANNEAL_WORK_BUDGET),
+            256,
+            "the pivot must keep its full anneal"
+        );
+    }
+
+    #[test]
+    fn the_step_budget_binds_on_a_job_wider_than_the_pivot() {
+        // Four times the pivot's span: 1.2e11 / (50 * 30_178_476) = 79.5 -> 79.
+        assert_eq!(select_steps(256, 30_178_476, 1, ANNEAL_WORK_BUDGET), 79);
+        // The bond dimension enters as chi^3, so doubling it costs eight times
+        // the work per step: 1.2e11 / (50 * 30_178_476 * 8) = 9.9 -> 9.
+        assert_eq!(select_steps(256, 30_178_476, 2, ANNEAL_WORK_BUDGET), 9);
+    }
+
+    #[test]
+    fn the_step_budget_never_returns_zero_and_never_adds_steps() {
+        // A job no budget can afford still walks one step: a zero-step anneal
+        // would hand the polish the untouched |+> product state.
+        assert_eq!(select_steps(256, u64::MAX, 32, 1.0), 1);
+        // Never more than asked for, however generous the budget.
+        assert_eq!(select_steps(12, 1, 1, f64::MAX), 12);
+        assert_eq!(select_steps(0, 1, 1, ANNEAL_WORK_BUDGET), 0);
+        // A gateless graph has no span to spend, so the budget cannot bind.
+        assert_eq!(select_steps(256, 0, 1, 1.0), 256);
+        // Degenerate budgets fall back to the requested count rather than
+        // silently trimming the anneal to nothing.
+        assert_eq!(select_steps(256, 1000, 1, f64::NAN), 256);
+        assert_eq!(select_steps(256, 1000, 1, 0.0), 256);
+        assert_eq!(select_steps(256, 1000, 1, -5.0), 256);
+    }
+
+    #[test]
+    fn the_step_budget_is_monotone_in_the_budget() {
+        let mut last = 0;
+        for k in 1..=12 {
+            let got = select_steps(256, 7_544_619, 1, 1e10 * f64::from(k));
+            assert!(got >= last, "a larger budget must not buy fewer steps");
+            assert!((1..=256).contains(&got));
+            last = got;
+        }
     }
 
     #[test]
@@ -639,6 +784,7 @@ mod tests {
             init: InitMode::Random,
             time_budget_ms: 0,
             flop_budget: 1.25e9,
+            anneal_work_budget: ANNEAL_WORK_BUDGET,
         }
     }
 
@@ -749,6 +895,7 @@ mod tests {
             init: InitMode::Anneal,
             time_budget_ms: 1,
             flop_budget: 1.25e9,
+            anneal_work_budget: ANNEAL_WORK_BUDGET,
         };
         let results = sample_ising_mps(&g, &params(8, 256, 61), &stopped);
         assert_results_well_formed(&results, &g, 8);
@@ -776,6 +923,7 @@ mod tests {
             init: InitMode::Anneal,
             time_budget_ms: 60_000,
             flop_budget: 1.25e9,
+            anneal_work_budget: ANNEAL_WORK_BUDGET,
         };
         assert_eq!(
             sample_ising_mps(&g, &params(8, 64, 67), &cfg(8)),
@@ -862,6 +1010,7 @@ mod tests {
                 init: InitMode::Anneal,
                 time_budget_ms: 0,
                 flop_budget: 1.25e9,
+        anneal_work_budget: ANNEAL_WORK_BUDGET,
             };
             let results = sample_ising_mps(&g, &params(num_reads, num_sweeps, seed), &c);
 
@@ -897,6 +1046,7 @@ mod tests {
                 init: InitMode::Anneal,
                 time_budget_ms: 0,
                 flop_budget: 1.25e9,
+        anneal_work_budget: ANNEAL_WORK_BUDGET,
             };
             let p = params(4, 32, seed);
             prop_assert_eq!(
