@@ -86,8 +86,10 @@ impl MpsSampler {
     /// let cfg = MpsConfig {
     ///     chi_max: 8,
     ///     init: InitMode::Anneal,
-    ///     time_budget_ms: 2000,
+    ///     // The clock takes no part: the work budget below bounds the anneal.
+    ///     time_budget_ms: 0,
     ///     flop_budget: 1.25e9,
+    ///     anneal_work_budget: 1.2e11,
     /// };
     /// let sampler = MpsSampler::new(cfg);
     /// let graph = IsingGraph::new(vec![0.0, 0.0], vec![-1.0], vec![(0, 1)]);
@@ -148,6 +150,7 @@ mod tests {
             init: InitMode::Anneal,
             time_budget_ms: 0,
             flop_budget: 1.25e9,
+            anneal_work_budget: crate::mps::ANNEAL_WORK_BUDGET,
         }
     }
 
@@ -337,6 +340,7 @@ mod tests {
             init: InitMode::Anneal,
             time_budget_ms: 2000,
             flop_budget: 1.25e9,
+            anneal_work_budget: crate::mps::ANNEAL_WORK_BUDGET,
         };
         let via_from_env = MpsConfig::from_env(1);
         assert_eq!(via_from_env.chi_max, 1);
@@ -358,6 +362,7 @@ mod tests {
             init: InitMode::Anneal,
             time_budget_ms: 2000,
             flop_budget: 1.25e9,
+            anneal_work_budget: crate::mps::ANNEAL_WORK_BUDGET,
         };
         let params = SampleParams {
             num_reads: 6,
@@ -395,6 +400,7 @@ mod tests {
             init: InitMode::Anneal,
             time_budget_ms: 2000,
             flop_budget: 1.25e9,
+            anneal_work_budget: crate::mps::ANNEAL_WORK_BUDGET,
         };
         let random_cfg = MpsConfig {
             init: InitMode::Random,
