@@ -3,7 +3,8 @@
 use quip_mock_coordinator::driver::{drive_miner, DriverReport};
 use quip_proto::v1::RejectReason;
 use std::process::Command;
-use std::sync::{LazyLock, Mutex};
+use std::sync::LazyLock;
+use tokio::sync::Mutex;
 
 /// Serializes this file's tests. Each spawns a real miner process, and
 /// `cargo test` runs `#[tokio::test]` cases concurrently on separate threads
@@ -11,13 +12,14 @@ use std::sync::{LazyLock, Mutex};
 /// worker threads on top of that, so unbounded parallelism can starve one
 /// past the mock coordinator's job deadline and drop a result. These are
 /// process-spawning integration tests, so serializing them costs little
-/// wall-clock time and buys back determinism. See qrel-p02.
+/// wall-clock time and buys back determinism. See qrel-p02. The guard is held
+/// across the drive await, so the mutex must be the async-aware one.
 static GATE: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 /// Drives a miner process while holding [`GATE`], so at most one test in
 /// this file spawns a miner at a time.
 async fn drive_miner_bounded(bin_path: &str, socket: &str) -> DriverReport {
-    let _guard = GATE.lock().unwrap_or_else(|e| e.into_inner());
+    let _guard = GATE.lock().await;
     drive_miner(bin_path, socket).await
 }
 
