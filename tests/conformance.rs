@@ -3,27 +3,21 @@
 use quip_mock_coordinator::driver::{drive_miner, DriverReport};
 use quip_proto::v1::RejectReason;
 use std::process::Command;
-use std::sync::LazyLock;
-use tokio::sync::Semaphore;
+use std::sync::{LazyLock, Mutex};
 
-/// Caps how many miner processes run at once. `cargo test` runs the
-/// `#[tokio::test]` cases in this file concurrently on separate threads by
-/// default, and each miner process (e.g. `quip-cpu-gibbs`) allocates its own
-/// worker threads on top of that. On a small CI runner, enough concurrent
-/// miners can starve one past the mock coordinator's job deadline and drop a
-/// result. These are process-spawning integration tests, so unbounded
-/// parallelism buys little wall-clock time and costs determinism; bound it
-/// here so the fix protects `cargo test` locally too, not just CI. See
-/// qrel-p02.
-static MINER_CONCURRENCY: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(2));
+/// Serializes this file's tests. Each spawns a real miner process, and
+/// `cargo test` runs `#[tokio::test]` cases concurrently on separate threads
+/// by default; a miner process (e.g. `quip-cpu-gibbs`) also allocates its own
+/// worker threads on top of that, so unbounded parallelism can starve one
+/// past the mock coordinator's job deadline and drop a result. These are
+/// process-spawning integration tests, so serializing them costs little
+/// wall-clock time and buys back determinism. See qrel-p02.
+static GATE: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
-/// Drives a miner process, holding a permit for the duration so at most
-/// [`MINER_CONCURRENCY`] miners run at once.
+/// Drives a miner process while holding [`GATE`], so at most one test in
+/// this file spawns a miner at a time.
 async fn drive_miner_bounded(bin_path: &str, socket: &str) -> DriverReport {
-    let _permit = MINER_CONCURRENCY
-        .acquire()
-        .await
-        .expect("semaphore is never closed");
+    let _guard = GATE.lock().unwrap_or_else(|e| e.into_inner());
     drive_miner(bin_path, socket).await
 }
 
