@@ -1,6 +1,6 @@
 [package]
 name = "quip-miner-cpu"
-version = "0.3.0"
+version = "0.3.1-rc1"
 edition = "2021"
 description = "CPU Ising miners: simulated annealing and single-site Gibbs (v0.3)"
 license = "AGPL-3.0-or-later"
@@ -100,12 +100,11 @@ large-futures         = "deny"
 exit                  = "deny"
 mem-forget            = "deny"
 
-# Shared protocol crates live in the quip-protocol repo; tracked on its v0.3
-# branch until they are published to a registry (crates.io / GitLab).
+# The Quip solver contract, published from crates.io (quip.network/quip-solver-core).
 [dependencies]
-quip-proto = { git = "https://gitlab.com/quip.network/quip-protocol.git", branch = "v0.3" }
-quip-protocol = { git = "https://gitlab.com/quip.network/quip-protocol.git", branch = "v0.3" }
-quip-miner-core = { git = "https://gitlab.com/quip.network/quip-protocol.git", branch = "v0.3" }
+quip-proto = "0.0.0"
+quip-protocol = "0.0.0"
+quip-solver-core = "0.0.0"
 clap = { version = "4", features = ["derive"] }
 crossbeam-channel = "0.5.16"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "signal", "io-util", "sync"] }
@@ -116,6 +115,6 @@ tracing = "0.1"
 
 [dev-dependencies]
 proptest = "1.11.0"
-quip-mock-coordinator = { git = "https://gitlab.com/quip.network/quip-protocol.git", branch = "v0.3" }
+quip-solver-conformance = "0.0.0"
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "signal", "io-util", "sync", "process"] }

@@ -21,8 +21,8 @@ use std::sync::atomic::{AtomicI8, Ordering};
 
 use crate::spin_barrier::SpinBarrier;
 
-use quip_miner_core::{IsingGraph, SampleParams, SamplerResult};
 use quip_protocol::scoring::energy_milli;
+use quip_solver_core::{IsingGraph, SampleParams, SamplerResult};
 
 use crate::coloring::Coloring;
 use crate::sampler_core::CpuGraph;
@@ -382,7 +382,7 @@ pub fn sample_gibbs_with(
 mod tests {
     use super::*;
     use crate::sampler_core::CpuGraph;
-    use quip_miner_core::IsingGraph;
+    use quip_solver_core::IsingGraph;
 
     fn atomics(vals: &[i8]) -> Vec<AtomicI8> {
         vals.iter().map(|&v| AtomicI8::new(v)).collect()

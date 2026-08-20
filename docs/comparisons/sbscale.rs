@@ -1,6 +1,6 @@
 //! SB read-level parallelism: reads are independent trajectories, so splitting
 //! 16 reads across T threads needs no kernel change and no synchronisation.
-use quip_miner_core::{IsingGraph, SampleParams};
+use quip_solver_core::{IsingGraph, SampleParams};
 use quip_miner_cpu::{sample_sb, DSB};
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};

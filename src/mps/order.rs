@@ -7,7 +7,7 @@
 //! a sparse eigensolver, and a factor of two does not rescue a case that misses
 //! its budget by three orders of magnitude.
 
-use quip_miner_core::IsingGraph;
+use quip_solver_core::IsingGraph;
 
 /// Reverse Cuthill-McKee ordering. `order[k]` is the original node at chain
 /// slot `k`.
@@ -337,7 +337,10 @@ mod tests {
         for w in spans.windows(2) {
             assert!(w[0] <= w[1], "gates not sorted by span: {spans:?}");
         }
-        assert_eq!(chain.span_sum(), spans.iter().map(|&x| u64::from(x)).sum());
+        assert_eq!(
+            chain.span_sum(),
+            spans.iter().map(|&x| u64::from(x)).sum::<u64>()
+        );
     }
 
     #[test]

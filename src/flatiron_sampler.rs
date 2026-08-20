@@ -4,11 +4,10 @@
 //! experimental kernels stay isolated from the SA and Gibbs path, borrowing
 //! only the shared streaming pump and the greedy polish.
 
-use quip_miner_core::{
-    BackendIdentity, CancelGuard, IsingGraph, SampleParams, Sampler, SamplerResult, StreamJob,
-    StreamResult,
+use quip_solver_core::{
+    BackendIdentity, CancelToken, IsingGraph, SampleError, SampleParams, Sampler, SamplerResult,
+    StreamJob, StreamResult,
 };
-use quip_proto::v1::RejectReason;
 
 use crate::flatiron::{sample_ising_flatiron, FlatironConfig};
 use crate::mps_sampler::CPU_MPS_ADAPT;
@@ -25,6 +24,7 @@ pub const CPU_FLATIRON_IDENTITY: BackendIdentity = BackendIdentity {
     algorithm: "flatiron",
     max_nodes: 65_536,
     max_edges: 524_288,
+    features: &[],
     adapt: CPU_MPS_ADAPT,
 };
 
@@ -42,10 +42,9 @@ impl FlatironSampler {
     ///
     /// ```
     /// use quip_miner_cpu::{FlatironConfig, FlatironSampler, IsingGraph, SampleParams};
-    /// use quip_miner_core::Sampler;
-    /// use quip_proto::v1::RejectReason;
+    /// use quip_solver_core::{SampleError, Sampler};
     ///
-    /// # fn main() -> Result<(), RejectReason> {
+    /// # fn main() -> Result<(), SampleError> {
     /// let sampler = FlatironSampler::new(FlatironConfig::new(8));
     /// let graph = IsingGraph::new(vec![0.0, 0.0], vec![-1.0], vec![(0, 1)]);
     /// let params = SampleParams { num_reads: 2, num_sweeps: 64, seed: 1, ..Default::default() };
@@ -64,7 +63,7 @@ impl Sampler for FlatironSampler {
         &self,
         graph: &IsingGraph,
         params: &SampleParams,
-    ) -> Result<Vec<SamplerResult>, RejectReason> {
+    ) -> Result<Vec<SamplerResult>, SampleError> {
         Ok(sample_ising_flatiron(graph, params, &self.cfg))
     }
 
@@ -73,11 +72,18 @@ impl Sampler for FlatironSampler {
         std::thread::available_parallelism().map_or(1, |n| n.get())
     }
 
+    /// Host parallelism, exactly what [`Self::stream_width`] reports: no
+    /// device, no config knob, so the declared and live answers never
+    /// disagree.
+    fn declared_stream_width() -> u32 {
+        u32::try_from(crate::host_parallelism()).unwrap_or(u32::MAX)
+    }
+
     fn sample_stream(
         &self,
         jobs: tokio::sync::mpsc::Receiver<StreamJob>,
         out: tokio::sync::mpsc::Sender<StreamResult>,
-        cancel: CancelGuard,
+        cancel: CancelToken,
     ) {
         let cfg = self.cfg;
         run_stream_pump(
@@ -93,7 +99,7 @@ impl Sampler for FlatironSampler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use quip_miner_core::StreamOutcome;
+    use quip_solver_core::StreamOutcome;
     use std::time::Duration;
 
     fn test_cfg() -> FlatironConfig {
@@ -157,14 +163,14 @@ mod tests {
                 job_id: job_id.clone(),
                 graph: tiny_ferro(),
                 params: tiny_params(2),
-                generation: 0,
+                watermark: None,
             })
             .await
             .expect("send StreamJob");
         drop(job_tx);
 
         let pump = tokio::task::spawn_blocking(move || {
-            sampler.sample_stream(job_rx, out_tx, CancelGuard::default());
+            sampler.sample_stream(job_rx, out_tx, CancelToken::default());
         });
 
         let got = tokio::time::timeout(Duration::from_secs(30), out_rx.recv())
@@ -194,7 +200,7 @@ mod tests {
         let (job_tx, job_rx) = tokio::sync::mpsc::channel::<StreamJob>(1);
         let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<StreamResult>(1);
 
-        let cancel = CancelGuard::default();
+        let cancel = CancelToken::default();
         cancel.cancel_through(7);
 
         job_tx
@@ -202,7 +208,7 @@ mod tests {
                 job_id: b"job-flatiron-cancelled".to_vec(),
                 graph: tiny_ferro(),
                 params: tiny_params(1),
-                generation: 7,
+                watermark: Some(7),
             })
             .await
             .expect("send StreamJob");

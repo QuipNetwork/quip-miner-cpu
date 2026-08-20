@@ -12,8 +12,8 @@
 //! what makes the H3 seeding comparison meaningful.
 
 use clap::Parser;
-use quip_miner_core::{run, CommonArgs};
 use quip_miner_cpu::{MpsConfig, MpsSampler, CPU_MFA_IDENTITY};
+use quip_solver_core::{run, CommonArgs};
 use std::process::ExitCode;
 
 #[derive(Parser)]

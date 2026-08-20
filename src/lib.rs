@@ -5,7 +5,7 @@
 //! - `quip-cpu-gibbs` — heat-bath single-site Gibbs over the same ladder
 //! - `quip-cpu-sb` — discrete Simulated Bifurcation
 //!
-//! The coordinator session loop lives in `quip-miner-core`; this crate provides
+//! The coordinator session loop lives in `quip-solver-core`; this crate provides
 //! the [`CpuSampler`] and [`SbSampler`] backends and the three binaries. All of
 //! them stream jobs through one shared pump, so cancellation and panic
 //! propagation cannot drift between them.
@@ -26,18 +26,17 @@ pub use flatiron_sampler::{FlatironSampler, CPU_FLATIRON_IDENTITY};
 pub use gibbs_parallel::{ConfigError, GibbsConfig, GibbsParallelism};
 pub use mps::{sample_ising_mps, InitMode, MpsConfig};
 pub use mps_sampler::{MpsSampler, CPU_MFA_IDENTITY, CPU_MPS_IDENTITY};
-pub use quip_miner_core::{Algorithm, IsingGraph, SampleParams, SamplerResult};
+pub use quip_solver_core::{Algorithm, IsingGraph, SampleParams, SamplerResult};
 pub use sampler_core::sample_ising;
 pub use sb_core::{sample_sb, sample_sb_with_workers, Coupling, SbVariant, BSB, DSB, HBSB, HDSB};
 pub use sb_sampler::{
     SbSampler, CPU_BSB_IDENTITY, CPU_HBSB_IDENTITY, CPU_HDSB_IDENTITY, CPU_SB_IDENTITY,
 };
 
-use quip_miner_core::adapt::AdaptBounds;
-use quip_miner_core::{
-    BackendIdentity, CancelGuard, Sampler, StreamJob, StreamOutcome, StreamResult,
+use quip_solver_core::adapt::AdaptBounds;
+use quip_solver_core::{
+    BackendIdentity, CancelToken, SampleError, Sampler, StreamJob, StreamOutcome, StreamResult,
 };
-use quip_proto::v1::RejectReason;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -69,6 +68,8 @@ pub const CPU_SA_IDENTITY: BackendIdentity = BackendIdentity {
     algorithm: "sa",
     max_nodes: DEFAULT_MAX_NODES,
     max_edges: DEFAULT_MAX_EDGES,
+    // A real multi-lane `sample_stream` override; no utilization governor.
+    features: &["streaming"],
     adapt: CPU_ADAPT,
 };
 
@@ -78,8 +79,23 @@ pub const CPU_GIBBS_IDENTITY: BackendIdentity = BackendIdentity {
     algorithm: "gibbs",
     max_nodes: DEFAULT_MAX_NODES,
     max_edges: DEFAULT_MAX_EDGES,
+    // Same capability set as `CPU_SA_IDENTITY`.
+    features: &["streaming"],
     adapt: CPU_ADAPT,
 };
+
+/// Why a stream kernel returned no samples.
+///
+/// `Cancelled` reports the token observed at a kernel checkpoint; `Reject`
+/// carries the per-job [`SampleError`] the session maps to a wire reject —
+/// the stream-path analog of what [`Sampler::sample`] returns, so the two
+/// paths cannot classify the same condition differently.
+pub(crate) enum StreamKernelError {
+    /// The kernel observed the cancel token and aborted the attempt.
+    Cancelled,
+    /// The backend refuses this job; the session rejects it on the wire.
+    Reject(SampleError),
+}
 
 /// Shared streaming pump for every CPU sampler.
 ///
@@ -93,22 +109,22 @@ pub const CPU_GIBBS_IDENTITY: BackendIdentity = BackendIdentity {
 /// applies `Configure.backend_toml` before any job, so a `num_cpus` setting
 /// is visible when the workers start.
 ///
-/// Both `CpuSampler` and `SbSampler` call this, so the cancellation and
+/// Every CPU sampler type calls this, so the cancellation and
 /// panic-propagation semantics cannot drift between binaries.
 fn run_stream_pump<K, F>(
     width: F,
     kernel: K,
     mut jobs: tokio::sync::mpsc::Receiver<StreamJob>,
     out: tokio::sync::mpsc::Sender<StreamResult>,
-    cancel: CancelGuard,
+    cancel: CancelToken,
 ) where
     F: FnOnce() -> usize,
     K: Fn(
             &IsingGraph,
             &SampleParams,
-            &CancelGuard,
-            u64,
-        ) -> Result<Vec<SamplerResult>, sampler_core::SampleCancelled>
+            &CancelToken,
+            Option<u64>,
+        ) -> Result<Vec<SamplerResult>, StreamKernelError>
         + Send
         + Sync
         + Clone
@@ -128,11 +144,37 @@ fn run_stream_pump<K, F>(
             std::thread::spawn(move || {
                 for j in work_rx.iter() {
                     let t0 = std::time::Instant::now();
-                    let outcome = match kernel(&j.graph, &j.params, &cancel, j.generation) {
-                        Ok(samples) => StreamOutcome::Completed(Ok(samples)),
-                        Err(sampler_core::SampleCancelled) => StreamOutcome::Cancelled,
-                    };
+                    let step = kernel(&j.graph, &j.params, &cancel, j.watermark);
                     let device_access_time_us = t0.elapsed().as_micros() as u64;
+                    let outcome = match step {
+                        Err(StreamKernelError::Cancelled) => StreamOutcome::Cancelled,
+                        // Post-run check, mirroring the upstream default
+                        // `sample_stream`: a cancel raised while the kernel
+                        // ran — or against a kernel that never polls the
+                        // token — must suppress the completion, or a reseed
+                        // can score a stale generation.
+                        Ok(samples) => {
+                            if cancel.is_cancelled(j.watermark) {
+                                StreamOutcome::Cancelled
+                            } else {
+                                StreamOutcome::Completed(Ok(samples))
+                            }
+                        }
+                        Err(StreamKernelError::Reject(e)) => {
+                            // A cancel also wins over a per-job reject unless
+                            // the error is session-fatal (upstream keeps a
+                            // `DeviceFault` visible through a cancel).
+                            let fatal = match &e {
+                                SampleError::DeviceFault(_) => true,
+                                SampleError::Capacity | SampleError::DeviceBusy => false,
+                            };
+                            if cancel.is_cancelled(j.watermark) && !fatal {
+                                StreamOutcome::Cancelled
+                            } else {
+                                StreamOutcome::Completed(Err(e))
+                            }
+                        }
+                    };
                     if out
                         .blocking_send(StreamResult {
                             job_id: j.job_id,
@@ -161,7 +203,7 @@ fn run_stream_pump<K, F>(
         // Abandoned generations are dropped here, before a worker ever
         // touches the graph: a reseed can leave the queue full of stale
         // nonces, and sampling one would waste the round for nothing.
-        if cancel.is_cancelled(j.generation) {
+        if cancel.is_cancelled(j.watermark) {
             if out
                 .blocking_send(StreamResult {
                     job_id: j.job_id,
@@ -223,7 +265,11 @@ struct CpuBackendConfig {
     unknown: BTreeMap<String, toml::Value>,
 }
 
-fn host_parallelism() -> usize {
+/// `pub(crate)`: also the base of `declared_stream_width` on both CPU sampler
+/// types — [`CpuSampler`] (SA) advertises it whole, [`GibbsCpuSampler`]
+/// divides it by the default worker count (see
+/// [`Sampler::declared_stream_width`]).
+pub(crate) fn host_parallelism() -> usize {
     std::thread::available_parallelism().map_or(1, |n| n.get())
 }
 
@@ -239,7 +285,7 @@ fn parse_num_cpus(backend_toml: &str) -> Result<Option<usize>, NumCpusError> {
     }
     let cfg: CpuBackendConfig =
         toml::from_str(backend_toml).map_err(|_| NumCpusError::InvalidToml)?;
-    quip_miner_core::config::warn_unknown_fields("cpu", cfg.unknown.keys());
+    quip_solver_core::config::warn_unknown_fields("cpu", cfg.unknown.keys());
     match cfg.num_cpus {
         None => Ok(None),
         Some(n) if n <= 0 => Err(NumCpusError::NonPositive { requested: n }),
@@ -263,10 +309,9 @@ impl CpuSampler {
     ///
     /// ```
     /// use quip_miner_cpu::{Algorithm, CpuSampler, IsingGraph, SampleParams};
-    /// use quip_miner_core::Sampler;
-    /// use quip_proto::v1::RejectReason;
+    /// use quip_solver_core::{SampleError, Sampler};
     ///
-    /// # fn main() -> Result<(), RejectReason> {
+    /// # fn main() -> Result<(), SampleError> {
     /// let sampler = CpuSampler::new(Algorithm::Sa);
     /// let graph = IsingGraph::new(vec![0.0, 0.0], vec![-1.0], vec![(0, 1)]);
     /// let params = SampleParams {
@@ -341,12 +386,13 @@ impl Sampler for CpuSampler {
         &self,
         graph: &IsingGraph,
         params: &SampleParams,
-    ) -> Result<Vec<SamplerResult>, RejectReason> {
+    ) -> Result<Vec<SamplerResult>, SampleError> {
         if self.algorithm == Algorithm::Gibbs {
-            // A colour budget the graph cannot meet is a property of the job,
-            // not of the miner, so it rejects that job rather than exiting.
+            // A colour budget the graph cannot meet is a size bound: an
+            // identical job (same graph) fails again identically, which is
+            // what Capacity means.
             return gibbs_parallel::sample_gibbs_with(graph, params, &self.gibbs)
-                .map_err(|_| RejectReason::Malformed);
+                .map_err(|_| SampleError::Capacity);
         }
         Ok(sample_ising(graph, params, self.algorithm))
     }
@@ -371,6 +417,17 @@ impl Sampler for CpuSampler {
         }
     }
 
+    /// Host parallelism, the same default [`Self::stream_width`] resolves to
+    /// before any `num_cpus` override.
+    ///
+    /// Right for the SA binary, whose live width is the whole core budget.
+    /// The Gibbs binary wraps this type in [`GibbsCpuSampler`] to declare its
+    /// divided width instead — `--capabilities` runs with no instance, so a
+    /// per-algorithm answer needs a type per binary.
+    fn declared_stream_width() -> u32 {
+        u32::try_from(host_parallelism()).unwrap_or(u32::MAX)
+    }
+
     fn apply_config(&self, backend_toml: &str) {
         if let Err(e) = self.apply_num_cpus(backend_toml) {
             tracing::error!(error = %e, "cpu num_cpus rejected");
@@ -382,22 +439,27 @@ impl Sampler for CpuSampler {
         &self,
         jobs: tokio::sync::mpsc::Receiver<StreamJob>,
         out: tokio::sync::mpsc::Sender<StreamResult>,
-        cancel: CancelGuard,
+        cancel: CancelToken,
     ) {
         let algorithm = self.algorithm;
         let gibbs = self.gibbs;
         run_stream_pump(
             || self.stream_width(),
-            move |g, p, guard, generation| {
+            move |g, p, token, watermark| {
                 if algorithm == Algorithm::Gibbs {
-                    Ok(gibbs_parallel::sample_gibbs_with(g, p, &gibbs).unwrap_or_default())
+                    // Same mapping as `sample`: a colour budget the graph
+                    // cannot meet is a size bound (`Capacity`), not an empty
+                    // completion the coordinator would count as a served job.
+                    gibbs_parallel::sample_gibbs_with(g, p, &gibbs)
+                        .map_err(|_| StreamKernelError::Reject(SampleError::Capacity))
                 } else {
                     sampler_core::sample_ising_cancellable(
                         g,
                         p,
                         algorithm,
-                        Some((guard, generation)),
+                        Some((token, watermark)),
                     )
+                    .map_err(|_| StreamKernelError::Cancelled)
                 }
             },
             jobs,
@@ -407,10 +469,63 @@ impl Sampler for CpuSampler {
     }
 }
 
+/// `quip-cpu-gibbs`'s sampler type: a [`CpuSampler`] that declares the
+/// Gibbs-shaped stream width.
+///
+/// [`Sampler::declared_stream_width`] is associated — `--capabilities`
+/// answers it with no instance — so a width that differs per algorithm needs
+/// a type per binary. This wrapper divides host parallelism by the default
+/// worker count the same way the live [`CpuSampler::stream_width`] does for
+/// Gibbs. A `gibbs_workers` or `num_cpus` override still moves the live
+/// width, and the session then logs the designed misdeclaration signal.
+///
+/// Delegation covers exactly the methods `CpuSampler` overrides (`sample`,
+/// `stream_width`, `apply_config`, `sample_stream`); a new override on
+/// `CpuSampler` needs a matching delegation here.
+pub struct GibbsCpuSampler(
+    /// The wrapped sampler, constructed with [`Algorithm::Gibbs`].
+    pub CpuSampler,
+);
+
+impl Sampler for GibbsCpuSampler {
+    fn sample(
+        &self,
+        graph: &IsingGraph,
+        params: &SampleParams,
+    ) -> Result<Vec<SamplerResult>, SampleError> {
+        self.0.sample(graph, params)
+    }
+
+    fn stream_width(&self) -> usize {
+        self.0.stream_width()
+    }
+
+    /// One model per default-`gibbs.workers` group of cores: the value
+    /// [`CpuSampler::stream_width`] resolves to for Gibbs before any
+    /// `num_cpus` or `gibbs_workers` override.
+    fn declared_stream_width() -> u32 {
+        let width = (host_parallelism() / gibbs_parallel::DEFAULT_GIBBS_WORKERS).max(1);
+        u32::try_from(width).unwrap_or(u32::MAX)
+    }
+
+    fn apply_config(&self, backend_toml: &str) {
+        self.0.apply_config(backend_toml);
+    }
+
+    fn sample_stream(
+        &self,
+        jobs: tokio::sync::mpsc::Receiver<StreamJob>,
+        out: tokio::sync::mpsc::Sender<StreamResult>,
+        cancel: CancelToken,
+    ) {
+        self.0.sample_stream(jobs, out, cancel);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use quip_miner_core::{Sampler, StreamJob, StreamOutcome, StreamResult};
+    use quip_solver_core::{Sampler, StreamJob, StreamOutcome, StreamResult};
     use std::time::Duration;
 
     fn tiny_ferro() -> IsingGraph {
@@ -449,6 +564,28 @@ mod tests {
     fn stream_width_is_at_least_one() {
         let sampler = CpuSampler::new(Algorithm::Gibbs);
         assert!(sampler.stream_width() >= 1);
+    }
+
+    /// The advertised and default live widths must agree, or every default
+    /// SA session logs a misdeclaration error (SPEC section 8: the
+    /// `--capabilities` answer and the in-session reply are one message).
+    #[test]
+    fn sa_declared_width_matches_default_live_width() {
+        let sampler = CpuSampler::new(Algorithm::Sa);
+        assert_eq!(
+            CpuSampler::declared_stream_width(),
+            u32::try_from(sampler.stream_width()).unwrap_or(u32::MAX)
+        );
+    }
+
+    /// Same agreement for the Gibbs binary's wrapper type.
+    #[test]
+    fn gibbs_declared_width_matches_default_live_width() {
+        let sampler = GibbsCpuSampler(CpuSampler::new(Algorithm::Gibbs));
+        assert_eq!(
+            GibbsCpuSampler::declared_stream_width(),
+            u32::try_from(sampler.stream_width()).unwrap_or(u32::MAX)
+        );
     }
 
     #[test]
@@ -513,7 +650,7 @@ mod tests {
                 job_id: job_id.clone(),
                 graph: tiny_ferro(),
                 params: tiny_params(1),
-                generation: 0,
+                watermark: None,
             })
             .await
             .expect("send StreamJob");
@@ -521,7 +658,7 @@ mod tests {
         drop(job_tx);
 
         let pump = tokio::task::spawn_blocking(move || {
-            sampler.sample_stream(job_rx, out_tx, CancelGuard::default());
+            sampler.sample_stream(job_rx, out_tx, CancelToken::default());
         });
 
         let got = tokio::time::timeout(Duration::from_secs(30), out_rx.recv())
@@ -558,7 +695,7 @@ mod tests {
     async fn run_stream_pump_cancels_abandoned_generations_before_sampling() {
         let (job_tx, job_rx) = tokio::sync::mpsc::channel::<StreamJob>(1);
         let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<StreamResult>(1);
-        let cancel = CancelGuard::default();
+        let cancel = CancelToken::default();
         cancel.cancel_through(7);
 
         let job_id = b"job-stale".to_vec();
@@ -567,7 +704,7 @@ mod tests {
                 job_id: job_id.clone(),
                 graph: tiny_ferro(),
                 params: tiny_params(1),
-                generation: 7,
+                watermark: Some(7),
             })
             .await
             .expect("send StreamJob");
@@ -600,6 +737,101 @@ mod tests {
             .expect("spawn_blocking join");
     }
 
+    /// Hypothesis: a per-job refusal from the kernel reaches the wire as a
+    /// reject, not an empty completion the coordinator would count as a
+    /// served job.
+    #[tokio::test]
+    async fn kernel_reject_passes_through_the_pump_as_an_error() {
+        let (job_tx, job_rx) = tokio::sync::mpsc::channel::<StreamJob>(1);
+        let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<StreamResult>(1);
+        job_tx
+            .send(StreamJob {
+                job_id: b"job-too-big".to_vec(),
+                graph: tiny_ferro(),
+                params: tiny_params(1),
+                watermark: None,
+            })
+            .await
+            .expect("send StreamJob");
+        drop(job_tx);
+
+        let pump = tokio::task::spawn_blocking(move || {
+            run_stream_pump(
+                || 1,
+                |_, _, _, _| Err(StreamKernelError::Reject(SampleError::Capacity)),
+                job_rx,
+                out_tx,
+                CancelToken::default(),
+            );
+        });
+
+        let got = tokio::time::timeout(Duration::from_secs(30), out_rx.recv())
+            .await
+            .expect("timeout waiting for StreamResult")
+            .expect("output channel closed without a result");
+        assert!(
+            matches!(
+                got.outcome,
+                StreamOutcome::Completed(Err(SampleError::Capacity))
+            ),
+            "a kernel reject must pass through as a per-job error"
+        );
+
+        tokio::time::timeout(Duration::from_secs(30), pump)
+            .await
+            .expect("timeout waiting for run_stream_pump to exit")
+            .expect("spawn_blocking join");
+    }
+
+    /// Hypothesis: a cancel that lands while the kernel is running — or
+    /// against a kernel that never polls the token — suppresses the
+    /// completion, mirroring the upstream default `sample_stream`. Otherwise
+    /// a reseed can score a stale generation.
+    #[tokio::test]
+    async fn cancel_during_kernel_run_suppresses_the_result() {
+        let (job_tx, job_rx) = tokio::sync::mpsc::channel::<StreamJob>(1);
+        let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<StreamResult>(1);
+        job_tx
+            .send(StreamJob {
+                job_id: b"job-race".to_vec(),
+                graph: tiny_ferro(),
+                params: tiny_params(1),
+                watermark: Some(5),
+            })
+            .await
+            .expect("send StreamJob");
+        drop(job_tx);
+
+        let pump = tokio::task::spawn_blocking(move || {
+            run_stream_pump(
+                || 1,
+                |g, p, token, _| {
+                    // The cancel lands mid-run: raise it from inside the
+                    // kernel, then complete normally.
+                    token.cancel_through(5);
+                    Ok(sample_ising(g, p, Algorithm::Sa))
+                },
+                job_rx,
+                out_tx,
+                CancelToken::default(),
+            );
+        });
+
+        let got = tokio::time::timeout(Duration::from_secs(30), out_rx.recv())
+            .await
+            .expect("timeout waiting for StreamResult")
+            .expect("output channel closed without a result");
+        assert!(
+            matches!(got.outcome, StreamOutcome::Cancelled),
+            "a cancel raised during the run must suppress the completion"
+        );
+
+        tokio::time::timeout(Duration::from_secs(30), pump)
+            .await
+            .expect("timeout waiting for run_stream_pump to exit")
+            .expect("spawn_blocking join");
+    }
+
     /// An in-flight SA job must abort at a sweep checkpoint instead of
     /// running to completion. The job returns `Cancelled` so the coordinator
     /// credit path stays the same as the dequeue cancel.
@@ -608,7 +840,7 @@ mod tests {
         let sampler = CpuSampler::new(Algorithm::Sa);
         let (job_tx, job_rx) = tokio::sync::mpsc::channel::<StreamJob>(1);
         let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<StreamResult>(1);
-        let cancel = CancelGuard::default();
+        let cancel = CancelToken::default();
         let cancel_for_pump = cancel.clone();
 
         // A 400-node chain with many sweeps cannot finish in the cancel
@@ -630,7 +862,7 @@ mod tests {
                     seed: 7,
                     ..Default::default()
                 },
-                generation: 3,
+                watermark: Some(3),
             })
             .await
             .expect("send StreamJob");
@@ -660,7 +892,7 @@ mod tests {
             .expect("spawn_blocking join");
     }
 
-    /// A live CancelGuard that never fires must not change the RNG stream or
+    /// A live CancelToken that never fires must not change the RNG stream or
     /// the flip order. Results stay bit-identical to [`sample_ising`].
     #[test]
     fn uncancelled_guard_matches_sample_ising_bit_for_bit() {
@@ -672,12 +904,12 @@ mod tests {
             ..Default::default()
         };
         let baseline = sample_ising(&graph, &params, Algorithm::Sa);
-        let guard = CancelGuard::default();
+        let guard = CancelToken::default();
         let live = sampler_core::sample_ising_cancellable(
             &graph,
             &params,
             Algorithm::Sa,
-            Some((&guard, 4)),
+            Some((&guard, Some(4))),
         )
         .expect("a live generation must not cancel");
         assert_eq!(baseline.len(), live.len());
@@ -694,7 +926,7 @@ mod tests {
     /// completed attempt after that contention.
     #[test]
     fn cpu_adapt_attempt_fits_a_cancelled_round() {
-        use quip_miner_core::adapt::adapt_params;
+        use quip_solver_core::adapt::adapt_params;
 
         let p = adapt_params(-14_518_191, 1, 4577, 41515, &[0], &CPU_ADAPT);
         let product = u64::from(p.num_reads) * u64::from(p.num_sweeps);

@@ -1,4 +1,4 @@
-use quip_miner_core::{Algorithm, IsingGraph, SampleParams};
+use quip_solver_core::{Algorithm, IsingGraph, SampleParams};
 use quip_miner_cpu::{sample_ising, sample_sb, DSB};
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};

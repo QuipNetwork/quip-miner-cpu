@@ -1,8 +1,10 @@
 //! CPU chromatic Gibbs miner (`quip-cpu-gibbs`).
 
 use clap::Parser;
-use quip_miner_core::{run, CommonArgs};
-use quip_miner_cpu::{Algorithm, CpuSampler, GibbsConfig, GibbsParallelism, CPU_GIBBS_IDENTITY};
+use quip_miner_cpu::{
+    Algorithm, CpuSampler, GibbsConfig, GibbsCpuSampler, GibbsParallelism, CPU_GIBBS_IDENTITY,
+};
+use quip_solver_core::{run, CommonArgs};
 use std::process::ExitCode;
 
 #[derive(Parser)]
@@ -53,6 +55,8 @@ fn main() -> ExitCode {
         return ExitCode::from(64);
     }
     run(CPU_GIBBS_IDENTITY, &cli.common, || {
-        Ok(CpuSampler::new(Algorithm::Gibbs).with_gibbs_config(gibbs))
+        Ok(GibbsCpuSampler(
+            CpuSampler::new(Algorithm::Gibbs).with_gibbs_config(gibbs),
+        ))
     })
 }

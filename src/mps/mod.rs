@@ -16,8 +16,8 @@
 
 use crate::sampler_core::{polish_from, CpuGraph};
 use order::ChainProblem;
-use quip_miner_core::{IsingGraph, SampleParams, SamplerResult};
 use quip_protocol::scoring::energy_milli;
+use quip_solver_core::{IsingGraph, SampleParams, SamplerResult};
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
 use state::Mps;

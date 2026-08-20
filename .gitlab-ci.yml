@@ -8,8 +8,6 @@ variables:
 default:
   image: rust:1.97
   tags: [linux, amd64]
-  before_script:
-    - apt-get update -qq && apt-get install -y -qq protobuf-compiler
 
 cache:
   key: cargo-$CI_COMMIT_REF_SLUG
@@ -33,7 +31,6 @@ cache:
     # so that line breaks every later login shell once the job is cleaned up.
     - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.97.1 --no-modify-path
     - source "$CARGO_HOME/env"
-    - brew install protobuf
 
 test:
   stage: test
@@ -71,7 +68,9 @@ build-linux-amd64:
 build-linux-arm64:
   extends: .build
   script:
-    - apt-get install -y -qq gcc-aarch64-linux-gnu
+    # The default before_script no longer runs apt-get (the protoc install is
+    # gone), so the cross-compiler install updates the package index itself.
+    - apt-get update -qq && apt-get install -y -qq gcc-aarch64-linux-gnu
     - rustup target add aarch64-unknown-linux-gnu
     - export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
     - cargo build --release --bins --target aarch64-unknown-linux-gnu

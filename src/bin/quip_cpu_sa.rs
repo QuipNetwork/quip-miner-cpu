@@ -1,8 +1,8 @@
 //! CPU simulated-annealing miner (`quip-cpu-sa`).
 
 use clap::Parser;
-use quip_miner_core::{run, CommonArgs};
 use quip_miner_cpu::{Algorithm, CpuSampler, CPU_SA_IDENTITY};
+use quip_solver_core::{run, CommonArgs};
 use std::process::ExitCode;
 
 #[derive(Parser)]

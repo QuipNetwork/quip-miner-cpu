@@ -11,13 +11,13 @@
 //!   reads run sequentially and cache-local on a single core.
 //!
 //! Types (`Algorithm`, `SampleParams`, `SamplerResult`, base `IsingGraph`) and
-//! the beta schedule come from `quip-miner-core`; this module keeps only the
+//! the beta schedule come from `quip-solver-core`; this module keeps only the
 //! CPU annealing kernels and a private adjacency (`CpuGraph`) built from the
 //! base graph.
 
-use quip_miner_core::beta::{default_ising_beta_range, geometric_beta_schedule};
-use quip_miner_core::{Algorithm, CancelGuard, IsingGraph, SampleParams, SamplerResult};
 use quip_protocol::scoring::energy_milli;
+use quip_solver_core::beta::{default_ising_beta_range, geometric_beta_schedule};
+use quip_solver_core::{Algorithm, CancelToken, IsingGraph, SampleParams, SamplerResult};
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
 
@@ -170,7 +170,7 @@ fn anneal_one_read(
     beta_schedule: &[f64],
     sweeps_per_beta: usize,
     rng: &mut SmallRng,
-    cancel: Option<(&CancelGuard, u64)>,
+    cancel: Option<(&CancelToken, Option<u64>)>,
 ) -> Result<Vec<i8>, SampleCancelled> {
     let n = graph.num_nodes();
     let mut spins = random_spins(n, rng);
@@ -198,8 +198,8 @@ fn anneal_one_read(
         for _ in 0..sweeps_per_beta {
             // One Relaxed load per sweep, never per spin flip. A sweep is
             // O(n) work, so this is the budget the protocol comment asked for.
-            if let Some((guard, generation)) = cancel {
-                if guard.is_cancelled(generation) {
+            if let Some((guard, watermark)) = cancel {
+                if guard.is_cancelled(watermark) {
                     return Err(SampleCancelled);
                 }
             }
@@ -297,7 +297,7 @@ pub(crate) fn sample_ising_cancellable(
     graph: &IsingGraph,
     params: &SampleParams,
     algorithm: Algorithm,
-    cancel: Option<(&CancelGuard, u64)>,
+    cancel: Option<(&CancelToken, Option<u64>)>,
 ) -> Result<Vec<SamplerResult>, SampleCancelled> {
     if algorithm == Algorithm::Gibbs {
         // Gibbs keeps its own worker/barrier loop. A mid-sweep return from
@@ -317,8 +317,8 @@ pub(crate) fn sample_ising_cancellable(
 
     let mut results = Vec::with_capacity(num_reads);
     for read_idx in 0..num_reads {
-        if let Some((guard, generation)) = cancel {
-            if guard.is_cancelled(generation) {
+        if let Some((guard, watermark)) = cancel {
+            if guard.is_cancelled(watermark) {
                 return Err(SampleCancelled);
             }
         }

@@ -107,8 +107,8 @@ the degeneracy. H3 reports the separation that appears once they do.
 The accepted-rate and paired best-energy comparison that decide H3 run through
 the campaign analysis script rather than through this repository.
 
-Shared protocol crates (`quip-proto`, `quip-protocol`, `quip-miner-core`) are
-git dependencies pinned to a `shared-vX.Y.Z` tag of `quip-protocol`.
+The Quip solver contract (`quip-proto`, `quip-protocol`, `quip-solver-core`) is
+published from crates.io.
 
 ## Running
 
@@ -165,7 +165,7 @@ cargo test --release
 ```
 
 Conformance/golden and handshake tests drive the binary in isolation via
-`quip-mock-coordinator` and check energies against `conformance/golden_vectors.json`.
+`quip-solver-conformance` and check energies against `conformance/golden_vectors.json`.
 
 ## License
 

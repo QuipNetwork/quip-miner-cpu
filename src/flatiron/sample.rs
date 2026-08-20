@@ -243,7 +243,7 @@ impl SamplingNet {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use quip_miner_core::IsingGraph;
+    use quip_solver_core::IsingGraph;
     use rand::SeedableRng;
 
     /// Exact per-site marginals by enumerating physical and bond indices.
