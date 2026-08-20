@@ -164,10 +164,7 @@ fn run_stream_pump<K, F>(
                             // A cancel also wins over a per-job reject unless
                             // the error is session-fatal (upstream keeps a
                             // `DeviceFault` visible through a cancel).
-                            let fatal = match &e {
-                                SampleError::DeviceFault(_) => true,
-                                SampleError::Capacity | SampleError::DeviceBusy => false,
-                            };
+                            let fatal = e.is_fatal();
                             if cancel.is_cancelled(j.watermark) && !fatal {
                                 StreamOutcome::Cancelled
                             } else {
