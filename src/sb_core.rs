@@ -31,8 +31,8 @@
 
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use quip_miner_core::{IsingGraph, SampleParams, SamplerResult};
 use quip_protocol::scoring::energy_milli;
+use quip_solver_core::{IsingGraph, SampleParams, SamplerResult};
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
 
@@ -108,7 +108,7 @@ pub const HBSB: SbVariant = SbVariant {
 /// self-loops `(u, u)` are skipped, and couplings shorter than the edge list
 /// read 0.
 ///
-/// This deliberately does not reuse `quip_miner_core::CsrGraph`, whose
+/// This deliberately does not reuse `quip_solver_core::CsrGraph`, whose
 /// `from_base` keeps self-loops. A self-loop in an SB neighbor row would inject
 /// a spurious self-force `-c0 j_uu sgn(x_u)` into that node and shift its
 /// bifurcation, while `energy_milli` scores the loop as an unoptimizable
@@ -1234,7 +1234,7 @@ mod tests {
     }
 
     /// Hypothesis: `SbGraph` repeats `CpuGraph`'s CSR construction rather than
-    /// reusing `quip_miner_core::CsrGraph`, whose `from_base` keeps self-loops.
+    /// reusing `quip_solver_core::CsrGraph`, whose `from_base` keeps self-loops.
     /// A self-loop in an SB neighbor row injects a spurious self-force
     /// `-c0 j_uu sgn(x_u)` that biases that node's bifurcation, while
     /// `energy_milli` scores the loop as an unoptimizable constant. This test

@@ -6,12 +6,11 @@
 //! streaming pump, so cancellation and panic propagation cannot drift between
 //! binaries.
 
-use quip_miner_core::adapt::AdaptBounds;
-use quip_miner_core::{
-    BackendIdentity, CancelGuard, IsingGraph, SampleParams, Sampler, SamplerResult, StreamJob,
-    StreamResult,
+use quip_solver_core::adapt::AdaptBounds;
+use quip_solver_core::{
+    BackendIdentity, CancelToken, IsingGraph, SampleError, SampleParams, Sampler, SamplerResult,
+    StreamJob, StreamResult,
 };
-use quip_proto::v1::RejectReason;
 
 use crate::sb_core::{sample_sb, SbVariant};
 use crate::{run_stream_pump, DEFAULT_MAX_EDGES, DEFAULT_MAX_NODES};
@@ -45,6 +44,7 @@ pub const CPU_SB_IDENTITY: BackendIdentity = BackendIdentity {
     algorithm: "sb",
     max_nodes: DEFAULT_MAX_NODES,
     max_edges: DEFAULT_MAX_EDGES,
+    features: &[],
     adapt: CPU_SB_ADAPT,
 };
 
@@ -58,6 +58,7 @@ pub const CPU_BSB_IDENTITY: BackendIdentity = BackendIdentity {
     algorithm: "bsb",
     max_nodes: DEFAULT_MAX_NODES,
     max_edges: DEFAULT_MAX_EDGES,
+    features: &[],
     adapt: CPU_SB_ADAPT,
 };
 
@@ -68,6 +69,7 @@ pub const CPU_HDSB_IDENTITY: BackendIdentity = BackendIdentity {
     algorithm: "hdsb",
     max_nodes: DEFAULT_MAX_NODES,
     max_edges: DEFAULT_MAX_EDGES,
+    features: &[],
     adapt: CPU_SB_ADAPT,
 };
 
@@ -81,6 +83,7 @@ pub const CPU_HBSB_IDENTITY: BackendIdentity = BackendIdentity {
     algorithm: "hbsb",
     max_nodes: DEFAULT_MAX_NODES,
     max_edges: DEFAULT_MAX_EDGES,
+    features: &[],
     adapt: CPU_SB_ADAPT,
 };
 
@@ -98,10 +101,9 @@ impl SbSampler {
     ///
     /// ```
     /// use quip_miner_cpu::{IsingGraph, SampleParams, SbSampler, DSB};
-    /// use quip_miner_core::Sampler;
-    /// use quip_proto::v1::RejectReason;
+    /// use quip_solver_core::{SampleError, Sampler};
     ///
-    /// # fn main() -> Result<(), RejectReason> {
+    /// # fn main() -> Result<(), SampleError> {
     /// let sampler = SbSampler::new(DSB);
     /// let graph = IsingGraph::new(vec![0.0, 0.0], vec![-1.0], vec![(0, 1)]);
     /// let params = SampleParams {
@@ -126,7 +128,7 @@ impl Sampler for SbSampler {
         &self,
         graph: &IsingGraph,
         params: &SampleParams,
-    ) -> Result<Vec<SamplerResult>, RejectReason> {
+    ) -> Result<Vec<SamplerResult>, SampleError> {
         Ok(sample_sb(graph, params, self.variant))
     }
 
@@ -135,11 +137,18 @@ impl Sampler for SbSampler {
         std::thread::available_parallelism().map_or(1, |n| n.get())
     }
 
+    /// Host parallelism, exactly what [`Self::stream_width`] reports: no
+    /// device, no config knob, so the declared and live answers never
+    /// disagree.
+    fn declared_stream_width() -> u32 {
+        u32::try_from(crate::host_parallelism()).unwrap_or(u32::MAX)
+    }
+
     fn sample_stream(
         &self,
         jobs: tokio::sync::mpsc::Receiver<StreamJob>,
         out: tokio::sync::mpsc::Sender<StreamResult>,
-        cancel: CancelGuard,
+        cancel: CancelToken,
     ) {
         let variant = self.variant;
         run_stream_pump(
@@ -157,7 +166,7 @@ mod tests {
     use super::*;
     use crate::sb_core::DSB;
     use crate::CPU_ADAPT;
-    use quip_miner_core::StreamOutcome;
+    use quip_solver_core::StreamOutcome;
     use std::time::Duration;
 
     fn tiny_ferro() -> IsingGraph {
@@ -175,7 +184,7 @@ mod tests {
 
     /// Hypothesis: the sb identity advertises the values the design fixed. The
     /// `algorithm` string reaches the coordinator in the Hello handshake and in
-    /// `--capabilities`, and nothing in `quip-miner-core` validates it, so this
+    /// `--capabilities`, and nothing in `quip-solver-core` validates it, so this
     /// test is the only guard on it.
     #[test]
     fn sb_identity_advertises_the_sb_algorithm_and_adapt_envelope() {
@@ -247,14 +256,14 @@ mod tests {
                 job_id: job_id.clone(),
                 graph: tiny_ferro(),
                 params: tiny_params(1),
-                generation: 0,
+                watermark: None,
             })
             .await
             .expect("send StreamJob");
         drop(job_tx);
 
         let pump = tokio::task::spawn_blocking(move || {
-            sampler.sample_stream(job_rx, out_tx, CancelGuard::default());
+            sampler.sample_stream(job_rx, out_tx, CancelToken::default());
         });
 
         let got = tokio::time::timeout(Duration::from_secs(30), out_rx.recv())

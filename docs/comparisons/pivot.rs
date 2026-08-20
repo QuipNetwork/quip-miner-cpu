@@ -1,4 +1,4 @@
-use quip_miner_core::{Algorithm, IsingGraph, SampleParams};
+use quip_solver_core::{Algorithm, IsingGraph, SampleParams};
 use quip_miner_cpu::gibbs_parallel::{sample_gibbs_parallel, DEFAULT_GIBBS_WORKERS};
 use quip_miner_cpu::{sample_ising, sample_sb, DSB};
 use rand::rngs::SmallRng;

@@ -1,7 +1,7 @@
 //! Annealing schedule: how `num_sweeps`, `sweeps_per_beta`, and `beta_range`
 //! become imaginary-time increments and a transverse-field ramp.
 //!
-//! The beta ladder is the same `quip_miner_core::beta` ladder the SA kernel
+//! The beta ladder is the same `quip_solver_core::beta` ladder the SA kernel
 //! uses, so `beta_range` means the same thing for every CPU backend. Imaginary
 //! time steps are the increments of that ladder, `eta_k = beta_k - beta_(k-1)`
 //! with `beta_0 = 0`, so the total imaginary time equals the final beta.
@@ -11,8 +11,8 @@
 //! increment makes every gate the identity, so running one would cost time and
 //! change nothing.
 
-use quip_miner_core::beta::{default_ising_beta_range, geometric_beta_schedule};
-use quip_miner_core::{IsingGraph, SampleParams};
+use quip_solver_core::beta::{default_ising_beta_range, geometric_beta_schedule};
+use quip_solver_core::{IsingGraph, SampleParams};
 
 /// Trotter-step cap. Imaginary-time evolution reaches the ground state of a
 /// 30-spin transverse-field model in tens of steps, so spending thousands would

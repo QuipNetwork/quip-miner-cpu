@@ -7,8 +7,8 @@
 //! starting configurations, which is the H3 experiment's control arm.
 
 use clap::Parser;
-use quip_miner_core::{run, CommonArgs};
 use quip_miner_cpu::{MpsConfig, MpsSampler, CPU_MPS_IDENTITY};
+use quip_solver_core::{run, CommonArgs};
 use std::process::ExitCode;
 
 #[derive(Parser)]

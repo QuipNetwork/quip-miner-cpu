@@ -8,8 +8,6 @@ variables:
 default:
   image: rust:1.97
   tags: [linux, amd64]
-  before_script:
-    - apt-get update -qq && apt-get install -y -qq protobuf-compiler
 
 cache:
   key: cargo-$CI_COMMIT_REF_SLUG
@@ -33,7 +31,6 @@ cache:
     # so that line breaks every later login shell once the job is cleaned up.
     - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.97.1 --no-modify-path
     - source "$CARGO_HOME/env"
-    - brew install protobuf
 
 test:
   stage: test

@@ -1,8 +1,8 @@
 //! CPU ballistic simulated-bifurcation miner (`quip-cpu-bsb`).
 
 use clap::Parser;
-use quip_miner_core::{run, CommonArgs};
 use quip_miner_cpu::{SbSampler, BSB, CPU_BSB_IDENTITY};
+use quip_solver_core::{run, CommonArgs};
 use std::process::ExitCode;
 
 #[derive(Parser)]

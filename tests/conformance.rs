@@ -1,7 +1,7 @@
-//! Protocol conformance: spawn SA and Gibbs miners against quip-mock-coordinator.
+//! Protocol conformance: spawn SA and Gibbs miners against quip-solver-conformance.
 
-use quip_mock_coordinator::driver::{drive_miner, DriverReport};
 use quip_proto::v1::RejectReason;
+use quip_solver_conformance::driver::{drive_miner, DriverReport};
 use std::process::Command;
 use std::sync::LazyLock;
 use tokio::sync::Mutex;
@@ -81,8 +81,8 @@ async fn quip_cpu_sa_passes_conformance() {
     assert!(report.handshake_ok, "SA handshake failed");
     assert_eq!(
         report.result_job_ids().len(),
-        3,
-        "expected 3 job results (job-1, job-2, job-hash)"
+        4,
+        "expected 4 job results (job-1, job-2, job-hash, job-sparse)"
     );
     assert!(
         report.result_job_ids().iter().any(|id| id == b"job-1"),
@@ -97,6 +97,11 @@ async fn quip_cpu_sa_passes_conformance() {
     assert!(
         report.result_job_ids().iter().any(|id| id == b"job-hash"),
         "missing result for topology-hash job-hash: {:?}",
+        report.result_job_ids()
+    );
+    assert!(
+        report.result_job_ids().iter().any(|id| id == b"job-sparse"),
+        "missing result for sparse-topology job-sparse: {:?}",
         report.result_job_ids()
     );
     assert!(
@@ -133,12 +138,13 @@ async fn quip_cpu_gibbs_passes_conformance() {
     assert!(report.handshake_ok, "Gibbs handshake failed");
     assert_eq!(
         report.result_job_ids().len(),
-        3,
-        "expected 3 job results (job-1, job-2, job-hash)"
+        4,
+        "expected 4 job results (job-1, job-2, job-hash, job-sparse)"
     );
     assert!(report.result_job_ids().iter().any(|id| id == b"job-1"));
     assert!(report.result_job_ids().iter().any(|id| id == b"job-2"));
     assert!(report.result_job_ids().iter().any(|id| id == b"job-hash"));
+    assert!(report.result_job_ids().iter().any(|id| id == b"job-sparse"));
     assert!(report.has_reject(b"job-bad-h", RejectReason::Malformed));
     assert!(report.has_reject(b"job-gate", RejectReason::UnsupportedKind));
     assert!(report.has_reject(b"job-old", RejectReason::Expired));
@@ -161,12 +167,13 @@ async fn quip_cpu_sb_passes_conformance() {
     assert!(report.handshake_ok, "SB handshake failed");
     assert_eq!(
         report.result_job_ids().len(),
-        3,
-        "expected 3 job results (job-1, job-2, job-hash)"
+        4,
+        "expected 4 job results (job-1, job-2, job-hash, job-sparse)"
     );
     assert!(report.result_job_ids().iter().any(|id| id == b"job-1"));
     assert!(report.result_job_ids().iter().any(|id| id == b"job-2"));
     assert!(report.result_job_ids().iter().any(|id| id == b"job-hash"));
+    assert!(report.result_job_ids().iter().any(|id| id == b"job-sparse"));
     assert!(report.has_reject(b"job-bad-h", RejectReason::Malformed));
     assert!(report.has_reject(b"job-gate", RejectReason::UnsupportedKind));
     assert!(report.has_reject(b"job-old", RejectReason::Expired));
@@ -225,8 +232,8 @@ async fn quip_cpu_bsb_passes_conformance() {
     assert!(report.handshake_ok, "bsb handshake failed");
     assert_eq!(
         report.result_job_ids().len(),
-        3,
-        "expected 3 job results (job-1, job-2, job-hash)"
+        4,
+        "expected 4 job results (job-1, job-2, job-hash, job-sparse)"
     );
     assert!(
         report.result_job_ids().iter().any(|id| id == b"job-1"),
@@ -241,6 +248,11 @@ async fn quip_cpu_bsb_passes_conformance() {
     assert!(
         report.result_job_ids().iter().any(|id| id == b"job-hash"),
         "missing result for topology-hash job-hash: {:?}",
+        report.result_job_ids()
+    );
+    assert!(
+        report.result_job_ids().iter().any(|id| id == b"job-sparse"),
+        "missing result for sparse-topology job-sparse: {:?}",
         report.result_job_ids()
     );
     assert!(
@@ -329,8 +341,8 @@ async fn quip_cpu_hdsb_passes_conformance() {
     assert!(report.handshake_ok, "HDSB handshake failed");
     assert_eq!(
         report.result_job_ids().len(),
-        3,
-        "expected 3 job results (job-1, job-2, job-hash)"
+        4,
+        "expected 4 job results (job-1, job-2, job-hash, job-sparse)"
     );
     assert!(
         report.result_job_ids().iter().any(|id| id == b"job-1"),
@@ -345,6 +357,11 @@ async fn quip_cpu_hdsb_passes_conformance() {
     assert!(
         report.result_job_ids().iter().any(|id| id == b"job-hash"),
         "missing result for topology-hash job-hash: {:?}",
+        report.result_job_ids()
+    );
+    assert!(
+        report.result_job_ids().iter().any(|id| id == b"job-sparse"),
+        "missing result for sparse-topology job-sparse: {:?}",
         report.result_job_ids()
     );
     assert!(
@@ -386,8 +403,8 @@ async fn quip_cpu_hbsb_passes_conformance() {
     assert!(report.handshake_ok, "HBSB handshake failed");
     assert_eq!(
         report.result_job_ids().len(),
-        3,
-        "expected 3 job results (job-1, job-2, job-hash)"
+        4,
+        "expected 4 job results (job-1, job-2, job-hash, job-sparse)"
     );
     assert!(
         report.result_job_ids().iter().any(|id| id == b"job-1"),
@@ -402,6 +419,11 @@ async fn quip_cpu_hbsb_passes_conformance() {
     assert!(
         report.result_job_ids().iter().any(|id| id == b"job-hash"),
         "missing result for topology-hash job-hash: {:?}",
+        report.result_job_ids()
+    );
+    assert!(
+        report.result_job_ids().iter().any(|id| id == b"job-sparse"),
+        "missing result for sparse-topology job-sparse: {:?}",
         report.result_job_ids()
     );
     assert!(
@@ -442,12 +464,13 @@ async fn quip_cpu_mps_passes_conformance() {
     assert!(report.handshake_ok, "mps handshake failed");
     assert_eq!(
         report.result_job_ids().len(),
-        3,
-        "expected 3 job results (job-1, job-2, job-hash)"
+        4,
+        "expected 4 job results (job-1, job-2, job-hash, job-sparse)"
     );
     assert!(report.result_job_ids().iter().any(|id| id == b"job-1"));
     assert!(report.result_job_ids().iter().any(|id| id == b"job-2"));
     assert!(report.result_job_ids().iter().any(|id| id == b"job-hash"));
+    assert!(report.result_job_ids().iter().any(|id| id == b"job-sparse"));
     assert!(report.has_reject(b"job-bad-h", RejectReason::Malformed));
     assert!(report.has_reject(b"job-gate", RejectReason::UnsupportedKind));
     assert!(report.has_reject(b"job-old", RejectReason::Expired));
@@ -475,12 +498,13 @@ async fn quip_cpu_flatiron_passes_conformance() {
     assert!(report.handshake_ok, "flatiron handshake failed");
     assert_eq!(
         report.result_job_ids().len(),
-        3,
-        "expected 3 job results (job-1, job-2, job-hash)"
+        4,
+        "expected 4 job results (job-1, job-2, job-hash, job-sparse)"
     );
     assert!(report.result_job_ids().iter().any(|id| id == b"job-1"));
     assert!(report.result_job_ids().iter().any(|id| id == b"job-2"));
     assert!(report.result_job_ids().iter().any(|id| id == b"job-hash"));
+    assert!(report.result_job_ids().iter().any(|id| id == b"job-sparse"));
     assert!(report.has_reject(b"job-bad-h", RejectReason::Malformed));
     assert!(report.has_reject(b"job-gate", RejectReason::UnsupportedKind));
     assert!(report.has_reject(b"job-old", RejectReason::Expired));
@@ -507,12 +531,13 @@ async fn quip_cpu_mfa_passes_conformance() {
     assert!(report.handshake_ok, "mfa handshake failed");
     assert_eq!(
         report.result_job_ids().len(),
-        3,
-        "expected 3 job results (job-1, job-2, job-hash)"
+        4,
+        "expected 4 job results (job-1, job-2, job-hash, job-sparse)"
     );
     assert!(report.result_job_ids().iter().any(|id| id == b"job-1"));
     assert!(report.result_job_ids().iter().any(|id| id == b"job-2"));
     assert!(report.result_job_ids().iter().any(|id| id == b"job-hash"));
+    assert!(report.result_job_ids().iter().any(|id| id == b"job-sparse"));
     assert!(report.has_reject(b"job-bad-h", RejectReason::Malformed));
     assert!(report.has_reject(b"job-gate", RejectReason::UnsupportedKind));
     assert!(report.has_reject(b"job-old", RejectReason::Expired));

@@ -5,7 +5,7 @@
 //! ordering pass, so no bandwidth cost; the price moves to vertex degree,
 //! which is what `select_chi` in `mod.rs` accounts for.
 
-use quip_miner_core::IsingGraph;
+use quip_solver_core::IsingGraph;
 
 /// The problem as a tensor network: cleaned nodes, merged bonds, adjacency.
 pub(crate) struct NetGraph {

@@ -7,8 +7,8 @@
 //! to measure exactly that degradation against the real corpora.
 
 use clap::Parser;
-use quip_miner_core::{run, CommonArgs};
 use quip_miner_cpu::{FlatironConfig, FlatironSampler, CPU_FLATIRON_IDENTITY};
+use quip_solver_core::{run, CommonArgs};
 use std::process::ExitCode;
 
 #[derive(Parser)]

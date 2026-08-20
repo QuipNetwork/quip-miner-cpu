@@ -1,6 +1,6 @@
 //! Gibbs read-level parallelism: whole reads to whole threads, one worker each,
 //! so the class barrier never runs. Compare against splitting classes.
-use quip_miner_core::{IsingGraph, SampleParams};
+use quip_solver_core::{IsingGraph, SampleParams};
 use quip_miner_cpu::gibbs_parallel::sample_gibbs_parallel;
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};

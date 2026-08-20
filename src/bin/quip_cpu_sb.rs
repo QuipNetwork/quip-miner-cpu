@@ -1,8 +1,8 @@
 //! CPU discrete Simulated Bifurcation miner (`quip-cpu-sb`).
 
 use clap::Parser;
-use quip_miner_core::{run, CommonArgs};
 use quip_miner_cpu::{SbSampler, CPU_SB_IDENTITY, DSB};
+use quip_solver_core::{run, CommonArgs};
 use std::process::ExitCode;
 
 #[derive(Parser)]

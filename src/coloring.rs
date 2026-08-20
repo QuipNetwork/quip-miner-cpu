@@ -73,7 +73,7 @@ impl Coloring {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use quip_miner_core::IsingGraph;
+    use quip_solver_core::IsingGraph;
 
     fn colored(g: &IsingGraph) -> (Coloring, CpuGraph) {
         let cpu = CpuGraph::from_base(g);

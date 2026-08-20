@@ -32,8 +32,8 @@
 use crate::mps::schedule;
 use crate::sampler_core::{polish_from, CpuGraph};
 use graph::NetGraph;
-use quip_miner_core::{IsingGraph, SampleParams, SamplerResult};
 use quip_protocol::scoring::energy_milli;
+use quip_solver_core::{IsingGraph, SampleParams, SamplerResult};
 use rand::rngs::SmallRng;
 use rand::SeedableRng;
 use sample::SamplingNet;

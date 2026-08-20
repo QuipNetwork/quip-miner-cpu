@@ -1,4 +1,4 @@
-use quip_miner_core::{IsingGraph, SampleParams};
+use quip_solver_core::{IsingGraph, SampleParams};
 use quip_miner_cpu::gibbs_parallel::{sample_gibbs_with, GibbsConfig, GibbsParallelism};
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};

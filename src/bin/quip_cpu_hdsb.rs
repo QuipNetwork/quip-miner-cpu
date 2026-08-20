@@ -1,8 +1,8 @@
 //! CPU heated discrete simulated-bifurcation miner (`quip-cpu-hdsb`).
 
 use clap::Parser;
-use quip_miner_core::{run, CommonArgs};
 use quip_miner_cpu::{SbSampler, CPU_HDSB_IDENTITY, HDSB};
+use quip_solver_core::{run, CommonArgs};
 use std::process::ExitCode;
 
 #[derive(Parser)]
