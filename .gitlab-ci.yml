@@ -68,7 +68,9 @@ build-linux-amd64:
 build-linux-arm64:
   extends: .build
   script:
-    - apt-get install -y -qq gcc-aarch64-linux-gnu
+    # The default before_script no longer runs apt-get (the protoc install is
+    # gone), so the cross-compiler install updates the package index itself.
+    - apt-get update -qq && apt-get install -y -qq gcc-aarch64-linux-gnu
     - rustup target add aarch64-unknown-linux-gnu
     - export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
     - cargo build --release --bins --target aarch64-unknown-linux-gnu
