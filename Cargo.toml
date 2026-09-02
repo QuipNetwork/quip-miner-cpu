@@ -68,6 +68,12 @@ name = "quip-cpu-sbqa"
 path = "src/bin/quip_cpu_sbqa.rs"
 required-features = ["experimental"]
 
+# Globally guided dSB. Experimental track.
+[[bin]]
+name = "quip-cpu-ggdsb"
+path = "src/bin/quip_cpu_ggdsb.rs"
+required-features = ["experimental"]
+
 # Tensor network. Experimental track, gated for the same reason as bsb.
 [[bin]]
 name = "quip-cpu-mps"

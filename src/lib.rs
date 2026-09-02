@@ -18,6 +18,7 @@ pub mod mps;
 pub mod mps_sampler;
 pub mod sampler_core;
 pub mod sb_core;
+pub mod sb_ggsb;
 pub mod sb_sampler;
 pub mod sb_sbqa;
 pub mod sb_tesb;
@@ -34,9 +35,10 @@ pub use sb_core::{
     sample_sb, sample_sb_with_workers, Coupling, SbVariant, BSB, DSB, EDGE_OF_CHAOS_CONTROL, GBSB,
     GDSB, HBSB, HDSB,
 };
+pub use sb_ggsb::{sample_ggsb, GgsbConfig};
 pub use sb_sampler::{
-    SbSampler, CPU_BSB_IDENTITY, CPU_GBSB_IDENTITY, CPU_GDSB_IDENTITY, CPU_HBSB_IDENTITY,
-    CPU_HDSB_IDENTITY, CPU_SBQA_IDENTITY, CPU_SB_IDENTITY, CPU_TEDSB_IDENTITY,
+    SbSampler, CPU_BSB_IDENTITY, CPU_GBSB_IDENTITY, CPU_GDSB_IDENTITY, CPU_GGDSB_IDENTITY,
+    CPU_HBSB_IDENTITY, CPU_HDSB_IDENTITY, CPU_SBQA_IDENTITY, CPU_SB_IDENTITY, CPU_TEDSB_IDENTITY,
 };
 pub use sb_sbqa::{sample_sbqa, SbqaConfig};
 pub use sb_tesb::{sample_tesb, TesbConfig};

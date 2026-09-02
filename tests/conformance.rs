@@ -288,6 +288,7 @@ const EXPERIMENTAL_BINS: &[(&str, &str)] = &[
     ("quip-cpu-gdsb", "gdsb"),
     ("quip-cpu-tedsb", "tedsb"),
     ("quip-cpu-sbqa", "sbqa"),
+    ("quip-cpu-ggdsb", "ggdsb"),
     ("quip-cpu-mps", "mps"),
     ("quip-cpu-mfa", "mfa"),
     ("quip-cpu-flatiron", "flatiron"),

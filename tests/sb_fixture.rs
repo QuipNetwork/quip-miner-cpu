@@ -15,8 +15,8 @@
 //! ```
 
 use quip_miner_cpu::{
-    sample_sb, sample_sbqa, sample_tesb, IsingGraph, SampleParams, SamplerResult, SbqaConfig,
-    TesbConfig, BSB, DSB, GBSB, GDSB, HBSB, HDSB,
+    sample_ggsb, sample_sb, sample_sbqa, sample_tesb, GgsbConfig, IsingGraph, SampleParams,
+    SamplerResult, SbqaConfig, TesbConfig, BSB, DSB, GBSB, GDSB, HBSB, HDSB,
 };
 use serde_json::{json, Value};
 use std::fs;
@@ -142,6 +142,13 @@ fn cases() -> Vec<Case> {
                     },
                 )
             },
+        },
+        Case {
+            name: "ring8_globally_guided_discrete",
+            algorithm: "ggdsb",
+            graph: ring8(),
+            params: params(4, 128, 10),
+            run: |g, p| sample_ggsb(g, p, DSB, GgsbConfig::default()),
         },
     ]
 }

@@ -13,6 +13,7 @@ use quip_solver_core::{
 };
 
 use crate::sb_core::{sample_sb, SbVariant};
+use crate::sb_ggsb::{sample_ggsb, GgsbConfig};
 use crate::sb_sbqa::{sample_sbqa, SbqaConfig};
 use crate::sb_tesb::{sample_tesb, TesbConfig};
 use crate::{run_stream_pump, DEFAULT_MAX_EDGES, DEFAULT_MAX_NODES};
@@ -135,6 +136,17 @@ pub const CPU_SBQA_IDENTITY: BackendIdentity = BackendIdentity {
     adapt: CPU_SB_ADAPT,
 };
 
+/// Backend identity for `quip-cpu-ggdsb` (globally guided discrete Simulated
+/// Bifurcation; Xiao et al. 2026). Experimental track.
+pub const CPU_GGDSB_IDENTITY: BackendIdentity = BackendIdentity {
+    backend: "cpu",
+    algorithm: "ggdsb",
+    max_nodes: DEFAULT_MAX_NODES,
+    max_edges: DEFAULT_MAX_EDGES,
+    features: &[],
+    adapt: CPU_SB_ADAPT,
+};
+
 /// Which SB kernel a sampler drives.
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum SbKernel {
@@ -145,6 +157,8 @@ enum SbKernel {
     Tabu(SbVariant, TesbConfig),
     /// Reads grouped into replica rings.
     Ring(SbqaConfig),
+    /// All reads advancing in lockstep under a shared leader.
+    Swarm(SbVariant, GgsbConfig),
 }
 
 /// Simulated Bifurcation sampler backend. No device, no governor, uncapped
@@ -198,11 +212,19 @@ impl SbSampler {
         }
     }
 
+    /// Create a globally guided sampler over `variant`.
+    pub fn swarm(variant: SbVariant, cfg: GgsbConfig) -> Self {
+        Self {
+            kernel: SbKernel::Swarm(variant, cfg),
+        }
+    }
+
     fn run(&self, graph: &IsingGraph, params: &SampleParams) -> Vec<SamplerResult> {
         match self.kernel {
             SbKernel::Plain(variant) => sample_sb(graph, params, variant),
             SbKernel::Tabu(variant, cfg) => sample_tesb(graph, params, variant, cfg),
             SbKernel::Ring(cfg) => sample_sbqa(graph, params, cfg),
+            SbKernel::Swarm(variant, cfg) => sample_ggsb(graph, params, variant, cfg),
         }
     }
 }
@@ -409,6 +431,14 @@ mod tests {
         assert_eq!(CPU_SBQA_IDENTITY.backend, "cpu");
         assert_eq!(CPU_SBQA_IDENTITY.algorithm, "sbqa");
         let sampler = SbSampler::ring(SbqaConfig::default());
+        assert!(sampler.stream_width() >= 1);
+    }
+
+    #[test]
+    fn cpu_ggdsb_identity_advertises_ggdsb_algorithm() {
+        assert_eq!(CPU_GGDSB_IDENTITY.backend, "cpu");
+        assert_eq!(CPU_GGDSB_IDENTITY.algorithm, "ggdsb");
+        let sampler = SbSampler::swarm(DSB, GgsbConfig::default());
         assert!(sampler.stream_width() >= 1);
     }
 }
