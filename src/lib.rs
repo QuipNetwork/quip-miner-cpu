@@ -19,6 +19,7 @@ pub mod mps_sampler;
 pub mod sampler_core;
 pub mod sb_core;
 pub mod sb_sampler;
+pub mod sb_sbqa;
 pub mod sb_tesb;
 mod spin_barrier;
 
@@ -35,8 +36,9 @@ pub use sb_core::{
 };
 pub use sb_sampler::{
     SbSampler, CPU_BSB_IDENTITY, CPU_GBSB_IDENTITY, CPU_GDSB_IDENTITY, CPU_HBSB_IDENTITY,
-    CPU_HDSB_IDENTITY, CPU_SB_IDENTITY, CPU_TEDSB_IDENTITY,
+    CPU_HDSB_IDENTITY, CPU_SBQA_IDENTITY, CPU_SB_IDENTITY, CPU_TEDSB_IDENTITY,
 };
+pub use sb_sbqa::{sample_sbqa, SbqaConfig};
 pub use sb_tesb::{sample_tesb, TesbConfig};
 
 use quip_solver_core::adapt::AdaptBounds;

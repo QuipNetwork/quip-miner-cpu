@@ -13,6 +13,7 @@ use quip_solver_core::{
 };
 
 use crate::sb_core::{sample_sb, SbVariant};
+use crate::sb_sbqa::{sample_sbqa, SbqaConfig};
 use crate::sb_tesb::{sample_tesb, TesbConfig};
 use crate::{run_stream_pump, DEFAULT_MAX_EDGES, DEFAULT_MAX_NODES};
 
@@ -123,6 +124,17 @@ pub const CPU_TEDSB_IDENTITY: BackendIdentity = BackendIdentity {
     adapt: CPU_SB_ADAPT,
 };
 
+/// Backend identity for `quip-cpu-sbqa` (Simulated Bifurcation Quantum
+/// Annealing; Pawlowski et al. 2026). Experimental track.
+pub const CPU_SBQA_IDENTITY: BackendIdentity = BackendIdentity {
+    backend: "cpu",
+    algorithm: "sbqa",
+    max_nodes: DEFAULT_MAX_NODES,
+    max_edges: DEFAULT_MAX_EDGES,
+    features: &[],
+    adapt: CPU_SB_ADAPT,
+};
+
 /// Which SB kernel a sampler drives.
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum SbKernel {
@@ -131,6 +143,8 @@ enum SbKernel {
     Plain(SbVariant),
     /// Two-phase tabu kernel over the plain integrator.
     Tabu(SbVariant, TesbConfig),
+    /// Reads grouped into replica rings.
+    Ring(SbqaConfig),
 }
 
 /// Simulated Bifurcation sampler backend. No device, no governor, uncapped
@@ -177,10 +191,18 @@ impl SbSampler {
         }
     }
 
+    /// Create a replica-ring sampler.
+    pub fn ring(cfg: SbqaConfig) -> Self {
+        Self {
+            kernel: SbKernel::Ring(cfg),
+        }
+    }
+
     fn run(&self, graph: &IsingGraph, params: &SampleParams) -> Vec<SamplerResult> {
         match self.kernel {
             SbKernel::Plain(variant) => sample_sb(graph, params, variant),
             SbKernel::Tabu(variant, cfg) => sample_tesb(graph, params, variant, cfg),
+            SbKernel::Ring(cfg) => sample_sbqa(graph, params, cfg),
         }
     }
 }
@@ -379,6 +401,14 @@ mod tests {
         assert_eq!(CPU_TEDSB_IDENTITY.backend, "cpu");
         assert_eq!(CPU_TEDSB_IDENTITY.algorithm, "tedsb");
         let sampler = SbSampler::tabu(DSB, TesbConfig::default());
+        assert!(sampler.stream_width() >= 1);
+    }
+
+    #[test]
+    fn cpu_sbqa_identity_advertises_sbqa_algorithm() {
+        assert_eq!(CPU_SBQA_IDENTITY.backend, "cpu");
+        assert_eq!(CPU_SBQA_IDENTITY.algorithm, "sbqa");
+        let sampler = SbSampler::ring(SbqaConfig::default());
         assert!(sampler.stream_width() >= 1);
     }
 }

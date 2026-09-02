@@ -62,6 +62,12 @@ name = "quip-cpu-tedsb"
 path = "src/bin/quip_cpu_tedsb.rs"
 required-features = ["experimental"]
 
+# Replica-ring dSB. Experimental track.
+[[bin]]
+name = "quip-cpu-sbqa"
+path = "src/bin/quip_cpu_sbqa.rs"
+required-features = ["experimental"]
+
 # Tensor network. Experimental track, gated for the same reason as bsb.
 [[bin]]
 name = "quip-cpu-mps"
