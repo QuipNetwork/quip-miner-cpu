@@ -13,6 +13,7 @@ use quip_solver_core::{
 };
 
 use crate::sb_core::{sample_sb, SbVariant};
+use crate::sb_tesb::{sample_tesb, TesbConfig};
 use crate::{run_stream_pump, DEFAULT_MAX_EDGES, DEFAULT_MAX_NODES};
 
 /// SB adapt envelope, shared by all four SB identities.
@@ -111,11 +112,32 @@ pub const CPU_GDSB_IDENTITY: BackendIdentity = BackendIdentity {
     adapt: CPU_SB_ADAPT,
 };
 
+/// Backend identity for `quip-cpu-tedsb` (tabu-enhanced discrete Simulated
+/// Bifurcation; Tao et al. 2026). Experimental track.
+pub const CPU_TEDSB_IDENTITY: BackendIdentity = BackendIdentity {
+    backend: "cpu",
+    algorithm: "tedsb",
+    max_nodes: DEFAULT_MAX_NODES,
+    max_edges: DEFAULT_MAX_EDGES,
+    features: &[],
+    adapt: CPU_SB_ADAPT,
+};
+
+/// Which SB kernel a sampler drives.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum SbKernel {
+    /// One integrator run per read: dSB, bSB, the heated and the controlled
+    /// forms.
+    Plain(SbVariant),
+    /// Two-phase tabu kernel over the plain integrator.
+    Tabu(SbVariant, TesbConfig),
+}
+
 /// Simulated Bifurcation sampler backend. No device, no governor, uncapped
-/// reads. The variant selects the coupling form and the heating rate.
+/// reads. The kernel selects the integrator and its outer loop.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SbSampler {
-    variant: SbVariant,
+    kernel: SbKernel,
 }
 
 impl SbSampler {
@@ -143,7 +165,23 @@ impl SbSampler {
     /// # }
     /// ```
     pub fn new(variant: SbVariant) -> Self {
-        Self { variant }
+        Self {
+            kernel: SbKernel::Plain(variant),
+        }
+    }
+
+    /// Create a tabu-enhanced sampler over `variant`.
+    pub fn tabu(variant: SbVariant, cfg: TesbConfig) -> Self {
+        Self {
+            kernel: SbKernel::Tabu(variant, cfg),
+        }
+    }
+
+    fn run(&self, graph: &IsingGraph, params: &SampleParams) -> Vec<SamplerResult> {
+        match self.kernel {
+            SbKernel::Plain(variant) => sample_sb(graph, params, variant),
+            SbKernel::Tabu(variant, cfg) => sample_tesb(graph, params, variant, cfg),
+        }
     }
 }
 
@@ -153,7 +191,7 @@ impl Sampler for SbSampler {
         graph: &IsingGraph,
         params: &SampleParams,
     ) -> Result<Vec<SamplerResult>, SampleError> {
-        Ok(sample_sb(graph, params, self.variant))
+        Ok(self.run(graph, params))
     }
 
     /// One model per core, the same shape as [`crate::CpuSampler::stream_width`].
@@ -174,10 +212,10 @@ impl Sampler for SbSampler {
         out: tokio::sync::mpsc::Sender<StreamResult>,
         cancel: CancelToken,
     ) {
-        let variant = self.variant;
+        let sampler = *self;
         run_stream_pump(
             || self.stream_width(),
-            move |g, p, _, _| Ok(sample_sb(g, p, variant)),
+            move |g, p, _, _| Ok(sampler.run(g, p)),
             jobs,
             out,
             cancel,
@@ -334,5 +372,13 @@ mod tests {
         assert_eq!(CPU_GDSB_IDENTITY.backend, "cpu");
         assert_eq!(CPU_GDSB_IDENTITY.algorithm, "gdsb");
         assert_eq!(CPU_GDSB_IDENTITY.adapt.max_sweeps, CPU_SB_ADAPT.max_sweeps);
+    }
+
+    #[test]
+    fn cpu_tedsb_identity_advertises_tedsb_algorithm() {
+        assert_eq!(CPU_TEDSB_IDENTITY.backend, "cpu");
+        assert_eq!(CPU_TEDSB_IDENTITY.algorithm, "tedsb");
+        let sampler = SbSampler::tabu(DSB, TesbConfig::default());
+        assert!(sampler.stream_width() >= 1);
     }
 }

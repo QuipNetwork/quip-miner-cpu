@@ -15,7 +15,8 @@
 //! ```
 
 use quip_miner_cpu::{
-    sample_sb, IsingGraph, SampleParams, SamplerResult, BSB, DSB, GBSB, GDSB, HBSB, HDSB,
+    sample_sb, sample_tesb, IsingGraph, SampleParams, SamplerResult, TesbConfig, BSB, DSB, GBSB,
+    GDSB, HBSB, HDSB,
 };
 use serde_json::{json, Value};
 use std::fs;
@@ -108,6 +109,23 @@ fn cases() -> Vec<Case> {
             graph: ring8(),
             params: params(4, 128, 7),
             run: |g, p| sample_sb(g, p, GDSB),
+        },
+        Case {
+            name: "ring8_tabu_discrete",
+            algorithm: "tedsb",
+            graph: ring8(),
+            params: params(4, 200, 8),
+            run: |g, p| {
+                sample_tesb(
+                    g,
+                    p,
+                    DSB,
+                    TesbConfig {
+                        warm_replicas: 8,
+                        ..TesbConfig::default()
+                    },
+                )
+            },
         },
     ]
 }

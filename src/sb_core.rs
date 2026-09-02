@@ -257,6 +257,12 @@ impl SbGraph {
         let e = self.nbr_start[var + 1] as usize;
         (&self.nbr_node[s..e], &self.nbr_coup[s..e])
     }
+
+    /// Multiply the coupling normalization. The tabu kernel runs its checking
+    /// phase at a smaller `c0` than the warm-up, as the paper does.
+    pub(crate) fn scale_c0(&mut self, scale: Real) {
+        self.c0 *= scale;
+    }
 }
 
 /// Pump `a(t_k) = a0 (k + 1) / n_step`.

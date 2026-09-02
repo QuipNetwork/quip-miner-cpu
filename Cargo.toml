@@ -56,6 +56,12 @@ name = "quip-cpu-gdsb"
 path = "src/bin/quip_cpu_gdsb.rs"
 required-features = ["experimental"]
 
+# Tabu-enhanced dSB. Experimental track.
+[[bin]]
+name = "quip-cpu-tedsb"
+path = "src/bin/quip_cpu_tedsb.rs"
+required-features = ["experimental"]
+
 # Tensor network. Experimental track, gated for the same reason as bsb.
 [[bin]]
 name = "quip-cpu-mps"
