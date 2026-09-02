@@ -28,7 +28,10 @@ pub use mps::{sample_ising_mps, InitMode, MpsConfig};
 pub use mps_sampler::{MpsSampler, CPU_MFA_IDENTITY, CPU_MPS_IDENTITY};
 pub use quip_solver_core::{Algorithm, IsingGraph, SampleParams, SamplerResult};
 pub use sampler_core::sample_ising;
-pub use sb_core::{sample_sb, sample_sb_with_workers, Coupling, SbVariant, BSB, DSB, HBSB, HDSB};
+pub use sb_core::{
+    sample_sb, sample_sb_with_workers, Coupling, SbVariant, BSB, DSB, EDGE_OF_CHAOS_CONTROL, GBSB,
+    GDSB, HBSB, HDSB,
+};
 pub use sb_sampler::{
     SbSampler, CPU_BSB_IDENTITY, CPU_HBSB_IDENTITY, CPU_HDSB_IDENTITY, CPU_SB_IDENTITY,
 };
