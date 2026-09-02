@@ -44,6 +44,18 @@ name = "quip-cpu-hbsb"
 path = "src/bin/quip_cpu_hbsb.rs"
 required-features = ["experimental"]
 
+# Edge-of-chaos generalized bSB. Experimental track, gated for the same reason as bsb.
+[[bin]]
+name = "quip-cpu-gbsb"
+path = "src/bin/quip_cpu_gbsb.rs"
+required-features = ["experimental"]
+
+# Edge-of-chaos control on the discrete coupling. Experimental track.
+[[bin]]
+name = "quip-cpu-gdsb"
+path = "src/bin/quip_cpu_gdsb.rs"
+required-features = ["experimental"]
+
 # Tensor network. Experimental track, gated for the same reason as bsb.
 [[bin]]
 name = "quip-cpu-mps"

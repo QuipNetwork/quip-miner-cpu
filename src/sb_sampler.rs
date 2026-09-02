@@ -87,6 +87,30 @@ pub const CPU_HBSB_IDENTITY: BackendIdentity = BackendIdentity {
     adapt: CPU_SB_ADAPT,
 };
 
+/// Backend identity for `quip-cpu-gbsb` (generalized ballistic Simulated
+/// Bifurcation with edge-of-chaos control; Goto, Hidaka, Tatsumura 2026).
+/// Experimental track.
+pub const CPU_GBSB_IDENTITY: BackendIdentity = BackendIdentity {
+    backend: "cpu",
+    algorithm: "gbsb",
+    max_nodes: DEFAULT_MAX_NODES,
+    max_edges: DEFAULT_MAX_EDGES,
+    features: &[],
+    adapt: CPU_SB_ADAPT,
+};
+
+/// Backend identity for `quip-cpu-gdsb`: the same control on the discrete
+/// coupling. The paper names this form as future work; it is this project's
+/// extension. Experimental track.
+pub const CPU_GDSB_IDENTITY: BackendIdentity = BackendIdentity {
+    backend: "cpu",
+    algorithm: "gdsb",
+    max_nodes: DEFAULT_MAX_NODES,
+    max_edges: DEFAULT_MAX_EDGES,
+    features: &[],
+    adapt: CPU_SB_ADAPT,
+};
+
 /// Simulated Bifurcation sampler backend. No device, no governor, uncapped
 /// reads. The variant selects the coupling form and the heating rate.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -296,5 +320,19 @@ mod tests {
         assert_eq!(CPU_HBSB_IDENTITY.algorithm, "hbsb");
         assert_eq!(CPU_HBSB_IDENTITY.max_nodes, 100_000);
         assert_eq!(CPU_HBSB_IDENTITY.max_edges, 1_000_000);
+    }
+
+    #[test]
+    fn cpu_gbsb_identity_advertises_gbsb_algorithm() {
+        assert_eq!(CPU_GBSB_IDENTITY.backend, "cpu");
+        assert_eq!(CPU_GBSB_IDENTITY.algorithm, "gbsb");
+        assert_eq!(CPU_GBSB_IDENTITY.adapt.max_sweeps, CPU_SB_ADAPT.max_sweeps);
+    }
+
+    #[test]
+    fn cpu_gdsb_identity_advertises_gdsb_algorithm() {
+        assert_eq!(CPU_GDSB_IDENTITY.backend, "cpu");
+        assert_eq!(CPU_GDSB_IDENTITY.algorithm, "gdsb");
+        assert_eq!(CPU_GDSB_IDENTITY.adapt.max_sweeps, CPU_SB_ADAPT.max_sweeps);
     }
 }

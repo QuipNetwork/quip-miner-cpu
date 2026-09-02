@@ -33,7 +33,8 @@ pub use sb_core::{
     GDSB, HBSB, HDSB,
 };
 pub use sb_sampler::{
-    SbSampler, CPU_BSB_IDENTITY, CPU_HBSB_IDENTITY, CPU_HDSB_IDENTITY, CPU_SB_IDENTITY,
+    SbSampler, CPU_BSB_IDENTITY, CPU_GBSB_IDENTITY, CPU_GDSB_IDENTITY, CPU_HBSB_IDENTITY,
+    CPU_HDSB_IDENTITY, CPU_SB_IDENTITY,
 };
 
 use quip_solver_core::adapt::AdaptBounds;
