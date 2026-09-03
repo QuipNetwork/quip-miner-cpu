@@ -386,10 +386,15 @@ pub(crate) fn anneal_one_read_int(
                 } else {
                     -heff[var]
                 };
-                if m < 0 && rng.gen::<f64>() >= row[usize::from(m.unsigned_abs())] {
-                    continue;
+                // Spelled with the same `u < accept_prob` the `f64` kernel
+                // uses, rather than the negated `u >= accept_prob`. The two
+                // disagree when the table holds a NaN, and only this order
+                // rejects where the `f64` kernel rejects. `m >= 0` short
+                // circuits, so an accepted downhill flip still draws nothing.
+                let accept = m >= 0 || rng.gen::<f64>() < row[usize::from(m.unsigned_abs())];
+                if accept {
+                    flip(graph, &mut spins, &mut heff, var);
                 }
-                flip(graph, &mut spins, &mut heff, var);
             }
         }
     }
