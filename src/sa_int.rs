@@ -180,13 +180,30 @@ impl IntGraph {
     }
 }
 
-/// Metropolis acceptance probabilities for every temperature rung.
+/// Largest acceptance table this path builds, in entries.
+///
+/// The table is `rungs * row_len` `f64` where the `f64` kernel needs only the
+/// `rungs` of the beta ladder itself, so an unbounded rung count would cost up
+/// to `MAX_FIELD + 1` times the memory `cpu-sa` used before this path existed.
+/// A mining job runs at most `CPU_ADAPT.max_sweeps` rungs, so nothing in the
+/// miner approaches this bound. It is here for a caller that hands the library
+/// an unbounded `num_sweeps` directly: past the cap [`acceptance_table`]
+/// declines, and the caller keeps the `f64` kernel, which produces the same
+/// spins from the same random stream.
+const MAX_TABLE_ENTRIES: usize = 1 << 20;
+
+/// Metropolis acceptance probabilities for every temperature rung, or `None`
+/// when the ladder is long enough that the table would cost more memory than
+/// [`MAX_TABLE_ENTRIES`] allows.
 ///
 /// Row `b` holds `exp(-2 * betas[b] * n)` at index `n`. Index 0 is never read:
 /// a candidate with `heff` of the flipped spin's own sign is downhill or flat
 /// and is accepted without consuming randomness, exactly as the `f64` kernel's
 /// `delta <= 0.0` arm does.
-pub(crate) fn acceptance_table(betas: &[f64], row_len: usize) -> Vec<f64> {
+pub(crate) fn acceptance_table(betas: &[f64], row_len: usize) -> Option<Vec<f64>> {
+    if betas.len().saturating_mul(row_len) > MAX_TABLE_ENTRIES {
+        return None;
+    }
     let mut table = vec![0.0f64; betas.len() * row_len];
     for (b, &beta) in betas.iter().enumerate() {
         // `-2.0 * beta` is exact, so each entry is a single rounding of
@@ -197,7 +214,7 @@ pub(crate) fn acceptance_table(betas: &[f64], row_len: usize) -> Vec<f64> {
             table[b * row_len + n] = (scale * n as f64).exp();
         }
     }
-    table
+    Some(table)
 }
 
 /// Seed the incremental effective-field cache for `spins`.
@@ -233,7 +250,26 @@ fn flip(graph: &IntGraph, spins: &mut [i8], heff: &mut [i8], var: usize) {
 ///
 /// Power of two so a sweep can index it with a mask. 8192 entries is 8 KiB,
 /// small enough to sit in L1 alongside the spins and the field cache.
+///
+/// A problem with more than `DRAW_ROW` nodes reuses a threshold within one
+/// sweep, for sites `DRAW_ROW` apart. The per-sweep offset repairs the pairing
+/// every sweep, so no pair of sites shares a threshold twice, but the count of
+/// independent thresholds in one sweep is capped here. The bundled corpora hold
+/// 4577 nodes, well inside the row.
 const DRAW_ROW: usize = 8192;
+
+// The three masked index sites below turn `& (DRAW_ROW - 1)` into `% DRAW_ROW`,
+// which holds only for a power of two.
+const _: () = assert!(DRAW_ROW.is_power_of_two());
+
+/// Largest threshold table this path draws, in bytes.
+///
+/// One `DRAW_ROW` per rung, so the cost is `rungs * 8 KiB` however small the
+/// problem. A mining job runs at most `CPU_ADAPT.max_sweeps` rungs, which costs
+/// 8 MiB, so nothing in the miner approaches this bound. Past it
+/// [`threshold_draws`] declines and the caller falls back to `cpu-sa`, which is
+/// what every other precondition failure in these kernels does.
+const MAX_DRAW_BYTES: usize = 64 << 20;
 
 /// Largest `u64` below `p * 2^64`, saturating at `u64::MAX`.
 fn scale_u64(p: f64) -> u64 {
@@ -265,7 +301,14 @@ fn scale_u64(p: f64) -> u64 {
 /// removes the per-attempt random draw; the paper reuses them the same way and
 /// decorrelates with a random cyclic shift, which
 /// [`anneal_one_read_fast`] applies per sweep.
-pub(crate) fn threshold_draws(betas: &[f64], max_field: usize, rng: &mut SmallRng) -> Vec<u8> {
+pub(crate) fn threshold_draws(
+    betas: &[f64],
+    max_field: usize,
+    rng: &mut SmallRng,
+) -> Option<Vec<u8>> {
+    if betas.len().saturating_mul(DRAW_ROW) > MAX_DRAW_BYTES {
+        return None;
+    }
     let mut cut = vec![0u64; max_field + 1];
     let mut out = vec![0u8; betas.len() * DRAW_ROW];
     for (b, &beta) in betas.iter().enumerate() {
@@ -288,7 +331,7 @@ pub(crate) fn threshold_draws(betas: &[f64], max_field: usize, rng: &mut SmallRn
             };
         }
     }
-    out
+    Some(out)
 }
 
 /// Cyclic shifts into the threshold table, one per sweep.
@@ -441,7 +484,7 @@ mod tests {
             let int = IntGraph::from_base(&graph).expect("unit couplings qualify");
             let cpu = CpuGraph::from_base(&graph);
             let betas = geometric_beta_schedule(0.05, 6.0, 64);
-            let table = acceptance_table(&betas, int.row_len());
+            let table = acceptance_table(&betas, int.row_len()).expect("short ladder");
             for read in 0..8u64 {
                 let mut a = SmallRng::seed_from_u64(seed * 977 + read);
                 let mut b = SmallRng::seed_from_u64(seed * 977 + read);
@@ -496,7 +539,7 @@ mod tests {
         let cpu = CpuGraph::from_base(&g);
         let mut rng = SmallRng::seed_from_u64(5);
         let betas = geometric_beta_schedule(0.05, 6.0, 8);
-        let table = acceptance_table(&betas, int.row_len());
+        let table = acceptance_table(&betas, int.row_len()).expect("short ladder");
         let spins = anneal_one_read_int(&int, &table, 1, &mut rng, None).expect("no cancel token");
         for v in 0..int.num_nodes() {
             let f = crate::sampler_core::effective_field(v, &spins, &cpu);
@@ -506,5 +549,24 @@ mod tests {
                 int.max_field
             );
         }
+    }
+
+    #[test]
+    fn a_ladder_too_long_for_the_table_declines_instead_of_allocating() {
+        // The caller falls back to the `f64` kernel, which produces the same
+        // spins, so declining costs output nothing and bounds the memory a
+        // caller can ask this path for.
+        let betas = vec![1.0f64; MAX_TABLE_ENTRIES / 4 + 1];
+        assert!(acceptance_table(&betas, 4).is_none());
+        assert!(acceptance_table(&betas, 1).is_some());
+    }
+
+    #[test]
+    fn a_ladder_too_long_for_the_threshold_row_declines_instead_of_allocating() {
+        let mut rng = SmallRng::seed_from_u64(9);
+        let over = vec![1.0f64; MAX_DRAW_BYTES / DRAW_ROW + 1];
+        assert!(threshold_draws(&over, 4, &mut rng).is_none());
+        let under = vec![1.0f64; 8];
+        assert!(threshold_draws(&under, 4, &mut rng).is_some());
     }
 }

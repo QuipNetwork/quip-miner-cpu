@@ -88,9 +88,9 @@ fn main() {
         let cpu = CpuGraph::from_base(&graph);
         let counts = bond_counts(&int).unwrap();
         let betas = geometric_beta_schedule(0.017, 6.5, 550);
-        let table = acceptance_table(&betas, int.row_len());
+        let table = acceptance_table(&betas, int.row_len()).unwrap();
         let mut seed_rng = SmallRng::seed_from_u64(99);
-        let draws = threshold_draws(&betas, int.max_field(), &mut seed_rng);
+        let draws = threshold_draws(&betas, int.max_field(), &mut seed_rng).unwrap();
         let offsets = sweep_offsets(betas.len(), 1, &mut SmallRng::seed_from_u64(5));
         let reads = 4u64;
         let updates = (reads as f64) * (betas.len() as f64) * (n as f64);

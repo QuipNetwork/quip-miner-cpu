@@ -143,7 +143,20 @@ unless:
 - every field is a whole number, and
 - `maxᵢ (|hᵢ| + degᵢ) ≤ 100`.
 
-`cpu-msa` needs two more conditions, and falls back to the scalar kernel
+One more condition bounds memory rather than correctness. The acceptance table
+holds one row per temperature rung. For an unbounded sweep count that reaches
+101 times the memory the `f64` kernel needs for the same ladder. Past 2^20 table
+entries the integer path declines, which leaves the caller on the `f64` kernel,
+whose spins are the same. A mining job runs at most 1024 rungs, so
+nothing in the miner approaches the bound.
+
+`cpu-fsa` and `cpu-msa` draw a threshold row of 8 KiB per rung, and decline past
+64 MiB of them, which falls back to `cpu-sa`. A problem with more than 8192
+nodes reuses a threshold within one sweep, for sites 8192 apart. The per-sweep
+offset repairs the pairing every sweep, so no two sites share a threshold twice,
+but the count of independent thresholds in one sweep is capped there.
+
+`cpu-msa` needs two more conditions, and falls back to the tabulated kernel
 otherwise:
 
 - every field is in `{-1, 0, +1}`, so it folds into one ghost bond, and
@@ -273,11 +286,17 @@ building it.
 
 **Holding one replica out of each update to decorrelate the lanes.** The
 multi-spin kernel shares one acceptance threshold across the 64 replicas of a
-word update, which couples them. Because the miner is scored on diversity, this
-was the main risk in the design. Measurement settled it. Diversity reads 445
-where the baseline reads 446 on `chain-h0`, and 258 where the baseline reads 261
-on `chain-ternary`. Both differences sit inside the run-to-run spread, so the
-decorrelation machinery stayed on paper.
+word update, which couples them. The coupling has a sharp form: two lanes that
+ever reach the same configuration make the same decision at every later site,
+so they stay identical for the rest of the run. Coalescence is absorbing.
+Because the miner is scored on diversity, this was the main risk in the design.
+
+Measurement settled it for this problem class. Diversity reads 445 where the
+baseline reads 446 on `chain-h0`, and 258 where the baseline reads 261 on
+`chain-ternary`, across 50 instances, 3 repetitions and both read counts. Both
+differences sit inside the run-to-run spread, so the decorrelation machinery
+stayed on paper. A landscape that funnels every replica into one basin would
+show this effect, and neither bundled corpus does.
 
 **Spin reordering, technique 3.** The Zephyr fixture already relabels to a dense
 range in ascending identifier order, and the neighbour rows are contiguous. No

@@ -311,7 +311,7 @@ mod tests {
             let counts = bond_counts(&int).expect("degree within bounds");
             let betas = geometric_beta_schedule(0.05, 6.0, 24);
             let mut rng = SmallRng::seed_from_u64(seed);
-            let draws = threshold_draws(&betas, int.max_field(), &mut rng);
+            let draws = threshold_draws(&betas, int.max_field(), &mut rng).expect("short ladder");
             let offsets = sweep_offsets(betas.len(), 2, &mut rng);
 
             let mut state = MscState::random(int.num_nodes(), &mut rng);

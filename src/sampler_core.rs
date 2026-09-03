@@ -178,11 +178,10 @@ enum Kernel {
 
 impl Kernel {
     fn for_problem(graph: &IsingGraph, beta_schedule: &[f64]) -> Self {
-        match IntGraph::from_base(graph) {
-            Some(g) => {
-                let table = acceptance_table(beta_schedule, g.row_len());
-                Self::Int(g, table)
-            }
+        let int = IntGraph::from_base(graph)
+            .and_then(|g| acceptance_table(beta_schedule, g.row_len()).map(|t| (g, t)));
+        match int {
+            Some((g, table)) => Self::Int(g, table),
             None => Self::Float(CpuGraph::from_base(graph)),
         }
     }

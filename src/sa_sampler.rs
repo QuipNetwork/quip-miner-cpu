@@ -132,7 +132,12 @@ pub(crate) fn sample_sa_variant(
     // what removes the per-attempt draw. Seeding it from the job seed keeps
     // the whole sampler deterministic.
     let mut table_rng = SmallRng::seed_from_u64(params.seed ^ 0x5341_5F54_424C_4531);
-    let draws = threshold_draws(&betas, int.max_field(), &mut table_rng);
+    let Some(draws) = threshold_draws(&betas, int.max_field(), &mut table_rng) else {
+        // A ladder long enough to price the threshold table out is the last
+        // precondition these kernels can fail, and it falls back the same way
+        // as the others.
+        return sample_ising_cancellable(graph, params, Algorithm::Sa, cancel);
+    };
 
     let counts = match variant {
         SaVariant::MultiSpin => bond_counts(&int),
