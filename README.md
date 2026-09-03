@@ -19,6 +19,8 @@ reads are sequential and cache-local. Energies are scored with the canonical
 | `quip-cpu-bsb` | ballistic Simulated Bifurcation | experimental |
 | `quip-cpu-hdsb` | heated discrete Simulated Bifurcation | experimental |
 | `quip-cpu-hbsb` | heated ballistic Simulated Bifurcation | experimental |
+| `quip-cpu-fsa` | simulated annealing with tabulated Metropolis thresholds | experimental |
+| `quip-cpu-msa` | multi-spin coded simulated annealing, 64 reads per word | experimental |
 | `quip-cpu-mps` | tensor network: imaginary-time TEBD with exact sampling | experimental |
 | `quip-cpu-mfa` | mean-field annealing (the same kernel at bond dimension 1) | experimental |
 | `quip-cpu-flatiron` | belief-propagation tensor network on the problem graph | experimental |

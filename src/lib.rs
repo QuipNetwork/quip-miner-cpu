@@ -16,6 +16,9 @@ pub mod flatiron_sampler;
 pub mod gibbs_parallel;
 pub mod mps;
 pub mod mps_sampler;
+mod sa_int;
+mod sa_msc;
+pub mod sa_sampler;
 pub mod sampler_core;
 pub mod sb_core;
 pub mod sb_sampler;
@@ -27,6 +30,7 @@ pub use gibbs_parallel::{ConfigError, GibbsConfig, GibbsParallelism};
 pub use mps::{sample_ising_mps, InitMode, MpsConfig};
 pub use mps_sampler::{MpsSampler, CPU_MFA_IDENTITY, CPU_MPS_IDENTITY};
 pub use quip_solver_core::{Algorithm, IsingGraph, SampleParams, SamplerResult};
+pub use sa_sampler::{SaSampler, SaVariant, CPU_FSA_IDENTITY, CPU_MSA_IDENTITY};
 pub use sampler_core::sample_ising;
 pub use sb_core::{sample_sb, sample_sb_with_workers, Coupling, SbVariant, BSB, DSB, HBSB, HDSB};
 pub use sb_sampler::{

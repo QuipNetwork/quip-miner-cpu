@@ -44,6 +44,19 @@ name = "quip-cpu-hbsb"
 path = "src/bin/quip_cpu_hbsb.rs"
 required-features = ["experimental"]
 
+# Tabulated-threshold annealing. Experimental track, gated for the same reason
+# as bsb.
+[[bin]]
+name = "quip-cpu-fsa"
+path = "src/bin/quip_cpu_fsa.rs"
+required-features = ["experimental"]
+
+# Multi-spin coded annealing. Experimental track.
+[[bin]]
+name = "quip-cpu-msa"
+path = "src/bin/quip_cpu_msa.rs"
+required-features = ["experimental"]
+
 # Tensor network. Experimental track, gated for the same reason as bsb.
 [[bin]]
 name = "quip-cpu-mps"
