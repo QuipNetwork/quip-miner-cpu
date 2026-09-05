@@ -345,29 +345,40 @@ impl CpuSampler {
     }
 
     fn core_budget(&self) -> usize {
-        match self.num_cpus.load(Ordering::Acquire) {
-            0 => host_parallelism(),
-            n => n,
-        }
+        core_budget(&self.num_cpus)
     }
+}
 
-    fn apply_num_cpus(&self, backend_toml: &str) -> Result<(), NumCpusError> {
-        let Some(requested) = parse_num_cpus(backend_toml)? else {
-            return Ok(());
-        };
-        let available = host_parallelism();
-        let budget = resolve_core_budget(requested, available);
-        if budget < requested {
-            tracing::debug!(
-                requested,
-                available,
-                budget,
-                "num_cpus exceeds host parallelism; clamped"
-            );
-        }
-        self.num_cpus.store(budget, Ordering::Release);
-        Ok(())
+/// Resolve a stored core budget. 0 means the operator set nothing, so the
+/// whole host is the budget.
+pub(crate) fn core_budget(cell: &AtomicUsize) -> usize {
+    match cell.load(Ordering::Acquire) {
+        0 => host_parallelism(),
+        n => n,
     }
+}
+
+/// Store `num_cpus` from `backend_toml` into `cell`, clamped to the host.
+///
+/// Shared by every CPU backend. A sampler that skips this silently ignores the
+/// operator's core budget and oversubscribes the host, so each `Sampler` impl
+/// in this crate must call it from `apply_config`.
+pub(crate) fn apply_num_cpus(cell: &AtomicUsize, backend_toml: &str) -> Result<(), NumCpusError> {
+    let Some(requested) = parse_num_cpus(backend_toml)? else {
+        return Ok(());
+    };
+    let available = host_parallelism();
+    let budget = resolve_core_budget(requested, available);
+    if budget < requested {
+        tracing::debug!(
+            requested,
+            available,
+            budget,
+            "num_cpus exceeds host parallelism; clamped"
+        );
+    }
+    cell.store(budget, Ordering::Release);
+    Ok(())
 }
 
 /// Refuse a bad `num_cpus` at handshake. A typo must not look like it worked.
@@ -377,7 +388,7 @@ impl CpuSampler {
     reason = "a zero or negative num_cpus is an operator typo; refuse to start \
               rather than silently fall back"
 )]
-fn reject_num_cpus(e: NumCpusError) -> ! {
+pub(crate) fn reject_num_cpus(e: NumCpusError) -> ! {
     eprintln!("configuration error: {e}");
     std::process::exit(64);
 }
@@ -430,7 +441,7 @@ impl Sampler for CpuSampler {
     }
 
     fn apply_config(&self, backend_toml: &str) {
-        if let Err(e) = self.apply_num_cpus(backend_toml) {
+        if let Err(e) = apply_num_cpus(&self.num_cpus, backend_toml) {
             tracing::error!(error = %e, "cpu num_cpus rejected");
             reject_num_cpus(e);
         }

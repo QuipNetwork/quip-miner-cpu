@@ -25,6 +25,8 @@ use quip_solver_core::{
 };
 use rand::rngs::SmallRng;
 use rand::SeedableRng;
+use std::sync::atomic::AtomicUsize;
+use std::sync::Arc;
 
 use crate::sa_int::{anneal_from, sweep_offsets, threshold_draws, IntGraph};
 use crate::sa_msc::{anneal_word, bond_counts, MscState, LANES};
@@ -78,9 +80,14 @@ pub enum SaVariant {
 }
 
 /// Annealing sampler for the tabulated-threshold and multi-spin kernels.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct SaSampler {
     variant: SaVariant,
+    /// Operator core budget from `Configure.backend_toml`. 0 means the host.
+    ///
+    /// Shared with every clone, because the pump clones the sampler after the
+    /// handshake has already stored the budget.
+    num_cpus: Arc<AtomicUsize>,
 }
 
 impl SaSampler {
@@ -109,7 +116,10 @@ impl SaSampler {
     /// ```
     #[must_use]
     pub fn new(variant: SaVariant) -> Self {
-        Self { variant }
+        Self {
+            variant,
+            num_cpus: Arc::new(AtomicUsize::new(0)),
+        }
     }
 }
 
@@ -209,13 +219,24 @@ impl Sampler for SaSampler {
         Ok(sample_sa_variant(graph, params, self.variant, None).unwrap_or_default())
     }
 
-    /// One model per core, the same shape as [`crate::CpuSampler::stream_width`].
+    /// One model per core, the same shape as `CpuSampler::stream_width`.
+    ///
+    /// `num_cpus` from `Configure.backend_toml` replaces host parallelism here,
+    /// exactly as it does for `cpu-sa`. Without this the two binaries would run
+    /// different concurrencies under the same operator configuration.
     fn stream_width(&self) -> usize {
-        crate::host_parallelism()
+        crate::core_budget(&self.num_cpus)
     }
 
     fn declared_stream_width() -> u32 {
         u32::try_from(crate::host_parallelism()).unwrap_or(u32::MAX)
+    }
+
+    fn apply_config(&self, backend_toml: &str) {
+        if let Err(e) = crate::apply_num_cpus(&self.num_cpus, backend_toml) {
+            tracing::error!(error = %e, "cpu num_cpus rejected");
+            crate::reject_num_cpus(e);
+        }
     }
 
     fn sample_stream(
@@ -267,6 +288,30 @@ mod tests {
             num_sweeps,
             seed,
             ..Default::default()
+        }
+    }
+
+    #[test]
+    fn the_core_budget_tracks_cpu_sa_rather_than_the_bare_host() {
+        // An operator setting num_cpus must get the same concurrency from
+        // every CPU backend. Without apply_config these binaries would run one
+        // model per hardware thread while cpu-sa ran the configured number,
+        // oversubscribing the host against an explicit instruction.
+        for variant in [SaVariant::Tabulated, SaVariant::MultiSpin] {
+            // Both fresh each pass: apply_config stores through a shared
+            // atomic, so a reused instance would carry the budget forward.
+            let sa = crate::CpuSampler::new(Algorithm::Sa);
+            let s = SaSampler::new(variant);
+            assert_eq!(s.stream_width(), sa.stream_width(), "default budget");
+
+            s.apply_config("num_cpus = 3");
+            sa.apply_config("num_cpus = 3");
+            assert_eq!(s.stream_width(), 3, "configured budget");
+            assert_eq!(s.stream_width(), sa.stream_width(), "configured budget");
+
+            // The pump clones the sampler after the handshake, so a clone must
+            // see the budget the handshake stored.
+            assert_eq!(s.clone().stream_width(), 3);
         }
     }
 
