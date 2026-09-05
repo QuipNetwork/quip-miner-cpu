@@ -85,8 +85,11 @@ pub struct SaSampler {
     variant: SaVariant,
     /// Operator core budget from `Configure.backend_toml`. 0 means the host.
     ///
-    /// Shared with every clone, because the pump clones the sampler after the
-    /// handshake has already stored the budget.
+    /// `apply_config` takes `&self`, so the budget needs interior mutability.
+    /// Behind an `Arc` rather than a bare atomic so that a clone shares the
+    /// stored budget instead of silently reverting to host parallelism, which
+    /// is how `CpuSampler` holds the same field. Taking this handle costs
+    /// `SaSampler` its `Copy`, `PartialEq` and `Eq` derives.
     num_cpus: Arc<AtomicUsize>,
 }
 
@@ -304,14 +307,16 @@ mod tests {
             let s = SaSampler::new(variant);
             assert_eq!(s.stream_width(), sa.stream_width(), "default budget");
 
+            // Clamped to the host, so a two-core CI box expects 2, not 3.
+            let want = 3.min(crate::host_parallelism());
             s.apply_config("num_cpus = 3");
             sa.apply_config("num_cpus = 3");
-            assert_eq!(s.stream_width(), 3, "configured budget");
+            assert_eq!(s.stream_width(), want, "configured budget");
             assert_eq!(s.stream_width(), sa.stream_width(), "configured budget");
 
-            // The pump clones the sampler after the handshake, so a clone must
-            // see the budget the handshake stored.
-            assert_eq!(s.clone().stream_width(), 3);
+            // The budget lives behind a shared handle, so a clone taken after
+            // the handshake still sees what the handshake stored.
+            assert_eq!(s.clone().stream_width(), want);
         }
     }
 

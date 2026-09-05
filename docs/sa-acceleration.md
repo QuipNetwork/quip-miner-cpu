@@ -12,13 +12,17 @@ On the two bundled Zephyr corpora, at equal sweep and read counts:
 
 | kernel | jobs per minute, 64 reads | speedup | quality change |
 | --- | --- | --- | --- |
-| `cpu-sa` before this work | 91.6 | 1.00x | baseline |
-| `cpu-sa` after this work | 110.1 | 1.20x | bit-identical |
-| `cpu-fsa` | 139.2 | 1.52x | none measurable |
-| `cpu-msa` | 915.7 | 10.00x | none measurable |
+| `cpu-sa` before this work | 94.1 | 1.00x | baseline |
+| `cpu-sa` after this work | 110.8 | 1.18x | bit-identical |
+| `cpu-fsa` | 137.7 | 1.46x | none measurable |
+| `cpu-msa` | 958.7 | 10.19x | none measurable |
 
-Neither solution quality nor solution diversity moves. The gain is one
-temperature ladder of identical work done faster.
+Measured on all 500 instances of the isingmark hardest-500 `chain-h0` corpus,
+with 2 repetitions per arm. Energy quality holds: every paired difference stays
+under 0.005 percent at a `t` below 1. Diversity holds for `cpu-sa` and
+`cpu-fsa`. For `cpu-msa` it falls 0.07 percent, which is below the unit the
+protocol reports. The gain is one temperature ladder of identical work done
+faster.
 
 ## Which techniques apply
 
@@ -186,16 +190,60 @@ The n=512 row shows what the degree-20 field recomputation costs. That graph
 fits in L2, and the multi-spin kernel reaches 40x there against 17.5x on
 Zephyr.
 
-### End-to-end
+### End-to-end, isingmark hardest-500 `chain-h0`
 
-Method follows `docs/comparisons.md`. The 50 hardest instances of each corpus,
-replayed through the isingmark `throughput` harness, 3 repetitions, arms
-interleaved within each repetition, so that host-load drift affects every arm
-equally.
-`sa-base` is the `cpu-sa` binary from `origin/main`, before this change.
+The primary campaign. All 500 instances of
+`isingmark/subset500/hardest500_h0.jsonl`, 2 repetitions, 5 arms, both read
+counts: 10000 jobs. `sa-base` is the `cpu-sa` binary from `origin/main`, before
+this change.
 
 Hardness 0.5 gives 36 reads and 550 sweeps. Hardness 1.0 gives 64 reads and 1000
 sweeps, which is exactly one `u64` word.
+
+The corpus topology and the `chain-h0` preset are the same graph. Canonicalised
+(sorted keys, compact separators) the two files hash identically, with matching
+node order and edge order, not merely matching counts.
+
+#### Hardness 1.0, 64 reads
+
+| kernel | mean gap | vs `sa-base` | gate | median wall | jobs/min | speedup | diversity |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `sa-base` | +1.641% | — | 10% | 4916 ms | 94.1 | 1.00x | 443.40 |
+| `cpu-sa` | +1.641% | -0.001% (t -0.1) | 11% | 4174 ms | 110.8 | 1.18x | 443.44 |
+| `cpu-fsa` | +1.642% | +0.001% (t +0.2) | 10% | 3337 ms | 137.7 | 1.46x | 443.39 |
+| `cpu-msa` | +1.645% | +0.003% (t +0.8) | 10% | 380 ms | 958.7 | 10.19x | 443.13 |
+| `cpu-sb` | +1.565% | -0.076% (t -19.3) | 16% | 5744 ms | 80.9 | 0.86x | 437 |
+
+#### Hardness 0.5, 36 reads
+
+| kernel | mean gap | vs `sa-base` | gate | median wall | jobs/min | speedup | diversity |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `sa-base` | +1.941% | — | 1% | 1560 ms | 288.0 | 1.00x | 450.14 |
+| `cpu-sa` | +1.945% | +0.004% (t +0.8) | 0% | 1328 ms | 337.5 | 1.17x | 450.14 |
+| `cpu-fsa` | +1.941% | +0.000% (t +0.1) | 1% | 1067 ms | 414.4 | 1.44x | 450.10 |
+| `cpu-msa` | +1.939% | -0.002% (t -0.3) | 1% | 213 ms | 1623.0 | 5.64x | 449.80 |
+| `cpu-sb` | +1.823% | -0.118% (t -24.3) | 4% | 1820 ms | 246.9 | 0.86x | 445 |
+
+#### What the mean gap does and does not say
+
+On 494 of the 500 instances, every arm finished above the energy the corpus
+records for that nonce. The gap measures distance below a target the chain
+already beat. Its absolute size says more about the corpus than about any
+kernel. It is still the right quantity for the
+paired columns, because every arm faces the same target on the same instance.
+
+### End-to-end, hardest-50 subset
+
+An earlier campaign on the 50 hardest instances of each corpus, 3 repetitions,
+arms interleaved within each repetition. Kept because it covers `chain-ternary`,
+which has no 500-instance corpus, and because it is the only campaign with
+3 repetitions.
+
+Those 50 nonces are a subset of the 500. Restricting the 500-instance run to
+them reproduces the separate campaign: +0.377% against +0.387% for `cpu-sa`.
+The full 500 shows a much larger mean gap than its own hardest-50 subset,
+because "hardest" ranks by how deep the chain went, not by how hard the instance
+is for these kernels.
 
 #### Hardness 0.5, `chain-h0`
 
@@ -246,9 +294,27 @@ removes instance-to-instance variation. The `t` value is the paired mean divided
 by its standard error. `gate` is the fraction of runs that met the corpus
 difficulty gate. `diversity` is the protocol diversity score in milli-units.
 
-Every `t` value for the three annealing kernels is below 1.5 in absolute value.
-Quality is unchanged. `cpu-sb` is the one arm with a real quality difference,
-and it is a different algorithm, included here only for reference.
+Every `t` value for the three annealing kernels is below 1.5 in absolute value
+on 500 paired instances. Energy quality is unchanged.
+
+`cpu-sb` is the one arm whose energy differs, and the difference is an
+improvement: 0.076% and 0.118% deeper, which lifts the gate rate from 10 to 16
+percent and from 1 to 4 percent, at 0.86x throughput. It is a Simulated
+Bifurcation kernel, included here for reference.
+
+**Diversity moves slightly for `cpu-msa`, and the earlier campaign was too small
+to see it.** Against `cpu-sa` the multi-spin kernel loses 0.31 milli at hardness
+1.0 and 0.34 milli at hardness 0.5, which is t = +2.4 and t = +2.8 over 1000
+paired records. The effect is real. It is also 0.07 percent, below the whole
+milli-unit the protocol reports.
+
+The mechanism is the lane coupling the design predicted. Replicas share one
+acceptance threshold per word update, so two lanes that ever reach the same
+configuration stay identical for the rest of the run. Fifty instances put this
+inside the noise, while five hundred resolve it. Nothing in the shipped code
+changes on account of 0.07 percent, but the earlier claim that the coupling is
+unmeasurable was wrong. A campaign that raises read counts or lowers temperature
+should measure it again.
 
 ### Why 5.3x and 10.0x
 
@@ -291,12 +357,14 @@ ever reach the same configuration make the same decision at every later site,
 so they stay identical for the rest of the run. Coalescence is absorbing.
 Because the miner is scored on diversity, this was the main risk in the design.
 
-Measurement settled it for this problem class. Diversity reads 445 where the
-baseline reads 446 on `chain-h0`, and 258 where the baseline reads 261 on
-`chain-ternary`, across 50 instances, 3 repetitions and both read counts. Both
-differences sit inside the run-to-run spread, so the decorrelation machinery
-stayed on paper. A landscape that funnels every replica into one basin would
-show this effect, and neither bundled corpus does.
+The 500-instance campaign resolves the effect and sizes it. `cpu-msa` loses
+0.31 milli of diversity at hardness 1.0 and 0.34 at hardness 0.5 against
+`cpu-sa`, at `t` of 2.4 and 2.8. That is 0.07 percent, below the whole
+milli-unit the protocol reports, and it costs nothing at the read counts and
+temperatures measured here. The decorrelation machinery stays on paper on those
+grounds. The effect is present, merely small. Build the machinery for a
+campaign that raises the read count, or one that moves to a landscape which
+funnels replicas into a single basin.
 
 **Spin reordering, technique 3.** The Zephyr fixture already relabels to a dense
 range in ascending identifier order, and the neighbour rows are contiguous. No

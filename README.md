@@ -141,6 +141,9 @@ The budget bounds sampler concurrency:
   below `num_cpus`, except when `num_cpus` is smaller than `gibbs.workers`.
   Then one model still uses `gibbs.workers` threads.
 
+- `quip-cpu-fsa` and `quip-cpu-msa`: same rule as SA. One model per core,
+  models sequential inside a job, total threads equal `num_cpus`.
+
 Other CPU binaries (SB, MPS, Flatiron) do not read `num_cpus`.
 
 **Driver / fixed-input (run in isolation, no chain).** Use the coordinator's
