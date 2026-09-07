@@ -21,6 +21,8 @@ use quip_solver_core::{Algorithm, CancelToken, IsingGraph, SampleParams, Sampler
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
 
+use crate::sa_int::{acceptance_table, anneal_one_read_int, IntGraph};
+
 /// Per-variable neighbor lists in CSR layout for O(degree) local fields.
 ///
 /// A flat CSR (`nbr_start` offsets into contiguous `nbr_node`/`nbr_coup`)
@@ -147,7 +149,7 @@ pub(crate) fn apply_field_delta(graph: &CpuGraph, heff: &mut [f64], var: usize, 
     }
 }
 
-fn random_spins(n: usize, rng: &mut SmallRng) -> Vec<i8> {
+pub(crate) fn random_spins(n: usize, rng: &mut SmallRng) -> Vec<i8> {
     (0..n)
         .map(|_| if rng.gen::<bool>() { 1i8 } else { -1i8 })
         .collect()
@@ -161,11 +163,35 @@ fn metropolis_accept(delta: f64, beta: f64, rng: &mut SmallRng) -> bool {
     rng.gen::<f64>() < accept_prob
 }
 
+/// Which annealing kernel a problem is eligible for.
+///
+/// The two arms produce identical spins from identical random streams (see
+/// [`crate::sa_int`]), so this is purely a speed choice: `Int` streams packed
+/// integer adjacency and reads tabulated acceptance probabilities, `Float`
+/// keeps the general `f64` arithmetic every other problem needs.
+enum Kernel {
+    /// Discrete-coupling kernel, with its per-rung acceptance table.
+    Int(IntGraph, Vec<f64>),
+    /// General `f64` kernel.
+    Float(CpuGraph),
+}
+
+impl Kernel {
+    fn for_problem(graph: &IsingGraph, beta_schedule: &[f64]) -> Self {
+        let int = IntGraph::from_base(graph)
+            .and_then(|g| acceptance_table(beta_schedule, g.row_len()).map(|t| (g, t)));
+        match int {
+            Some((g, table)) => Self::Int(g, table),
+            None => Self::Float(CpuGraph::from_base(graph)),
+        }
+    }
+}
+
 /// Marker returned when a cancel checkpoint fires mid-attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct SampleCancelled;
 
-fn anneal_one_read(
+pub(crate) fn anneal_one_read(
     graph: &CpuGraph,
     beta_schedule: &[f64],
     sweeps_per_beta: usize,
@@ -310,10 +336,10 @@ pub(crate) fn sample_ising_cancellable(
         ));
     }
     let num_reads = params.num_reads.max(1);
-    let cpu = CpuGraph::from_base(graph);
     let beta_schedule = build_beta_schedule(graph, params);
     let sweeps_per = params.sweeps_per_beta.max(1);
     let base_seed = params.seed;
+    let kernel = Kernel::for_problem(graph, &beta_schedule);
 
     let mut results = Vec::with_capacity(num_reads);
     for read_idx in 0..num_reads {
@@ -328,7 +354,12 @@ pub(crate) fn sample_ising_cancellable(
             .wrapping_add(read_idx as u64)
             .wrapping_add(1);
         let mut rng = SmallRng::seed_from_u64(seed);
-        let spins = anneal_one_read(&cpu, &beta_schedule, sweeps_per, &mut rng, cancel)?;
+        let spins = match &kernel {
+            Kernel::Int(g, table) => anneal_one_read_int(g, table, sweeps_per, &mut rng, cancel)?,
+            Kernel::Float(cpu) => {
+                anneal_one_read(cpu, &beta_schedule, sweeps_per, &mut rng, cancel)?
+            }
+        };
         results.push(score_spins(&spins, graph));
     }
     Ok(results)

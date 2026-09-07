@@ -24,6 +24,8 @@ reads are sequential and cache-local. Energies are scored with the canonical
 | `quip-cpu-tedsb` | tabu-enhanced discrete Simulated Bifurcation | experimental |
 | `quip-cpu-sbqa` | replica-ring discrete Simulated Bifurcation | experimental |
 | `quip-cpu-ggdsb` | globally guided discrete Simulated Bifurcation | experimental |
+| `quip-cpu-fsa` | simulated annealing with tabulated Metropolis thresholds | experimental |
+| `quip-cpu-msa` | multi-spin coded simulated annealing, 64 reads per word | experimental |
 | `quip-cpu-mps` | tensor network: imaginary-time TEBD with exact sampling | experimental |
 | `quip-cpu-mfa` | mean-field annealing (the same kernel at bond dimension 1) | experimental |
 | `quip-cpu-flatiron` | belief-propagation tensor network on the problem graph | experimental |
@@ -145,6 +147,9 @@ The budget bounds sampler concurrency:
   model uses `gibbs.workers` threads (default 4). The product stays at or
   below `num_cpus`, except when `num_cpus` is smaller than `gibbs.workers`.
   Then one model still uses `gibbs.workers` threads.
+
+- `quip-cpu-fsa` and `quip-cpu-msa`: same rule as SA. One model per core,
+  models sequential inside a job, total threads equal `num_cpus`.
 
 Other CPU binaries (SB, MPS, Flatiron) do not read `num_cpus`.
 
