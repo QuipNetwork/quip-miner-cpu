@@ -1,0 +1,20 @@
+//! CPU tabu-enhanced discrete simulated-bifurcation miner (`quip-cpu-tedsb`).
+
+use clap::Parser;
+use quip_miner_cpu::{SbSampler, TesbConfig, CPU_TEDSB_IDENTITY, DSB};
+use quip_solver_core::{run, CommonArgs};
+use std::process::ExitCode;
+
+#[derive(Parser)]
+#[command(version = concat!(env!("CARGO_PKG_VERSION"), " protocol 1"))]
+struct Cli {
+    #[command(flatten)]
+    common: CommonArgs,
+}
+
+fn main() -> ExitCode {
+    let cli = Cli::parse();
+    run(CPU_TEDSB_IDENTITY, &cli.common, || {
+        Ok(SbSampler::tabu(DSB, TesbConfig::default()))
+    })
+}

@@ -21,7 +21,10 @@ mod sa_msc;
 pub mod sa_sampler;
 pub mod sampler_core;
 pub mod sb_core;
+pub mod sb_ggsb;
 pub mod sb_sampler;
+pub mod sb_sbqa;
+pub mod sb_tesb;
 mod spin_barrier;
 
 pub use flatiron::{sample_ising_flatiron, FlatironConfig};
@@ -32,10 +35,17 @@ pub use mps_sampler::{MpsSampler, CPU_MFA_IDENTITY, CPU_MPS_IDENTITY};
 pub use quip_solver_core::{Algorithm, IsingGraph, SampleParams, SamplerResult};
 pub use sa_sampler::{SaSampler, SaVariant, CPU_FSA_IDENTITY, CPU_MSA_IDENTITY};
 pub use sampler_core::sample_ising;
-pub use sb_core::{sample_sb, sample_sb_with_workers, Coupling, SbVariant, BSB, DSB, HBSB, HDSB};
-pub use sb_sampler::{
-    SbSampler, CPU_BSB_IDENTITY, CPU_HBSB_IDENTITY, CPU_HDSB_IDENTITY, CPU_SB_IDENTITY,
+pub use sb_core::{
+    sample_sb, sample_sb_with_workers, Coupling, SbVariant, BSB, DSB, EDGE_OF_CHAOS_CONTROL, GBSB,
+    GDSB, HBSB, HDSB,
 };
+pub use sb_ggsb::{sample_ggsb, GgsbConfig};
+pub use sb_sampler::{
+    SbSampler, CPU_BSB_IDENTITY, CPU_GBSB_IDENTITY, CPU_GDSB_IDENTITY, CPU_GGDSB_IDENTITY,
+    CPU_HBSB_IDENTITY, CPU_HDSB_IDENTITY, CPU_SBQA_IDENTITY, CPU_SB_IDENTITY, CPU_TEDSB_IDENTITY,
+};
+pub use sb_sbqa::{sample_sbqa, SbqaConfig};
+pub use sb_tesb::{sample_tesb, TesbConfig};
 
 use quip_solver_core::adapt::AdaptBounds;
 use quip_solver_core::{

@@ -1,6 +1,6 @@
 [package]
 name = "quip-miner-cpu"
-version = "0.3.2-rc3"
+version = "0.3.2"
 edition = "2021"
 description = "CPU Ising miners: simulated annealing and single-site Gibbs (v0.3)"
 license = "AGPL-3.0-or-later"
@@ -42,6 +42,36 @@ required-features = ["experimental"]
 [[bin]]
 name = "quip-cpu-hbsb"
 path = "src/bin/quip_cpu_hbsb.rs"
+required-features = ["experimental"]
+
+# Edge-of-chaos generalized bSB. Experimental track, gated for the same reason as bsb.
+[[bin]]
+name = "quip-cpu-gbsb"
+path = "src/bin/quip_cpu_gbsb.rs"
+required-features = ["experimental"]
+
+# Edge-of-chaos control on the discrete coupling. Experimental track.
+[[bin]]
+name = "quip-cpu-gdsb"
+path = "src/bin/quip_cpu_gdsb.rs"
+required-features = ["experimental"]
+
+# Tabu-enhanced dSB. Experimental track.
+[[bin]]
+name = "quip-cpu-tedsb"
+path = "src/bin/quip_cpu_tedsb.rs"
+required-features = ["experimental"]
+
+# Replica-ring dSB. Experimental track.
+[[bin]]
+name = "quip-cpu-sbqa"
+path = "src/bin/quip_cpu_sbqa.rs"
+required-features = ["experimental"]
+
+# Globally guided dSB. Experimental track.
+[[bin]]
+name = "quip-cpu-ggdsb"
+path = "src/bin/quip_cpu_ggdsb.rs"
 required-features = ["experimental"]
 
 # Tabulated-threshold annealing. Experimental track, gated for the same reason

@@ -14,7 +14,10 @@
 //!   --test sb_fixture sb_kernel_matches_the_determinism_fixture -- --exact
 //! ```
 
-use quip_miner_cpu::{sample_sb, IsingGraph, SampleParams, SbVariant, BSB, DSB, HBSB, HDSB};
+use quip_miner_cpu::{
+    sample_ggsb, sample_sb, sample_sbqa, sample_tesb, GgsbConfig, IsingGraph, SampleParams,
+    SamplerResult, SbqaConfig, TesbConfig, BSB, DSB, GBSB, GDSB, HBSB, HDSB,
+};
 use serde_json::{json, Value};
 use std::fs;
 
@@ -26,9 +29,9 @@ const FIXTURE_PATH: &str = concat!(
 struct Case {
     name: &'static str,
     algorithm: &'static str,
-    variant: SbVariant,
     graph: IsingGraph,
     params: SampleParams,
+    run: fn(&IsingGraph, &SampleParams) -> Vec<SamplerResult>,
 }
 
 fn params(num_reads: usize, num_sweeps: usize, seed: u64) -> SampleParams {
@@ -61,37 +64,91 @@ fn cases() -> Vec<Case> {
         Case {
             name: "ferro_pair",
             algorithm: "sb",
-            variant: DSB,
             graph: ferro_pair(),
             params: params(4, 64, 1),
+            run: |g, p| sample_sb(g, p, DSB),
         },
         Case {
             name: "biased_chain",
             algorithm: "sb",
-            variant: DSB,
             graph: biased_chain(),
             params: params(4, 128, 2),
+            run: |g, p| sample_sb(g, p, DSB),
         },
         Case {
             name: "ring8_ballistic",
             algorithm: "bsb",
-            variant: BSB,
             graph: ring8(),
             params: params(4, 128, 3),
+            run: |g, p| sample_sb(g, p, BSB),
         },
         Case {
             name: "ring8_heated_discrete",
             algorithm: "hdsb",
-            variant: HDSB,
             graph: ring8(),
             params: params(4, 128, 4),
+            run: |g, p| sample_sb(g, p, HDSB),
         },
         Case {
             name: "ring8_heated_ballistic",
             algorithm: "hbsb",
-            variant: HBSB,
             graph: ring8(),
             params: params(4, 128, 5),
+            run: |g, p| sample_sb(g, p, HBSB),
+        },
+        Case {
+            name: "ring8_edge_of_chaos_ballistic",
+            algorithm: "gbsb",
+            graph: ring8(),
+            params: params(4, 128, 6),
+            run: |g, p| sample_sb(g, p, GBSB),
+        },
+        Case {
+            name: "ring8_edge_of_chaos_discrete",
+            algorithm: "gdsb",
+            graph: ring8(),
+            params: params(4, 128, 7),
+            run: |g, p| sample_sb(g, p, GDSB),
+        },
+        Case {
+            name: "ring8_tabu_discrete",
+            algorithm: "tedsb",
+            graph: ring8(),
+            params: params(4, 200, 8),
+            run: |g, p| {
+                sample_tesb(
+                    g,
+                    p,
+                    DSB,
+                    TesbConfig {
+                        warm_replicas: 8,
+                        ..TesbConfig::default()
+                    },
+                )
+            },
+        },
+        Case {
+            name: "ring8_replica_ring",
+            algorithm: "sbqa",
+            graph: ring8(),
+            params: params(4, 128, 9),
+            run: |g, p| {
+                sample_sbqa(
+                    g,
+                    p,
+                    SbqaConfig {
+                        replicas: 2,
+                        ..SbqaConfig::default()
+                    },
+                )
+            },
+        },
+        Case {
+            name: "ring8_globally_guided_discrete",
+            algorithm: "ggdsb",
+            graph: ring8(),
+            params: params(4, 128, 10),
+            run: |g, p| sample_ggsb(g, p, DSB, GgsbConfig::default()),
         },
     ]
 }
@@ -100,7 +157,7 @@ fn observed() -> Value {
     let entries: Vec<Value> = cases()
         .into_iter()
         .map(|c| {
-            let results = sample_sb(&c.graph, &c.params, c.variant);
+            let results = (c.run)(&c.graph, &c.params);
             json!({
                 "name": c.name,
                 "algorithm": c.algorithm,

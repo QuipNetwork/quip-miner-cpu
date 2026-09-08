@@ -13,6 +13,9 @@ use quip_solver_core::{
 };
 
 use crate::sb_core::{sample_sb, SbVariant};
+use crate::sb_ggsb::{sample_ggsb, GgsbConfig};
+use crate::sb_sbqa::{sample_sbqa, SbqaConfig};
+use crate::sb_tesb::{sample_tesb, TesbConfig};
 use crate::{run_stream_pump, DEFAULT_MAX_EDGES, DEFAULT_MAX_NODES};
 
 /// SB adapt envelope, shared by all four SB identities.
@@ -87,11 +90,82 @@ pub const CPU_HBSB_IDENTITY: BackendIdentity = BackendIdentity {
     adapt: CPU_SB_ADAPT,
 };
 
+/// Backend identity for `quip-cpu-gbsb` (generalized ballistic Simulated
+/// Bifurcation with edge-of-chaos control; Goto, Hidaka, Tatsumura 2026).
+/// Experimental track.
+pub const CPU_GBSB_IDENTITY: BackendIdentity = BackendIdentity {
+    backend: "cpu",
+    algorithm: "gbsb",
+    max_nodes: DEFAULT_MAX_NODES,
+    max_edges: DEFAULT_MAX_EDGES,
+    features: &[],
+    adapt: CPU_SB_ADAPT,
+};
+
+/// Backend identity for `quip-cpu-gdsb`: the same control on the discrete
+/// coupling. The paper names this form as future work; it is this project's
+/// extension. Experimental track.
+pub const CPU_GDSB_IDENTITY: BackendIdentity = BackendIdentity {
+    backend: "cpu",
+    algorithm: "gdsb",
+    max_nodes: DEFAULT_MAX_NODES,
+    max_edges: DEFAULT_MAX_EDGES,
+    features: &[],
+    adapt: CPU_SB_ADAPT,
+};
+
+/// Backend identity for `quip-cpu-tedsb` (tabu-enhanced discrete Simulated
+/// Bifurcation; Tao et al. 2026). Experimental track.
+pub const CPU_TEDSB_IDENTITY: BackendIdentity = BackendIdentity {
+    backend: "cpu",
+    algorithm: "tedsb",
+    max_nodes: DEFAULT_MAX_NODES,
+    max_edges: DEFAULT_MAX_EDGES,
+    features: &[],
+    adapt: CPU_SB_ADAPT,
+};
+
+/// Backend identity for `quip-cpu-sbqa` (Simulated Bifurcation Quantum
+/// Annealing; Pawlowski et al. 2026). Experimental track.
+pub const CPU_SBQA_IDENTITY: BackendIdentity = BackendIdentity {
+    backend: "cpu",
+    algorithm: "sbqa",
+    max_nodes: DEFAULT_MAX_NODES,
+    max_edges: DEFAULT_MAX_EDGES,
+    features: &[],
+    adapt: CPU_SB_ADAPT,
+};
+
+/// Backend identity for `quip-cpu-ggdsb` (globally guided discrete Simulated
+/// Bifurcation; Xiao et al. 2026). Experimental track.
+pub const CPU_GGDSB_IDENTITY: BackendIdentity = BackendIdentity {
+    backend: "cpu",
+    algorithm: "ggdsb",
+    max_nodes: DEFAULT_MAX_NODES,
+    max_edges: DEFAULT_MAX_EDGES,
+    features: &[],
+    adapt: CPU_SB_ADAPT,
+};
+
+/// Which SB kernel a sampler drives.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum SbKernel {
+    /// One integrator run per read: dSB, bSB, the heated and the controlled
+    /// forms.
+    Plain(SbVariant),
+    /// Two-phase tabu kernel over the plain integrator.
+    Tabu(SbVariant, TesbConfig),
+    /// Reads grouped into replica rings.
+    Ring(SbqaConfig),
+    /// All reads advancing in lockstep under a shared leader.
+    Swarm(SbVariant, GgsbConfig),
+}
+
 /// Simulated Bifurcation sampler backend. No device, no governor, uncapped
-/// reads. The variant selects the coupling form and the heating rate.
+/// reads. The kernel selects the integrator and its outer loop.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SbSampler {
-    variant: SbVariant,
+    kernel: SbKernel,
 }
 
 impl SbSampler {
@@ -119,7 +193,39 @@ impl SbSampler {
     /// # }
     /// ```
     pub fn new(variant: SbVariant) -> Self {
-        Self { variant }
+        Self {
+            kernel: SbKernel::Plain(variant),
+        }
+    }
+
+    /// Create a tabu-enhanced sampler over `variant`.
+    pub fn tabu(variant: SbVariant, cfg: TesbConfig) -> Self {
+        Self {
+            kernel: SbKernel::Tabu(variant, cfg),
+        }
+    }
+
+    /// Create a replica-ring sampler.
+    pub fn ring(cfg: SbqaConfig) -> Self {
+        Self {
+            kernel: SbKernel::Ring(cfg),
+        }
+    }
+
+    /// Create a globally guided sampler over `variant`.
+    pub fn swarm(variant: SbVariant, cfg: GgsbConfig) -> Self {
+        Self {
+            kernel: SbKernel::Swarm(variant, cfg),
+        }
+    }
+
+    fn run(&self, graph: &IsingGraph, params: &SampleParams) -> Vec<SamplerResult> {
+        match self.kernel {
+            SbKernel::Plain(variant) => sample_sb(graph, params, variant),
+            SbKernel::Tabu(variant, cfg) => sample_tesb(graph, params, variant, cfg),
+            SbKernel::Ring(cfg) => sample_sbqa(graph, params, cfg),
+            SbKernel::Swarm(variant, cfg) => sample_ggsb(graph, params, variant, cfg),
+        }
     }
 }
 
@@ -129,7 +235,7 @@ impl Sampler for SbSampler {
         graph: &IsingGraph,
         params: &SampleParams,
     ) -> Result<Vec<SamplerResult>, SampleError> {
-        Ok(sample_sb(graph, params, self.variant))
+        Ok(self.run(graph, params))
     }
 
     /// One model per core, the same shape as [`crate::CpuSampler::stream_width`].
@@ -150,10 +256,10 @@ impl Sampler for SbSampler {
         out: tokio::sync::mpsc::Sender<StreamResult>,
         cancel: CancelToken,
     ) {
-        let variant = self.variant;
+        let sampler = *self;
         run_stream_pump(
             || self.stream_width(),
-            move |g, p, _, _| Ok(sample_sb(g, p, variant)),
+            move |g, p, _, _| Ok(sampler.run(g, p)),
             jobs,
             out,
             cancel,
@@ -296,5 +402,43 @@ mod tests {
         assert_eq!(CPU_HBSB_IDENTITY.algorithm, "hbsb");
         assert_eq!(CPU_HBSB_IDENTITY.max_nodes, 100_000);
         assert_eq!(CPU_HBSB_IDENTITY.max_edges, 1_000_000);
+    }
+
+    #[test]
+    fn cpu_gbsb_identity_advertises_gbsb_algorithm() {
+        assert_eq!(CPU_GBSB_IDENTITY.backend, "cpu");
+        assert_eq!(CPU_GBSB_IDENTITY.algorithm, "gbsb");
+        assert_eq!(CPU_GBSB_IDENTITY.adapt.max_sweeps, CPU_SB_ADAPT.max_sweeps);
+    }
+
+    #[test]
+    fn cpu_gdsb_identity_advertises_gdsb_algorithm() {
+        assert_eq!(CPU_GDSB_IDENTITY.backend, "cpu");
+        assert_eq!(CPU_GDSB_IDENTITY.algorithm, "gdsb");
+        assert_eq!(CPU_GDSB_IDENTITY.adapt.max_sweeps, CPU_SB_ADAPT.max_sweeps);
+    }
+
+    #[test]
+    fn cpu_tedsb_identity_advertises_tedsb_algorithm() {
+        assert_eq!(CPU_TEDSB_IDENTITY.backend, "cpu");
+        assert_eq!(CPU_TEDSB_IDENTITY.algorithm, "tedsb");
+        let sampler = SbSampler::tabu(DSB, TesbConfig::default());
+        assert!(sampler.stream_width() >= 1);
+    }
+
+    #[test]
+    fn cpu_sbqa_identity_advertises_sbqa_algorithm() {
+        assert_eq!(CPU_SBQA_IDENTITY.backend, "cpu");
+        assert_eq!(CPU_SBQA_IDENTITY.algorithm, "sbqa");
+        let sampler = SbSampler::ring(SbqaConfig::default());
+        assert!(sampler.stream_width() >= 1);
+    }
+
+    #[test]
+    fn cpu_ggdsb_identity_advertises_ggdsb_algorithm() {
+        assert_eq!(CPU_GGDSB_IDENTITY.backend, "cpu");
+        assert_eq!(CPU_GGDSB_IDENTITY.algorithm, "ggdsb");
+        let sampler = SbSampler::swarm(DSB, GgsbConfig::default());
+        assert!(sampler.stream_width() >= 1);
     }
 }

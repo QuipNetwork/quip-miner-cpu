@@ -41,20 +41,27 @@ use crate::spin_barrier::SpinBarrier;
 /// Internal state precision. One line changes the whole kernel to f64 for a
 /// benchmark build; the reported energy never depends on it, because the
 /// sampler returns `sign(x)` as `i8` and `energy_milli` rescores in f64.
-type Real = f32;
+pub(crate) type Real = f32;
 
 /// Time step. The 2021 paper searched `{0.25, 0.5, 0.75, 1.0, 1.25}` and used
 /// 1.0 or 1.25 for the ballistic and discrete variants.
-const DT: Real = 1.0;
+pub(crate) const DT: Real = 1.0;
 
 /// Detuning `a0`, set to 1 in every source. With `a0 = 1` the position update
 /// reduces to `x += y * dt`.
-const A0: Real = 1.0;
+pub(crate) const A0: Real = 1.0;
 
 /// Initial draw is `x, y ~ U(-INIT_RANGE, INIT_RANGE)` per particle per read.
 /// The papers say only "randomly set around zero"; 0.1 keeps particles away
 /// from the walls during the early low-pump phase.
 const INIT_RANGE: Real = 0.1;
+
+/// Edge-of-chaos control strength `A` (Goto, Hidaka, Tatsumura, Phys. Rev.
+/// Applied 25, 044011, 2026, Eq. 7). The paper has no global default: tuned
+/// values span 0.04 to 0.66 per instance, and 0.2 is the value its step-size
+/// study uses. Fixed here the way `gamma` is fixed for the heated variants;
+/// the benchmark campaign re-tunes it.
+pub const EDGE_OF_CHAOS_CONTROL: f32 = 0.2;
 
 /// Form of the coupling term in the SB force.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -65,40 +72,68 @@ pub enum Coupling {
     Continuous,
 }
 
-/// One SB variant: the coupling form and the heating rate `γ`.
+/// One SB variant: the coupling form, the heating rate `γ`, and the
+/// edge-of-chaos control strength `A`.
 ///
 /// `γ = 0` means no heating. The nonzero values are the K2000-tuned constants
 /// from Kanao and Goto 2022, fixed per variant before any tuning starts.
+///
+/// `A = 0` means one scalar pump for every particle. A nonzero `A` gives each
+/// particle its own bifurcation parameter `p_i`, advanced once per step by
+/// `p_i -= (1 - A x_i^2) p_i / (M - k)`, so a particle near a wall keeps its
+/// pump longer. The paper defines and measures the ballistic form only; the
+/// discrete form is this project's extension along the `coupling` axis.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SbVariant {
     /// Coupling form for the force term.
     pub coupling: Coupling,
     /// Heating rate. Zero disables the heating step entirely.
     pub gamma: f32,
+    /// Edge-of-chaos control strength. Zero keeps the scalar pump.
+    pub control: f32,
 }
 
 /// Discrete SB. The production-track variant, shipped as `quip-cpu-sb`.
 pub const DSB: SbVariant = SbVariant {
     coupling: Coupling::Discrete,
     gamma: 0.0,
+    control: 0.0,
 };
 
 /// Ballistic SB.
 pub const BSB: SbVariant = SbVariant {
     coupling: Coupling::Continuous,
     gamma: 0.0,
+    control: 0.0,
 };
 
 /// Heated discrete SB.
 pub const HDSB: SbVariant = SbVariant {
     coupling: Coupling::Discrete,
     gamma: 0.06,
+    control: 0.0,
 };
 
 /// Heated ballistic SB.
 pub const HBSB: SbVariant = SbVariant {
     coupling: Coupling::Continuous,
     gamma: 0.5,
+    control: 0.0,
+};
+
+/// Generalized ballistic SB with edge-of-chaos control: the paper's GbSB.
+pub const GBSB: SbVariant = SbVariant {
+    coupling: Coupling::Continuous,
+    gamma: 0.0,
+    control: EDGE_OF_CHAOS_CONTROL,
+};
+
+/// Generalized discrete SB: the same control on the discrete coupling. The
+/// paper names this form as future work and does not measure it.
+pub const GDSB: SbVariant = SbVariant {
+    coupling: Coupling::Discrete,
+    gamma: 0.0,
+    control: EDGE_OF_CHAOS_CONTROL,
 };
 
 /// Per-particle neighbor lists in CSR layout, in `Real` precision.
@@ -116,9 +151,10 @@ pub const HBSB: SbVariant = SbVariant {
 ///
 /// Biases live outside the CSR rows because they reach the force through the
 /// ancilla column rather than through a neighbor row.
-struct SbGraph {
+#[derive(Clone)]
+pub(crate) struct SbGraph {
     /// Linear biases, one per node, narrowed for the hot loop.
-    h: Vec<Real>,
+    pub(crate) h: Vec<Real>,
     /// CSR row offsets, length `n + 1`.
     nbr_start: Vec<u32>,
     /// Flattened neighbor node ids.
@@ -126,15 +162,15 @@ struct SbGraph {
     /// Flattened couplings, parallel to `nbr_node`.
     nbr_coup: Vec<Real>,
     /// True when any `h_i != 0`. The ancilla exists only then.
-    has_bias: bool,
+    pub(crate) has_bias: bool,
     /// Coupling normalization `0.5 sqrt(n_spins - 1) / ||J||_F`, computed once
     /// per job. Zero when the problem carries no scale or the inputs are not
     /// finite.
-    c0: Real,
+    pub(crate) c0: Real,
 }
 
 impl SbGraph {
-    fn from_base(g: &IsingGraph) -> Self {
+    pub(crate) fn from_base(g: &IsingGraph) -> Self {
         let n = g.h.len();
         let mut deg = vec![0u32; n];
         for &(u, v) in &g.edges {
@@ -204,22 +240,28 @@ impl SbGraph {
         }
     }
 
-    fn num_nodes(&self) -> usize {
+    pub(crate) fn num_nodes(&self) -> usize {
         self.h.len()
     }
 
     /// Particle count: the graph's nodes plus the ancilla when the problem
     /// carries a bias.
-    fn num_particles(&self) -> usize {
+    pub(crate) fn num_particles(&self) -> usize {
         self.num_nodes() + usize::from(self.has_bias)
     }
 
     /// `(neighbor_ids, couplings)` slices for `var`.
     #[inline]
-    fn neighbors(&self, var: usize) -> (&[u32], &[Real]) {
+    pub(crate) fn neighbors(&self, var: usize) -> (&[u32], &[Real]) {
         let s = self.nbr_start[var] as usize;
         let e = self.nbr_start[var + 1] as usize;
         (&self.nbr_node[s..e], &self.nbr_coup[s..e])
+    }
+
+    /// Multiply the coupling normalization. The tabu kernel runs its checking
+    /// phase at a smaller `c0` than the warm-up, as the paper does.
+    pub(crate) fn scale_c0(&mut self, scale: Real) {
+        self.c0 *= scale;
     }
 }
 
@@ -229,7 +271,7 @@ impl SbGraph {
 /// coefficient `a0 - a(t)` reaches zero and the coupling term alone decides the
 /// sign of each position. Callers guarantee `n_step >= 1`.
 #[inline]
-fn pump(step: usize, n_step: usize) -> Real {
+pub(crate) fn pump(step: usize, n_step: usize) -> Real {
     A0 * (step + 1) as Real / n_step as Real
 }
 
@@ -237,7 +279,7 @@ fn pump(step: usize, n_step: usize) -> Real {
 ///
 /// Positions are drawn first, then momenta. The order is part of the kernel's
 /// reproducibility contract and the determinism fixture pins it.
-fn draw_initial_conditions(m: usize, rng: &mut SmallRng) -> (Vec<Real>, Vec<Real>) {
+pub(crate) fn draw_initial_conditions(m: usize, rng: &mut SmallRng) -> (Vec<Real>, Vec<Real>) {
     let x: Vec<Real> = (0..m)
         .map(|_| rng.gen_range(-INIT_RANGE..=INIT_RANGE))
         .collect();
@@ -245,6 +287,159 @@ fn draw_initial_conditions(m: usize, rng: &mut SmallRng) -> (Vec<Real>, Vec<Real
         .map(|_| rng.gen_range(-INIT_RANGE..=INIT_RANGE))
         .collect();
     (x, y)
+}
+
+/// Per-read seed. Same derivation as `sampler_core::sample_ising`, so a
+/// benchmark can pair an SB run with an SA run on one job at one seed.
+pub(crate) fn read_seed(base: u64, read_idx: usize) -> u64 {
+    base.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        .wrapping_add(read_idx as u64)
+        .wrapping_add(1)
+}
+
+/// One trajectory's integrator state plus the scratch one step needs, so the
+/// hot loop allocates nothing.
+pub(crate) struct Trajectory {
+    /// Positions, one per particle, ancilla last when the problem has a bias.
+    pub(crate) x: Vec<Real>,
+    /// Momenta, parallel to `x`.
+    pub(crate) y: Vec<Real>,
+    /// `g(x_j)` for every particle, refreshed once per step so the force reads
+    /// the OLD positions for every i.
+    coupled: Vec<Real>,
+    /// Momenta captured before the SB substep. Empty when the variant does not
+    /// heat, so the unheated path pays neither the allocation nor the copy.
+    y_pre: Vec<Real>,
+    /// Per-particle bifurcation parameters `p_i`. Empty when the variant has no
+    /// control, so the plain variants keep the scalar pump and their fixture.
+    p: Vec<Real>,
+}
+
+impl Trajectory {
+    /// State for one read. `heated` and `controlled` select the two optional
+    /// code paths; they are parameters rather than reads of the variant so a
+    /// test can force a path on a variant whose constant is zero.
+    pub(crate) fn new(x: Vec<Real>, y: Vec<Real>, heated: bool, controlled: bool) -> Self {
+        let m = x.len();
+        Self {
+            coupled: vec![0.0; m],
+            y_pre: vec![0.0; if heated { m } else { 0 }],
+            p: vec![1.0; if controlled { m } else { 0 }],
+            x,
+            y,
+        }
+    }
+}
+
+/// One SB step over `t` at step `k` of `n_step`.
+///
+/// Momentum first, from the old positions; position from the new momentum;
+/// then the inelastic wall; then, for a heated variant, the Kanao and Goto
+/// heating from the momentum captured before the step. When the trajectory
+/// carries per-particle pumps, Eq. (7) of Goto, Hidaka and Tatsumura 2026
+/// advances them from the pre-step positions before the force loop reads
+/// them, and `-p_i` replaces the scalar `restore` for particle `i`.
+///
+/// `extra` adds a per-node force inside the coupling bracket:
+/// `f_i += scale * field[i]` for the graph's nodes only. The ancilla receives
+/// none of it. The tabu kernel passes its stored-configuration field here.
+/// With `None`, or with a zero scale, the arithmetic is the plain kernel's.
+pub(crate) fn sb_step(
+    g: &SbGraph,
+    k: usize,
+    n_step: usize,
+    variant: SbVariant,
+    t: &mut Trajectory,
+    extra: Option<(&[Real], Real)>,
+) {
+    let n = g.num_nodes();
+    let heated = !t.y_pre.is_empty();
+    let controlled = !t.p.is_empty();
+    // `-(a0 - a(t_k))`, folded into one multiply.
+    let restore = pump(k, n_step) - A0;
+
+    match variant.coupling {
+        Coupling::Discrete => {
+            for (c, &xi) in t.coupled.iter_mut().zip(t.x.iter()) {
+                *c = if xi >= 0.0 { 1.0 } else { -1.0 };
+            }
+        }
+        Coupling::Continuous => t.coupled.copy_from_slice(&t.x),
+    }
+
+    if controlled {
+        // Eq. (7): every p_i advances from the pre-step position, and the new
+        // p_i multiplies the old x_i below. `n_step - k >= 1`, so `inv` is
+        // finite; on the last step it is 1 and p_i ends at A x_i^2 p_i.
+        let inv = 1.0 / (n_step - k) as Real;
+        let a = variant.control;
+        for (pi, &xi) in t.p.iter_mut().zip(t.x.iter()) {
+            *pi -= (1.0 - a * xi * xi) * *pi * inv;
+        }
+    }
+
+    if heated {
+        t.y_pre.copy_from_slice(&t.y);
+    }
+
+    let Trajectory {
+        x,
+        y,
+        coupled,
+        y_pre,
+        p,
+    } = t;
+
+    // Momentum first, from the OLD positions. `J_uv = -j_uv` and
+    // `J_{i,N} = -h_i`, so the coupling force carries a leading minus and
+    // the CSR can store the quip values unchanged.
+    for i in 0..n {
+        let (nodes, coups) = g.neighbors(i);
+        let mut f: Real = 0.0;
+        for (&v, &coup) in nodes.iter().zip(coups.iter()) {
+            f += coup * coupled[v as usize];
+        }
+        if g.has_bias {
+            f += g.h[i] * coupled[n];
+        }
+        if let Some((field, scale)) = extra {
+            f += scale * field[i];
+        }
+        let r = if controlled { -p[i] } else { restore };
+        y[i] += (r * x[i] - g.c0 * f) * DT;
+    }
+    if g.has_bias {
+        let mut f: Real = 0.0;
+        for (&bias, &c) in g.h.iter().zip(coupled.iter()) {
+            f += bias * c;
+        }
+        let r = if controlled { -p[n] } else { restore };
+        y[n] += (r * x[n] - g.c0 * f) * DT;
+    }
+
+    // Position from the NEW momentum, then the perfectly inelastic wall:
+    // the particle stops dead at x = ±1 rather than bouncing.
+    for (xi, yi) in x.iter_mut().zip(y.iter_mut()) {
+        *xi += A0 * *yi * DT;
+        if *xi > 1.0 {
+            *xi = 1.0;
+            *yi = 0.0;
+        } else if *xi < -1.0 {
+            *xi = -1.0;
+            *yi = 0.0;
+        }
+    }
+
+    // Kanao and Goto's heating: applied last, from the momentum captured
+    // before this step, so a particle the wall just stopped leaves with
+    // nonzero momentum. The `+γy` term is negative damping, so the
+    // equations are no longer Hamiltonian and plain symplectic Euler does
+    // not apply; this ordering is the one the paper tuned numerically.
+    if heated {
+        for (yi, &pre) in y.iter_mut().zip(y_pre.iter()) {
+            *yi += variant.gamma * pre * DT;
+        }
+    }
 }
 
 /// Integrate `n_step` SB steps in place over the given initial conditions.
@@ -264,78 +459,12 @@ fn sb_run(
     x: &mut [Real],
     y: &mut [Real],
 ) {
-    let n = g.num_nodes();
-    let m = x.len();
-    // `g(x_j)` for every particle, refreshed once per step so the force reads
-    // the OLD positions for every i.
-    let mut coupled: Vec<Real> = vec![0.0; m];
-    // Momenta captured before the SB substep. Empty when the variant does not
-    // heat, so the unheated path pays neither the allocation nor the copy.
-    let mut y_pre: Vec<Real> = vec![0.0; if heated { m } else { 0 }];
-
+    let mut t = Trajectory::new(x.to_vec(), y.to_vec(), heated, variant.control != 0.0);
     for k in 0..n_step {
-        // `-(a0 - a(t_k))`, folded into one multiply.
-        let restore = pump(k, n_step) - A0;
-
-        match variant.coupling {
-            Coupling::Discrete => {
-                for (c, &xi) in coupled.iter_mut().zip(x.iter()) {
-                    *c = if xi >= 0.0 { 1.0 } else { -1.0 };
-                }
-            }
-            Coupling::Continuous => coupled.copy_from_slice(x),
-        }
-
-        if heated {
-            y_pre.copy_from_slice(y);
-        }
-
-        // Momentum first, from the OLD positions. `J_uv = -j_uv` and
-        // `J_{i,N} = -h_i`, so the coupling force carries a leading minus and
-        // the CSR can store the quip values unchanged.
-        for i in 0..n {
-            let (nodes, coups) = g.neighbors(i);
-            let mut f: Real = 0.0;
-            for (&v, &coup) in nodes.iter().zip(coups.iter()) {
-                f += coup * coupled[v as usize];
-            }
-            if g.has_bias {
-                f += g.h[i] * coupled[n];
-            }
-            y[i] += (restore * x[i] - g.c0 * f) * DT;
-        }
-        if g.has_bias {
-            let mut f: Real = 0.0;
-            for (&bias, &c) in g.h.iter().zip(coupled.iter()) {
-                f += bias * c;
-            }
-            y[n] += (restore * x[n] - g.c0 * f) * DT;
-        }
-
-        // Position from the NEW momentum, then the perfectly inelastic wall:
-        // the particle stops dead at x = ±1 rather than bouncing.
-        for (xi, yi) in x.iter_mut().zip(y.iter_mut()) {
-            *xi += A0 * *yi * DT;
-            if *xi > 1.0 {
-                *xi = 1.0;
-                *yi = 0.0;
-            } else if *xi < -1.0 {
-                *xi = -1.0;
-                *yi = 0.0;
-            }
-        }
-
-        // Kanao and Goto's heating: applied last, from the momentum captured
-        // before this step, so a particle the wall just stopped leaves with
-        // nonzero momentum. The `+γy` term is negative damping, so the
-        // equations are no longer Hamiltonian and plain symplectic Euler does
-        // not apply; this ordering is the one the paper tuned numerically.
-        if heated {
-            for (yi, &pre) in y.iter_mut().zip(y_pre.iter()) {
-                *yi += variant.gamma * pre * DT;
-            }
-        }
+        sb_step(g, k, n_step, variant, &mut t, None);
     }
+    x.copy_from_slice(&t.x);
+    y.copy_from_slice(&t.y);
 }
 
 /// Integrate `n_step` SB steps across `workers` threads.
@@ -380,9 +509,12 @@ fn sb_run_parallel(
                 let hi = (lo + chunk).min(m);
                 let mut sense = false;
                 let mut y_pre: Vec<Real> = vec![0.0; if heated { hi - lo } else { 0 }];
+                let controlled = variant.control != 0.0;
+                let mut p: Vec<Real> = vec![1.0; if controlled { hi - lo } else { 0 }];
 
                 for k in 0..n_step {
                     let restore = pump(k, n_step) - A0;
+                    let inv = 1.0 / (n_step - k) as Real;
 
                     for i in lo..hi {
                         let xi = Real::from_bits(xa[i].load(Ordering::Relaxed));
@@ -399,6 +531,9 @@ fn sb_run_parallel(
                         ca[i].store(c.to_bits(), Ordering::Relaxed);
                         if heated {
                             y_pre[i - lo] = Real::from_bits(ya[i].load(Ordering::Relaxed));
+                        }
+                        if controlled {
+                            p[i - lo] -= (1.0 - variant.control * xi * xi) * p[i - lo] * inv;
                         }
                     }
                     barrier.wait(&mut sense);
@@ -428,7 +563,8 @@ fn sb_run_parallel(
 
                         let xi = Real::from_bits(xa[i].load(Ordering::Relaxed));
                         let mut yi = Real::from_bits(ya[i].load(Ordering::Relaxed));
-                        yi += (restore * xi - g.c0 * f) * DT;
+                        let r = if controlled { -p[i - lo] } else { restore };
+                        yi += (r * xi - g.c0 * f) * DT;
                         let mut xi = xi + A0 * yi * DT;
                         if xi > 1.0 {
                             xi = 1.0;
@@ -465,7 +601,7 @@ fn sb_run_parallel(
 /// package's `positions >= 0` rule. `sampler_core::spin_sign` maps an `i8` zero
 /// to `-1` instead. The two never meet: this is the only place SB crosses into
 /// `i8`, and it only ever writes ±1.
-fn gauge_fixed_spins(g: &SbGraph, x: &[Real]) -> Vec<i8> {
+pub(crate) fn gauge_fixed_spins(g: &SbGraph, x: &[Real]) -> Vec<i8> {
     let n = g.num_nodes();
     let gauge: i8 = if g.has_bias && x[n] < 0.0 { -1 } else { 1 };
     x.iter()
@@ -537,13 +673,7 @@ pub fn sample_sb_with_workers(
 
     (0..num_reads)
         .map(|read_idx| {
-            // Same derivation as `sampler_core::sample_ising`, so a benchmark
-            // can pair an SB run with an SA run on one job at one seed.
-            let seed = base_seed
-                .wrapping_mul(0x9E37_79B9_7F4A_7C15)
-                .wrapping_add(read_idx as u64)
-                .wrapping_add(1);
-            let mut rng = SmallRng::seed_from_u64(seed);
+            let mut rng = SmallRng::seed_from_u64(read_seed(base_seed, read_idx));
             let (mut x, mut y) = draw_initial_conditions(m, &mut rng);
             if workers <= 1 {
                 sb_run(&g, n_step, variant, heated, &mut x, &mut y);
@@ -573,11 +703,7 @@ pub(crate) fn sb_final_state_for_test(
     let sb = SbGraph::from_base(graph);
     let m = sb.num_particles();
     let n_step = params.num_sweeps.max(1);
-    let seed = params
-        .seed
-        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
-        .wrapping_add(1);
-    let mut rng = SmallRng::seed_from_u64(seed);
+    let mut rng = SmallRng::seed_from_u64(read_seed(params.seed, 0));
     let (mut x, mut y) = draw_initial_conditions(m, &mut rng);
     sb_run(&sb, n_step, variant, variant.gamma != 0.0, &mut x, &mut y);
     (x, y)
@@ -601,28 +727,32 @@ mod tests {
             DSB,
             SbVariant {
                 coupling: Coupling::Discrete,
-                gamma: 0.0
+                gamma: 0.0,
+                control: 0.0
             }
         );
         assert_eq!(
             BSB,
             SbVariant {
                 coupling: Coupling::Continuous,
-                gamma: 0.0
+                gamma: 0.0,
+                control: 0.0
             }
         );
         assert_eq!(
             HDSB,
             SbVariant {
                 coupling: Coupling::Discrete,
-                gamma: 0.06
+                gamma: 0.06,
+                control: 0.0
             }
         );
         assert_eq!(
             HBSB,
             SbVariant {
                 coupling: Coupling::Continuous,
-                gamma: 0.5
+                gamma: 0.5,
+                control: 0.0
             }
         );
     }
@@ -646,7 +776,7 @@ mod tests {
         )
     }
 
-    const ALL_VARIANTS: [SbVariant; 4] = [DSB, BSB, HDSB, HBSB];
+    const ALL_VARIANTS: [SbVariant; 6] = [DSB, BSB, HDSB, HBSB, GBSB, GDSB];
 
     /// Reads whose reported energy equals `want`.
     fn count_at(results: &[SamplerResult], want: i64) -> usize {
@@ -1221,6 +1351,121 @@ mod tests {
         assert_eq!(BSB.gamma, 0.0);
         const { assert!(HDSB.gamma > 0.0) };
         const { assert!(HBSB.gamma > 0.0) };
+    }
+
+    /// Hypothesis: the per-read seed derivation is the SA one, so a benchmark
+    /// can pair any SB kernel with an SA run on one job at one seed.
+    #[test]
+    fn read_seed_matches_the_sa_derivation() {
+        for (base, idx) in [(0u64, 0usize), (7, 3), (u64::MAX, 41)] {
+            let want = base
+                .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                .wrapping_add(idx as u64)
+                .wrapping_add(1);
+            assert_eq!(read_seed(base, idx), want);
+        }
+    }
+
+    /// Hypothesis: the two new variants carry the published control strength
+    /// on top of the plain ballistic and discrete forms, and the four shipped
+    /// variants carry no control at all.
+    #[test]
+    fn edge_of_chaos_variants_extend_the_plain_forms() {
+        assert_eq!(EDGE_OF_CHAOS_CONTROL, 0.2);
+        assert_eq!(
+            GBSB,
+            SbVariant {
+                coupling: Coupling::Continuous,
+                gamma: 0.0,
+                control: EDGE_OF_CHAOS_CONTROL
+            }
+        );
+        assert_eq!(
+            GDSB,
+            SbVariant {
+                coupling: Coupling::Discrete,
+                gamma: 0.0,
+                control: EDGE_OF_CHAOS_CONTROL
+            }
+        );
+        for v in [DSB, BSB, HDSB, HBSB] {
+            assert_eq!(v.control, 0.0, "{v:?} must not carry control");
+        }
+    }
+
+    /// Hypothesis (Goto, Hidaka, Tatsumura 2026, Eq. 7 with A = 0): the
+    /// controlled path with zero control strength tracks the scalar pump,
+    /// `p_i(t_{k+1}) = 1 - (k+1)/M`, on every particle at every step. The
+    /// recursion accumulates f32 rounding, so the check is a tolerance, not
+    /// bit equality; bit equality for the plain variants comes from the
+    /// fixture, which never takes this path.
+    #[test]
+    fn zero_control_through_the_controlled_path_tracks_the_scalar_pump() {
+        let g = SbGraph::from_base(&mixed4());
+        let m = g.num_particles();
+        let mut rng = SmallRng::seed_from_u64(9);
+        let (x, y) = draw_initial_conditions(m, &mut rng);
+        let variant = SbVariant {
+            control: 0.0,
+            ..GBSB
+        };
+        let n_step = 64;
+        let mut t = Trajectory::new(x, y, false, true);
+        for k in 0..n_step {
+            sb_step(&g, k, n_step, variant, &mut t, None);
+            let want = A0 - pump(k, n_step);
+            for (i, &pi) in t.p.iter().enumerate() {
+                assert!(
+                    (pi - want).abs() < 1e-5,
+                    "step {k} particle {i}: p = {pi}, scalar pump gives {want}"
+                );
+            }
+        }
+    }
+
+    /// Hypothesis: with control on, a particle keeps a residual restoring
+    /// force at the end of the run, `p_i(t_M) = A x_i^2 p_i(t_{M-1})`, which
+    /// lies in `(0, A]`. Plain bSB ends at exactly zero pump. That residual is
+    /// the mechanism the paper describes, so it is asserted rather than
+    /// tolerated.
+    #[test]
+    fn edge_of_chaos_control_leaves_a_residual_restoring_force() {
+        let g = SbGraph::from_base(&mixed4());
+        let m = g.num_particles();
+        let mut rng = SmallRng::seed_from_u64(11);
+        let (x, y) = draw_initial_conditions(m, &mut rng);
+        let n_step = 128;
+        let mut t = Trajectory::new(x, y, false, true);
+        for k in 0..n_step {
+            sb_step(&g, k, n_step, GBSB, &mut t, None);
+        }
+        for (i, &pi) in t.p.iter().enumerate() {
+            assert!(pi > 0.0, "particle {i}: p must stay positive, got {pi}");
+            assert!(
+                pi <= EDGE_OF_CHAOS_CONTROL + 1e-6,
+                "particle {i}: p must end at or below A, got {pi}"
+            );
+        }
+    }
+
+    /// Hypothesis: `extra` with a zero scale changes nothing. The tabu kernel
+    /// relies on this so `beta = 0` reproduces plain SB.
+    #[test]
+    fn zero_scaled_extra_field_is_bit_identical() {
+        let g = SbGraph::from_base(&mixed4());
+        let m = g.num_particles();
+        let mut rng = SmallRng::seed_from_u64(5);
+        let (x, y) = draw_initial_conditions(m, &mut rng);
+        let field = vec![0.75; g.num_nodes()];
+        let n_step = 32;
+        let mut plain = Trajectory::new(x.clone(), y.clone(), false, false);
+        let mut with = Trajectory::new(x, y, false, false);
+        for k in 0..n_step {
+            sb_step(&g, k, n_step, DSB, &mut plain, None);
+            sb_step(&g, k, n_step, DSB, &mut with, Some((&field, 0.0)));
+        }
+        assert_eq!(plain.x, with.x);
+        assert_eq!(plain.y, with.y);
     }
 
     /// Self-loop, out-of-range edge, and a `j` vector shorter than `edges`. All

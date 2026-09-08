@@ -19,6 +19,11 @@ reads are sequential and cache-local. Energies are scored with the canonical
 | `quip-cpu-bsb` | ballistic Simulated Bifurcation | experimental |
 | `quip-cpu-hdsb` | heated discrete Simulated Bifurcation | experimental |
 | `quip-cpu-hbsb` | heated ballistic Simulated Bifurcation | experimental |
+| `quip-cpu-gbsb` | generalized ballistic Simulated Bifurcation, edge-of-chaos control | experimental |
+| `quip-cpu-gdsb` | edge-of-chaos control on the discrete coupling | experimental |
+| `quip-cpu-tedsb` | tabu-enhanced discrete Simulated Bifurcation | experimental |
+| `quip-cpu-sbqa` | replica-ring discrete Simulated Bifurcation | experimental |
+| `quip-cpu-ggdsb` | globally guided discrete Simulated Bifurcation | experimental |
 | `quip-cpu-fsa` | simulated annealing with tabulated Metropolis thresholds | experimental |
 | `quip-cpu-msa` | multi-spin coded simulated annealing, 64 reads per word | experimental |
 | `quip-cpu-mps` | tensor network: imaginary-time TEBD with exact sampling | experimental |
@@ -32,7 +37,9 @@ the graph. The SA kernel also polls the cancel guard once per sweep (one
 seconds then stops at the next sweep. The kernel emits
 `StreamOutcome::Cancelled`, the same outcome as the dequeue path. The SB
 kernel and its sampler live in `src/sb_core.rs` and `src/sb_sampler.rs`,
-separate from the annealing path.
+separate from the annealing path. `docs/sb-variants.md` gives the method,
+the constants, and the paper behind each Simulated Bifurcation kernel, and
+names every place the code departs from its paper.
 
 Prebuilt binaries are attached to each
 [Release](https://gitlab.com/quip.network/quip-miner-cpu/-/releases) for
