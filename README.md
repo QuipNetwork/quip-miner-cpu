@@ -50,7 +50,7 @@ cannot separate a Linux aarch64 binary from a Darwin arm64 one.
 ## Build
 
 ```sh
-cargo build --release        # needs protoc on PATH (protobuf-compiler)
+cargo build --release
 ```
 
 The experimental binaries build behind an opt-in feature and never appear in
