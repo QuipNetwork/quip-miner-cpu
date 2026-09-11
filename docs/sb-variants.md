@@ -27,8 +27,9 @@ last step, gauge-fixed by the ancilla sign.
 | `quip-cpu-sbqa` | replica-ring dSB (SBQA) | Pawlowski et al., arXiv:2604.01050. Data: github.com/quantumz-io/SBQA_benchmarks |
 | `quip-cpu-ggdsb` | globally guided dSB (GGdSB) | Xiao et al., Phys. Rev. Applied 25, 024014 (2026). Code: github.com/JugarH/Global-Guided-Simulated-Bifurcation |
 
-The five new binaries build behind `--features experimental`. A Release
-publishes them with an `(experimental)` marker on the asset name.
+Every binary in the table except `quip-cpu-sb` builds behind
+`--features experimental`. A Release publishes all of them and names the
+experimental ones in its notes.
 
 ## Edge-of-chaos control: `quip-cpu-gbsb`, `quip-cpu-gdsb`
 

@@ -42,9 +42,9 @@ cache:
 # a grep of Cargo.toml cannot see.
 #
 # The partition check refuses a target gated behind any feature other than
-# `experimental`. Cargo skips a target whose `required-features` are unmet
-# instead of failing, so such a target would be missing from `dist/` with
-# nothing reporting it.
+# `experimental`. The classification below sorts a target by whether it carries
+# a `required-features` key at all, so a target gated behind some other feature
+# would fall into neither list and be dropped from `dist/` without a word.
 #
 # `set -eu` is load-bearing, not decoration. The runner reports only the last
 # command's status from a multi-command script block, so without it a failing
@@ -68,19 +68,22 @@ cache:
   for b in $prod $exp; do
     cp "$BIN_DIR/$b" "dist/$b-$ASSET_SUFFIX"
   done
-  # The release job needs the track of each binary, which no file name carries.
-  # It reads this table: display name, then the file name in the registry.
-  : > assets.tsv
-  for b in $prod; do
-    for p in linux-amd64 linux-arm64 darwin-arm64; do
-      printf '%s\t%s\n' "$b-$p" "$b-$p" >> assets.tsv
-    done
-  done
-  for b in $exp; do
-    for p in linux-amd64 linux-arm64 darwin-arm64; do
-      printf '%s (experimental)\t%s\n' "$b-$p" "$b-$p" >> assets.tsv
-    done
-  done
+  # The release job needs each binary's track, which no file name carries, and
+  # it runs in an image that has no cargo. It reads this table instead.
+  : > bins.tsv
+  for b in $prod; do printf 'production\t%s\n' "$b" >> bins.tsv; done
+  for b in $exp; do printf 'experimental\t%s\n' "$b" >> bins.tsv; done
+  # Check the count on every pipeline, not only on the tag pipeline that
+  # publishes. A binary added to Cargo.toml has to be acknowledged in the merge
+  # request that adds it, rather than breaking the release after someone has
+  # already pushed the tag.
+  rows=$(wc -l < bins.tsv)
+  if [ "$((rows * 3))" -ne "$ASSET_COUNT" ]; then
+    echo "the manifest declares $rows binaries, so a tag would publish" >&2
+    echo "$((rows * 3)) assets, but ASSET_COUNT is $ASSET_COUNT." >&2
+    echo "A binary target was added or removed. Update ASSET_COUNT." >&2
+    exit 1
+  fi
 
 test:
   stage: test
@@ -90,16 +93,16 @@ test:
     # depends on a build. Without it the tree drifts silently, because no other
     # job reads formatting.
     - cargo fmt --all -- --check
-    # --all-features keeps the experimental backends inside the zero-warnings
-    # gate. The build jobs package them, so they are held to the same bar as
-    # the production binaries.
+    # --all-features puts the experimental backends inside the same
+    # zero-warnings gate and the same test command as the production ones.
+    # Per-binary conformance coverage still differs; see tests/conformance.rs.
     - cargo test --release --all-features
     - cargo clippy --release --all-targets --all-features -- -D warnings
 
 .build:
   stage: build
   artifacts:
-    paths: [dist/, assets.tsv]
+    paths: [dist/, bins.tsv]
     expire_in: 1 week
 
 # Asset names carry both the operating system and the architecture. The earlier
@@ -196,7 +199,7 @@ release:
   rules:
     - if: $CI_COMMIT_TAG
   # `needs` narrows artifact download to the jobs named here, so the job that
-  # writes assets.tsv has to be one of them. `upload` carries no artifacts; it
+  # writes bins.tsv has to be one of them. `upload` carries no artifacts; it
   # is named only to order this job after the files reach the registry.
   needs:
     - job: upload
@@ -208,8 +211,21 @@ release:
       set -eu
       base="${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/${PKG}/${CI_COMMIT_TAG}"
       set -- --name "quip-miner-cpu ${CI_COMMIT_TAG}" --tag-name "${CI_COMMIT_TAG}"
-      while IFS="$(printf '\t')" read -r name file; do
-        [ -n "$file" ] || continue
-        set -- "$@" --assets-link "{\"name\":\"${name}\",\"url\":\"${base}/${file}\"}"
-      done < assets.tsv
-      release-cli create "$@"
+      # An asset name stays exactly <binary>-<os>-<arch>. `glab release
+      # download` writes the asset name as the file name and matches its
+      # --asset-name glob against it, so a marker here would put spaces in
+      # the downloaded file name and hide the file from `quip-cpu-*-linux-amd64`.
+      while IFS="$(printf '\t')" read -r track b; do
+        [ -n "$b" ] || continue
+        for p in linux-amd64 linux-arm64 darwin-arm64; do
+          set -- "$@" --assets-link "{\"name\":\"${b}-${p}\",\"url\":\"${base}/${b}-${p}\"}"
+        done
+      done < bins.tsv
+      # The track goes in the release notes, which costs no file name.
+      prod=$(awk -F'\t' '$1=="production"{printf "%s`%s`", s, $2; s=", "}' bins.tsv)
+      exp=$(awk -F'\t' '$1=="experimental"{printf "%s`%s`", s, $2; s=", "}' bins.tsv)
+      desc=$(printf '%s\n\n%s\n\n%s\n' \
+        "Each binary is attached for linux-amd64, linux-arm64 and darwin-arm64." \
+        "Production: ${prod}" \
+        "Experimental, published for evaluation and not supported for production mining: ${exp}")
+      release-cli create --description "$desc" "$@"

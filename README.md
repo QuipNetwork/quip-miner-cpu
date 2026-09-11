@@ -48,10 +48,10 @@ operating system as well as the architecture, because an architecture alone
 cannot separate a Linux aarch64 binary from a Darwin arm64 one.
 
 Every binary in the table above is published, production and experimental
-alike. The release page marks an experimental asset with `(experimental)`
-after its name. The file name itself carries no marker, so the same file in
-the package registry looks like any other. Read the track column above before
-you deploy one.
+alike. Each release lists the two tracks in its notes. Asset names follow the
+same `<binary>-<os>-<arch>` pattern on both tracks and carry no marker, so the
+file alone does not say which track it came from. Read the track column above
+before you deploy one.
 
 ## Build
 

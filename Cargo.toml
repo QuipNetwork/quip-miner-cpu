@@ -108,9 +108,9 @@ required-features = ["experimental"]
 
 # The experimental backends stay behind this feature, so a plain `cargo build`
 # produces only the three production binaries. CI builds, tests and lints with
-# --all-features, and a tag publishes every binary: the experimental ones carry
-# an `(experimental)` marker on the release page. The feature is empty because
-# the modules compile unconditionally and only the [[bin]] targets are gated.
+# --all-features, and a tag publishes every binary, with the release notes
+# naming the experimental ones. The feature is empty because the modules
+# compile unconditionally and only the [[bin]] targets are gated.
 [features]
 experimental = []
 
