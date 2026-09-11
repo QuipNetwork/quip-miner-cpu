@@ -1,6 +1,6 @@
 [package]
 name = "quip-miner-cpu"
-version = "0.3.2"
+version = "0.3.3"
 edition = "2021"
 description = "CPU Ising miners: simulated annealing and single-site Gibbs (v0.3)"
 license = "AGPL-3.0-or-later"
@@ -106,10 +106,11 @@ name = "quip-cpu-flatiron"
 path = "src/bin/quip_cpu_flatiron.rs"
 required-features = ["experimental"]
 
-# Experimental backends are developer-built only. CI tests and lints them with
-# --all-features; it must never package them into release assets. The feature is
-# empty because the modules compile unconditionally and only the [[bin]] targets
-# are gated.
+# The experimental backends stay behind this feature, so a plain `cargo build`
+# produces only the three production binaries. CI builds, tests and lints with
+# --all-features, and a tag publishes every binary: the experimental ones carry
+# an `(experimental)` marker on the release page. The feature is empty because
+# the modules compile unconditionally and only the [[bin]] targets are gated.
 [features]
 experimental = []
 

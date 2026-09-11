@@ -53,9 +53,8 @@ pub const CPU_SB_IDENTITY: BackendIdentity = BackendIdentity {
 
 /// Backend identity for `quip-cpu-bsb` (ballistic Simulated Bifurcation:
 /// continuous coupling, no heating). Experimental track; the binary builds
-/// only behind the `experimental` cargo feature and never ships in a release
-/// asset. The adapt bounds stay shared with `quip-cpu-sb` until the benchmark
-/// campaign re-tunes them per variant.
+/// only behind the `experimental` cargo feature. The adapt bounds stay shared
+/// with `quip-cpu-sb` until the benchmark campaign re-tunes them per variant.
 pub const CPU_BSB_IDENTITY: BackendIdentity = BackendIdentity {
     backend: "cpu",
     algorithm: "bsb",

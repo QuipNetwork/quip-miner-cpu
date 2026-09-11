@@ -4,6 +4,10 @@ variables:
   CARGO_HOME: $CI_PROJECT_DIR/.cargo
   # Downloadable binaries live in the generic package registry under this name.
   PKG: quip-miner-cpu
+  # 16 binary targets on three platforms. The build jobs read the target list
+  # out of the manifest, so this number is the one place a new binary has to be
+  # acknowledged by hand. Publishing a binary stays a deliberate decision.
+  ASSET_COUNT: "48"
 
 default:
   image: rust:1.97
@@ -32,6 +36,52 @@ cache:
     - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.97.1 --no-modify-path
     - source "$CARGO_HOME/env"
 
+# Every build job packages the same set of binaries, so the set is read from the
+# manifest rather than repeated three times. `cargo metadata` reports the
+# targets Cargo actually builds, including any discovered under `src/bin`, which
+# a grep of Cargo.toml cannot see.
+#
+# The partition check refuses a target gated behind any feature other than
+# `experimental`. Cargo skips a target whose `required-features` are unmet
+# instead of failing, so such a target would be missing from `dist/` with
+# nothing reporting it.
+#
+# `set -eu` is load-bearing, not decoration. The runner reports only the last
+# command's status from a multi-command script block, so without it a failing
+# `cp` inside the loop would leave a short `dist/` and still exit 0.
+.package-bins: &package-bins |
+  set -eu
+  meta=$(cargo metadata --no-deps --format-version 1)
+  chunk() { printf '%s' "$meta" | tr '{' '\n' | grep '"kind":\["bin"\]'; }
+  pick() { sed -n 's/.*"name":"\([^"]*\)".*/\1/p' | LC_ALL=C sort | tr '\n' ' '; }
+  prod=$(chunk | grep -v '"required-features"' | pick)
+  exp=$(chunk | grep '"required-features":\[[^]]*"experimental"' | pick)
+  all=$(chunk | pick)
+  seen=$(printf '%s\n' $prod $exp | LC_ALL=C sort | tr '\n' ' ')
+  if [ "$seen" != "$all" ]; then
+    echo "a binary target is gated behind a feature other than experimental" >&2
+    echo "  declared: $all" >&2
+    echo "  handled:  $seen" >&2
+    exit 1
+  fi
+  mkdir -p dist
+  for b in $prod $exp; do
+    cp "$BIN_DIR/$b" "dist/$b-$ASSET_SUFFIX"
+  done
+  # The release job needs the track of each binary, which no file name carries.
+  # It reads this table: display name, then the file name in the registry.
+  : > assets.tsv
+  for b in $prod; do
+    for p in linux-amd64 linux-arm64 darwin-arm64; do
+      printf '%s\t%s\n' "$b-$p" "$b-$p" >> assets.tsv
+    done
+  done
+  for b in $exp; do
+    for p in linux-amd64 linux-arm64 darwin-arm64; do
+      printf '%s (experimental)\t%s\n' "$b-$p" "$b-$p" >> assets.tsv
+    done
+  done
+
 test:
   stage: test
   script:
@@ -41,14 +91,15 @@ test:
     # job reads formatting.
     - cargo fmt --all -- --check
     # --all-features keeps the experimental backends inside the zero-warnings
-    # gate even though CI never packages their binaries.
+    # gate. The build jobs package them, so they are held to the same bar as
+    # the production binaries.
     - cargo test --release --all-features
     - cargo clippy --release --all-targets --all-features -- -D warnings
 
 .build:
   stage: build
   artifacts:
-    paths: [dist/]
+    paths: [dist/, assets.tsv]
     expire_in: 1 week
 
 # Asset names carry both the operating system and the architecture. The earlier
@@ -56,41 +107,45 @@ test:
 # binary from a Darwin arm64 one. An Apple Silicon host downloaded
 # `quip-cpu-sa-arm64`, received a Linux ELF, and only discovered the mismatch
 # when it tried to run the file.
+#
+# `--all-features` builds the experimental binaries alongside the production
+# ones. The feature is empty and no code reads it, so the production binaries
+# keep the same instructions; only their build metadata hash changes.
 build-linux-amd64:
   extends: .build
+  variables:
+    BIN_DIR: target/release
+    ASSET_SUFFIX: linux-amd64
   script:
-    - cargo build --release --bins
-    - mkdir -p dist
-    - cp target/release/quip-cpu-sa dist/quip-cpu-sa-linux-amd64
-    - cp target/release/quip-cpu-gibbs dist/quip-cpu-gibbs-linux-amd64
-    - cp target/release/quip-cpu-sb dist/quip-cpu-sb-linux-amd64
+    - cargo build --release --bins --all-features
+    - *package-bins
 
 build-linux-arm64:
   extends: .build
+  variables:
+    BIN_DIR: target/aarch64-unknown-linux-gnu/release
+    ASSET_SUFFIX: linux-arm64
   script:
     # The default before_script no longer runs apt-get (the protoc install is
     # gone), so the cross-compiler install updates the package index itself.
     - apt-get update -qq && apt-get install -y -qq gcc-aarch64-linux-gnu
     - rustup target add aarch64-unknown-linux-gnu
     - export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
-    - cargo build --release --bins --target aarch64-unknown-linux-gnu
-    - mkdir -p dist
-    - cp target/aarch64-unknown-linux-gnu/release/quip-cpu-sa dist/quip-cpu-sa-linux-arm64
-    - cp target/aarch64-unknown-linux-gnu/release/quip-cpu-gibbs dist/quip-cpu-gibbs-linux-arm64
-    - cp target/aarch64-unknown-linux-gnu/release/quip-cpu-sb dist/quip-cpu-sb-linux-arm64
+    - cargo build --release --bins --all-features --target aarch64-unknown-linux-gnu
+    - *package-bins
 
 # Tag only. The Apple Silicon runners are a shared and limited resource, and the
 # `test` job already proves the crate compiles on every pipeline.
 build-darwin-arm64:
   extends: [.build, .macos]
+  variables:
+    BIN_DIR: target/release
+    ASSET_SUFFIX: darwin-arm64
   rules:
     - if: $CI_COMMIT_TAG
   script:
-    - cargo build --release --bins
-    - mkdir -p dist
-    - cp target/release/quip-cpu-sa dist/quip-cpu-sa-darwin-arm64
-    - cp target/release/quip-cpu-gibbs dist/quip-cpu-gibbs-darwin-arm64
-    - cp target/release/quip-cpu-sb dist/quip-cpu-sb-darwin-arm64
+    - cargo build --release --bins --all-features
+    - *package-bins
 
 # On a tag: upload every built binary to the generic package registry, then cut
 # a Release linking them as downloadable assets.
@@ -101,17 +156,34 @@ upload:
     - if: $CI_COMMIT_TAG
   before_script: []
   script:
-    # Three build jobs produce three binaries each. A short `dist/` means one of
-    # them failed or did not run, so stop here rather than publish a release
-    # that silently omits a platform.
     - |
+      set -eu
+      # Every binary must have arrived from all three build jobs. This catches a
+      # build job that produced a short list; the total then catches a target
+      # added to or removed from the manifest, which has to be a deliberate
+      # release decision rather than an automatic one.
+      for f in dist/*-linux-amd64; do
+        b=$(basename "$f" -linux-amd64)
+        for p in linux-arm64 darwin-arm64; do
+          if [ ! -f "dist/$b-$p" ]; then
+            echo "dist/$b-$p is missing: a build job did not finish" >&2
+            exit 1
+          fi
+        done
+      done
       count=$(ls dist/ | wc -l)
-      if [ "$count" -ne 9 ]; then
-        echo "expected 9 binaries in dist/, found ${count}:" >&2
+      if [ "$count" -ne "$ASSET_COUNT" ]; then
+        echo "expected $ASSET_COUNT binaries in dist/, found ${count}." >&2
+        echo "A binary target was added or removed. Update ASSET_COUNT." >&2
         ls -la dist/ >&2
         exit 1
       fi
     - |
+      # `set -e` is what makes --fail count. A shell reports only the last
+      # command's status from a block, so without it a failed upload in the
+      # middle of the loop would still leave this job green and the release
+      # would publish an asset link that resolves to nothing.
+      set -eu
       for f in dist/*; do
         n=$(basename "$f")
         curl --fail --header "JOB-TOKEN: $CI_JOB_TOKEN" --upload-file "$f" \
@@ -123,18 +195,21 @@ release:
   image: registry.gitlab.com/gitlab-org/release-cli:latest
   rules:
     - if: $CI_COMMIT_TAG
-  needs: [upload]
+  # `needs` narrows artifact download to the jobs named here, so the job that
+  # writes assets.tsv has to be one of them. `upload` carries no artifacts; it
+  # is named only to order this job after the files reach the registry.
+  needs:
+    - job: upload
+      artifacts: false
+    - job: build-linux-amd64
   before_script: []
   script:
     - |
+      set -eu
       base="${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/${PKG}/${CI_COMMIT_TAG}"
-      release-cli create --name "quip-miner-cpu ${CI_COMMIT_TAG}" --tag-name "${CI_COMMIT_TAG}" \
-        --assets-link "{\"name\":\"quip-cpu-sa-linux-amd64\",\"url\":\"${base}/quip-cpu-sa-linux-amd64\"}" \
-        --assets-link "{\"name\":\"quip-cpu-gibbs-linux-amd64\",\"url\":\"${base}/quip-cpu-gibbs-linux-amd64\"}" \
-        --assets-link "{\"name\":\"quip-cpu-sa-linux-arm64\",\"url\":\"${base}/quip-cpu-sa-linux-arm64\"}" \
-        --assets-link "{\"name\":\"quip-cpu-gibbs-linux-arm64\",\"url\":\"${base}/quip-cpu-gibbs-linux-arm64\"}" \
-        --assets-link "{\"name\":\"quip-cpu-sa-darwin-arm64\",\"url\":\"${base}/quip-cpu-sa-darwin-arm64\"}" \
-        --assets-link "{\"name\":\"quip-cpu-gibbs-darwin-arm64\",\"url\":\"${base}/quip-cpu-gibbs-darwin-arm64\"}" \
-        --assets-link "{\"name\":\"quip-cpu-sb-linux-amd64\",\"url\":\"${base}/quip-cpu-sb-linux-amd64\"}" \
-        --assets-link "{\"name\":\"quip-cpu-sb-linux-arm64\",\"url\":\"${base}/quip-cpu-sb-linux-arm64\"}" \
-        --assets-link "{\"name\":\"quip-cpu-sb-darwin-arm64\",\"url\":\"${base}/quip-cpu-sb-darwin-arm64\"}"
+      set -- --name "quip-miner-cpu ${CI_COMMIT_TAG}" --tag-name "${CI_COMMIT_TAG}"
+      while IFS="$(printf '\t')" read -r name file; do
+        [ -n "$file" ] || continue
+        set -- "$@" --assets-link "{\"name\":\"${name}\",\"url\":\"${base}/${file}\"}"
+      done < assets.tsv
+      release-cli create "$@"
