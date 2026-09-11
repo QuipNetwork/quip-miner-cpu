@@ -46,17 +46,23 @@ cache:
 # a `required-features` key at all, so a target gated behind some other feature
 # would fall into neither list and be dropped from `dist/` without a word.
 #
-# `set -eu` is load-bearing, not decoration. The runner reports only the last
-# command's status from a multi-command script block, so without it a failing
-# `cp` inside the loop would leave a short `dist/` and still exit 0.
+# The runner wraps a job script in `set -o errexit` and `set -o pipefail`
+# already, so `set -eu` below only says so locally and adds `-u`. Those two
+# options are why `match` exists: grep exits 1 when it selects nothing, which
+# under pipefail fails the pipeline and under errexit ends the job at a
+# variable assignment, printing nothing at all. A manifest that puts every
+# target on one track is legal, so absorb that status and let the checks below
+# report anything genuinely wrong. A real grep error, which exits above 1,
+# still stops the job.
 .package-bins: &package-bins |
   set -eu
-  meta=$(cargo metadata --no-deps --format-version 1)
-  chunk() { printf '%s' "$meta" | tr '{' '\n' | grep '"kind":\["bin"\]'; }
+  match() { grep "$@" || [ $? = 1 ]; }
   pick() { sed -n 's/.*"name":"\([^"]*\)".*/\1/p' | LC_ALL=C sort | tr '\n' ' '; }
-  prod=$(chunk | grep -v '"required-features"' | pick)
-  exp=$(chunk | grep '"required-features":\[[^]]*"experimental"' | pick)
-  all=$(chunk | pick)
+  meta=$(cargo metadata --no-deps --format-version 1)
+  bins=$(printf '%s' "$meta" | tr '{' '\n' | match '"kind":\["bin"\]')
+  prod=$(printf '%s\n' "$bins" | match -v '"required-features"' | pick)
+  exp=$(printf '%s\n' "$bins" | match '"required-features":\[[^]]*"experimental"' | pick)
+  all=$(printf '%s\n' "$bins" | pick)
   seen=$(printf '%s\n' $prod $exp | LC_ALL=C sort | tr '\n' ' ')
   if [ "$seen" != "$all" ]; then
     echo "a binary target is gated behind a feature other than experimental" >&2
@@ -182,10 +188,10 @@ upload:
         exit 1
       fi
     - |
-      # `set -e` is what makes --fail count. A shell reports only the last
-      # command's status from a block, so without it a failed upload in the
-      # middle of the loop would still leave this job green and the release
-      # would publish an asset link that resolves to nothing.
+      # --fail makes curl exit non-zero on an HTTP error, and the runner's
+      # `set -o errexit` then stops the loop rather than carrying on to upload
+      # the rest. Without the flag a 4xx would leave this job green and the
+      # release would link an asset that resolves to nothing.
       set -eu
       for f in dist/*; do
         n=$(basename "$f")
