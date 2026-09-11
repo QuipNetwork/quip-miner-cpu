@@ -47,14 +47,20 @@ Prebuilt binaries are attached to each
 operating system as well as the architecture, because an architecture alone
 cannot separate a Linux aarch64 binary from a Darwin arm64 one.
 
+Every binary in the table above is published, production and experimental
+alike. Each release lists the two tracks in its notes. Asset names follow the
+same `<binary>-<os>-<arch>` pattern on both tracks and carry no marker, so the
+file alone does not say which track it came from. Read the track column above
+before you deploy one.
+
 ## Build
 
 ```sh
 cargo build --release
 ```
 
-The experimental binaries build behind an opt-in feature and never appear in
-a Release:
+A plain build produces the three production binaries. The experimental
+binaries need an opt-in feature:
 
 ```sh
 cargo build --release --features experimental
