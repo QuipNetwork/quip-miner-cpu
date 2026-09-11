@@ -215,6 +215,16 @@ release:
   script:
     - |
       set -eu
+      # bins.tsv arrives as a build artifact. Check it describes the release
+      # this job is about to create, so a table that never arrived, or arrived
+      # truncated, stops the job instead of publishing a short asset list.
+      rows=$(wc -l < bins.tsv)
+      if [ "$((rows * 3))" -ne "$ASSET_COUNT" ]; then
+        echo "bins.tsv lists $rows binaries, which is $((rows * 3)) assets," >&2
+        echo "but ASSET_COUNT is $ASSET_COUNT. The build artifact is missing" >&2
+        echo "or incomplete." >&2
+        exit 1
+      fi
       base="${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/${PKG}/${CI_COMMIT_TAG}"
       set -- --name "quip-miner-cpu ${CI_COMMIT_TAG}" --tag-name "${CI_COMMIT_TAG}"
       # An asset name stays exactly <binary>-<os>-<arch>. `glab release

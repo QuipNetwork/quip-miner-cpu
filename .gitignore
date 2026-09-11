@@ -7,3 +7,7 @@
 
 # Audit working artifacts (/rustcheck)
 .rustcheck/
+
+# Written by the CI packaging block, never committed.
+/bins.tsv
+/dist/
