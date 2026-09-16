@@ -30,6 +30,10 @@ reads are sequential and cache-local. Energies are scored with the canonical
 | `quip-cpu-mfa` | mean-field annealing (the same kernel at bond dimension 1) | experimental |
 | `quip-cpu-flatiron` | belief-propagation tensor network on the problem graph | experimental |
 
+The MSA miner uses color-ordered sweeps with 64 replicas per word. Its adaptive
+budget matches CUDA MSA: 7,392 to 29,568 sweeps and exactly 128 reads.
+See [SA acceleration](docs/sa-acceleration.md) for the kernel and benchmark details.
+
 Every sampler streams jobs through one shared pump, `run_stream_pump` in
 `src/lib.rs`. That pump drops a cancelled generation before a worker touches
 the graph. The SA kernel also polls the cancel guard once per sweep (one
@@ -159,7 +163,7 @@ The budget bounds sampler concurrency:
 
 Other CPU binaries (SB, MPS, Flatiron) do not read `num_cpus`.
 
-**Driver / fixed-input (run in isolation, no chain).** Use the coordinator's
+**Driver / fixed-input (run in isolation).** Use the coordinator's
 `drive` harness pointed at the binary — `--source random` for golden-drawn
 problems, `--source list <jsonl>` for a fixed replay:
 

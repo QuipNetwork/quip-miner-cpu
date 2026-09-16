@@ -11,3 +11,8 @@
 # Written by the CI packaging block, never committed.
 /bins.tsv
 /dist/
+
+.beads/
+.beads-*/
+.beads-credential-key
+.dolt/

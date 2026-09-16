@@ -17,6 +17,7 @@
 use crate::sampler_core::CpuGraph;
 
 /// A valid partition of the graph's nodes into independent sets.
+#[derive(Debug)]
 pub(crate) struct Coloring {
     /// Node ids per class. Every class is an independent set.
     classes: Vec<Vec<u32>>,

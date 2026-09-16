@@ -29,9 +29,15 @@
 //! `+1`, which makes `d' = d + [h_i ≠ 0]` and leaves the formula unchanged. A
 //! nonzero field therefore costs one extra plane, not a separate kernel.
 //!
-//! `L` is accumulated as bit planes by a ripple carry-save adder, so all 64
-//! replicas are counted at once. The Metropolis test in the geometric form of
-//! [`crate::sa_int`] is `m ≥ -M`, which rearranges to
+//! `L` is counted as bit planes across all 64 replicas at once. A
+//! Harley-Seal carry-save tree takes at most 20 neighbors plus one field
+//! bond. That tree is a port of CUDA `popcount21`. Missing inputs are
+//! zero words. The field bond, if present, occupies the 21st input.
+//! Wider neighborhoods use a ripple adder through the supported maximum
+//! of 63 bonds including the field.
+//!
+//! The Metropolis test in the geometric form of [`crate::sa_int`] is
+//! `m ≥ -M`, which rearranges to
 //!
 //! ```text
 //! L ≤ ⌊(d' + M) / 2⌋
@@ -40,10 +46,14 @@
 //! a comparison of the bit-sliced counter against a scalar. Accepted replicas
 //! come back as a mask and the flip is one XOR into `spin[i]`.
 //!
+//! If the shared threshold `M` is at least `d'`, every lane accepts. The
+//! kernel then inverts the spin word and skips the neighbor walk.
+//!
 //! # Cost, and what it gives up
 //!
-//! Nothing here is exponential in the degree: `⌈log2(d'+1)⌉ = 5` planes and a
-//! carry-save tree linear in `d'`. What it gives up is the incremental
+//! The satisfied-bond counter needs `⌈log2(d'+1)⌉` planes (five at degree 20,
+//! six at the supported maximum of 63 bonds including the field).
+//! What it gives up is the incremental
 //! effective-field cache of [`crate::sampler_core`]. Each replica accepts a
 //! different set of flips, so no shared cached field can exist and the local
 //! field is recomputed on every attempt. At degree 20 that tax is larger than
@@ -51,16 +61,26 @@
 //!
 //! # Randomness
 //!
-//! One acceptance threshold `M` is shared by the 64 replicas of a word update,
-//! which is what removes 63 of every 64 random draws. The paper takes the same
+//! One acceptance threshold `M` is shared by every replica of a node update,
+//! including replicas in different words. The paper takes the same
 //! route and the replicas still separate, because they start from independent
 //! configurations and see different `L`. It is a real coupling all the same,
 //! and this crate's miner is scored on solution diversity, so
 //! `mining::diversity` is measured against `cpu-sa` rather than assumed.
+//!
+//! # Sweep schedule
+//!
+//! As in CUDA MSA, one 8192-byte threshold row is redrawn at each beta rung.
+//! Each sweep uses a seed-derived cyclic offset shared by all replica words,
+//! then visits independent color classes in sequence. The CPU retains its
+//! `SmallRng` threshold stream, `f64` beta ladder, and per-sweep cancellation;
+//! this is the same update algorithm, not a bit-identical CUDA random stream.
 
-use quip_solver_core::CancelToken;
+use quip_solver_core::{CancelToken, SampleParams};
+use rand::{rngs::SmallRng, SeedableRng};
 
-use crate::sa_int::{draw_row, IntGraph};
+use crate::coloring::Coloring;
+use crate::sa_int::{draw_row, fill_threshold_row, IntGraph};
 use crate::sampler_core::SampleCancelled;
 
 /// Replicas advanced by one word update.
@@ -75,6 +95,13 @@ const PLANES: usize = 6;
 
 /// Largest `d'` this kernel accepts, set by [`PLANES`].
 pub(crate) const MAX_DEGREE: usize = (1 << PLANES) - 1;
+
+/// Graph neighbors the specialized Harley-Seal counter accepts.
+///
+/// Matches CUDA `MSA_MAX_DEG`. The field bond, if present, occupies the
+/// 21st input. Wider neighborhoods use the ripple counter.
+const CSA_NEIGHBORS: usize = 20;
+const CSA_INPUTS: usize = CSA_NEIGHBORS + 1;
 
 /// Spin words for one replica block.
 pub(crate) struct MscState {
@@ -120,69 +147,166 @@ pub(crate) fn bond_counts(graph: &IntGraph) -> Option<Vec<u8>> {
     Some(counts)
 }
 
-/// Advance one 64-replica block through the whole beta ladder.
-///
-/// Pure given `state` and `offsets`, so a test can drive this and the scalar
-/// kernel of [`crate::sa_int`] from identical inputs and compare lane by lane.
-pub(crate) fn anneal_word(
+/// Advance all replica words together, following the CUDA MSA schedule.
+/// One threshold row is redrawn per beta and shared across words. Colors
+/// run in sequence, and every word uses the same seed-derived sweep offset.
+pub(crate) fn anneal_words(
     graph: &IntGraph,
     counts: &[u8],
-    draws: &[u8],
-    sweeps_per_beta: usize,
-    state: &mut MscState,
-    offsets: &[usize],
+    colors: &Coloring,
+    betas: &[f64],
+    params: &SampleParams,
+    states: &mut [MscState],
     cancel: Option<(&CancelToken, Option<u64>)>,
 ) -> Result<(), SampleCancelled> {
-    let n = graph.num_nodes();
-    let row_len = draw_row();
-    let mask = row_len - 1;
-    let mut sweep = 0usize;
-    for row in draws.chunks_exact(row_len) {
-        for _ in 0..sweeps_per_beta {
+    let mut row = vec![0; draw_row()];
+    let mut cut = vec![0; graph.max_field() + 1];
+    let mut rng = SmallRng::seed_from_u64(params.seed ^ 0x5341_5F54_424C_4531);
+    for (beta_idx, &beta) in betas.iter().enumerate() {
+        if let Some((guard, watermark)) = cancel {
+            if guard.is_cancelled(watermark) {
+                return Err(SampleCancelled);
+            }
+        }
+        fill_threshold_row(beta, &mut cut, &mut rng, &mut row);
+        for sweep in 0..params.sweeps_per_beta.max(1) {
             if let Some((guard, watermark)) = cancel {
                 if guard.is_cancelled(watermark) {
                     return Err(SampleCancelled);
                 }
             }
-            let off = offsets.get(sweep).copied().unwrap_or(0);
-            sweep += 1;
-            for var in 0..n {
-                let bi = state.spin[var];
-                let d = usize::from(counts[var]);
-
-                // Count satisfied bonds into bit planes. Only the planes a
-                // partial count can reach are rippled, so the work is linear
-                // in the degree rather than PLANES times the degree.
-                let mut planes = [0u64; PLANES];
-                let mut filled = 0usize;
-                let h = graph.bias(var);
-                if h != 0 {
-                    // Ghost bond to a spin pinned at +1: l = c_h ^ b_i.
-                    let l = if h < 0 { !bi } else { bi };
-                    add_plane(&mut planes, &mut filled, l);
+            let off = sweep_offset(params.seed, beta_idx, sweep);
+            for class in colors.classes() {
+                for state in states.iter_mut() {
+                    sweep_word(graph, counts, &row, class, off, state);
                 }
-                for &e in graph.neighbors(var) {
-                    let sign = 0u64.wrapping_sub(u64::from(e >> 31));
-                    let l = sign ^ bi ^ state.spin[(e & 0x7fff_ffff) as usize];
-                    add_plane(&mut planes, &mut filled, l);
-                }
-
-                // Metropolis: accept where L <= (d + M) / 2.
-                let m = usize::from(row[(var + off) & mask]);
-                let limit = (d + m) / 2;
-                let accept = if limit >= d {
-                    u64::MAX
-                } else {
-                    le_constant(&planes, limit)
-                };
-                state.spin[var] = bi ^ accept;
             }
         }
     }
     Ok(())
 }
 
-/// Add one bit plane into the running carry-save count.
+/// CUDA's splitmix64 offset, shared by every replica at a given sweep.
+fn sweep_offset(seed: u64, beta_idx: usize, sweep: usize) -> usize {
+    let mut x =
+        (seed ^ ((beta_idx as u64) << 20) ^ sweep as u64).wrapping_add(0x9E37_79B9_7F4A_7C15);
+    x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    ((x ^ (x >> 31)) as usize) & (draw_row() - 1)
+}
+
+/// Update a color's nodes in one word from a shared threshold row.
+fn sweep_word(
+    graph: &IntGraph,
+    counts: &[u8],
+    row: &[u8],
+    nodes: &[u32],
+    off: usize,
+    state: &mut MscState,
+) {
+    let mask = row.len() - 1;
+    for &var in nodes {
+        let var = var as usize;
+        let d = usize::from(counts[var]);
+        let m = usize::from(row[(var + off) & mask]);
+        // m >= d iff (d + m) / 2 >= d, so every lane accepts and the
+        // satisfied-bond count is unused.
+        if m >= d {
+            state.spin[var] = !state.spin[var];
+            continue;
+        }
+        let bi = state.spin[var];
+        let planes = count_planes(graph, var, bi, &state.spin);
+        let limit = (d + m) / 2;
+        state.spin[var] = bi ^ le_constant(&planes, limit);
+    }
+}
+
+/// Bit-sliced satisfied-bond count for every replica in `bi`.
+///
+/// Degree selection is outside the per-input work: at most 20 neighbors
+/// plus one field bond use the specialized counter, and the rest use ripple.
+fn count_planes(graph: &IntGraph, var: usize, bi: u64, spin: &[u64]) -> [u64; PLANES] {
+    let nbrs = graph.neighbors(var);
+    let h = graph.bias(var);
+    if nbrs.len() <= CSA_NEIGHBORS {
+        count_planes_csa(nbrs, h, bi, spin)
+    } else {
+        count_planes_ripple(nbrs, h, bi, spin)
+    }
+}
+
+fn count_planes_csa(nbrs: &[u32], h: i8, bi: u64, spin: &[u64]) -> [u64; PLANES] {
+    let mut x = [0u64; CSA_INPUTS];
+    for (q, &e) in nbrs.iter().enumerate() {
+        let sign = 0u64.wrapping_sub(u64::from(e >> 31));
+        x[q] = sign ^ bi ^ spin[(e & 0x7fff_ffff) as usize];
+    }
+    if h != 0 {
+        x[CSA_NEIGHBORS] = if h < 0 { !bi } else { bi };
+    }
+    popcount21(&x)
+}
+
+fn count_planes_ripple(nbrs: &[u32], h: i8, bi: u64, spin: &[u64]) -> [u64; PLANES] {
+    let mut planes = [0u64; PLANES];
+    let mut filled = 0usize;
+    if h != 0 {
+        // Ghost bond to a spin pinned at +1: l = c_h ^ b_i.
+        add_plane(&mut planes, &mut filled, if h < 0 { !bi } else { bi });
+    }
+    for &e in nbrs {
+        let sign = 0u64.wrapping_sub(u64::from(e >> 31));
+        add_plane(
+            &mut planes,
+            &mut filled,
+            sign ^ bi ^ spin[(e & 0x7fff_ffff) as usize],
+        );
+    }
+    planes
+}
+
+/// Carry-save adder: `(carry, sum) = a + b + c` per lane.
+#[inline]
+fn csa(a: u64, b: u64, c: u64) -> (u64, u64) {
+    let u = a ^ b;
+    ((a & b) | (u & c), u ^ c)
+}
+
+/// Per-lane popcount of 21 one-bit inputs into six planes.
+///
+/// Missing inputs are zero words. Port of CUDA `popcount21`.
+#[inline]
+fn popcount21(x: &[u64; CSA_INPUTS]) -> [u64; PLANES] {
+    let (t_a, ones) = csa(0, x[0], x[1]);
+    let (t_b, ones) = csa(ones, x[2], x[3]);
+    let (f_a, twos) = csa(0, t_a, t_b);
+    let (t_a, ones) = csa(ones, x[4], x[5]);
+    let (t_b, ones) = csa(ones, x[6], x[7]);
+    let (f_b, twos) = csa(twos, t_a, t_b);
+    let (e_a, fours) = csa(0, f_a, f_b);
+    let (t_a, ones) = csa(ones, x[8], x[9]);
+    let (t_b, ones) = csa(ones, x[10], x[11]);
+    let (f_a, twos) = csa(twos, t_a, t_b);
+    let (t_a, ones) = csa(ones, x[12], x[13]);
+    let (t_b, ones) = csa(ones, x[14], x[15]);
+    let (f_b, twos) = csa(twos, t_a, t_b);
+    let (e_b, fours) = csa(fours, f_a, f_b);
+    let (s_a, eights) = csa(0, e_a, e_b);
+    let (t_a, ones) = csa(ones, x[16], x[17]);
+    let (t_b, ones) = csa(ones, x[18], x[19]);
+    let (f_a, twos) = csa(twos, t_a, t_b);
+    let t_a = ones & x[20];
+    let ones = ones ^ x[20];
+    let f_b = twos & t_a;
+    let twos = twos ^ t_a;
+    let (e_a, fours) = csa(fours, f_a, f_b);
+    let s_b = eights & e_a;
+    let eights = eights ^ e_a;
+    [ones, twos, fours, eights, s_a | s_b, 0]
+}
+
+/// Add one bit plane into the running count with ripple carries.
 ///
 /// `filled` is how many inputs have been absorbed so far, which bounds how far
 /// a carry can travel.
@@ -230,7 +354,9 @@ fn le_constant(planes: &[u64; PLANES], limit: usize) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sa_int::{anneal_from, sweep_offsets, threshold_draws};
+    use crate::sa_int::{
+        anneal_from, draw_row, fill_threshold_row, sweep_offsets, threshold_draws,
+    };
     use quip_solver_core::beta::geometric_beta_schedule;
     use quip_solver_core::IsingGraph;
     use rand::rngs::SmallRng;
@@ -296,6 +422,36 @@ mod tests {
         }
     }
 
+    #[test]
+    fn popcount21_matches_scalar_and_ripple_on_padded_inputs() {
+        let mut rng = SmallRng::seed_from_u64(21);
+        for n_set in 0..=CSA_INPUTS {
+            for _ in 0..8 {
+                let mut x = [0u64; CSA_INPUTS];
+                for slot in x.iter_mut().take(n_set) {
+                    *slot = rng.gen();
+                }
+                let csa_planes = popcount21(&x);
+                let mut ripple = [0u64; PLANES];
+                let mut filled = 0usize;
+                for &w in &x {
+                    add_plane(&mut ripple, &mut filled, w);
+                }
+                for lane in 0..LANES {
+                    let expect = x.iter().map(|w| ((w >> lane) & 1) as usize).sum::<usize>();
+                    let from_csa: usize = (0..PLANES)
+                        .map(|k| ((csa_planes[k] >> lane) & 1) as usize * (1 << k))
+                        .sum();
+                    let from_ripple: usize = (0..PLANES)
+                        .map(|k| ((ripple[k] >> lane) & 1) as usize * (1 << k))
+                        .sum();
+                    assert_eq!(from_csa, expect, "csa lane {lane} n_set {n_set}");
+                    assert_eq!(from_ripple, expect, "ripple lane {lane} n_set {n_set}");
+                }
+            }
+        }
+    }
+
     /// The load-bearing test: every lane of the multi-spin kernel must trace
     /// exactly the trajectory the scalar kernel traces from the same initial
     /// configuration and the same acceptance thresholds.
@@ -316,8 +472,12 @@ mod tests {
 
             let mut state = MscState::random(int.num_nodes(), &mut rng);
             let before: Vec<Vec<i8>> = (0..LANES).map(|l| state.lane(l)).collect();
-            anneal_word(&int, &counts, &draws, 2, &mut state, &offsets, None)
-                .expect("no cancel token");
+            let nodes: Vec<u32> = (0..int.num_nodes() as u32).collect();
+            for (row, shifts) in draws.chunks_exact(draw_row()).zip(offsets.chunks_exact(2)) {
+                for &off in shifts {
+                    sweep_word(&int, &counts, row, &nodes, off, &mut state);
+                }
+            }
 
             for (lane, start) in before.iter().enumerate() {
                 let mut spins = start.clone();
@@ -328,10 +488,210 @@ mod tests {
     }
 
     #[test]
+    fn cancelled_generation_leaves_replica_words_untouched() {
+        let graph = unit_graph(8, 1, &[0.0], 0.5);
+        let int = IntGraph::from_base(&graph).expect("unit graph");
+        let counts = bond_counts(&int).expect("small degree");
+        let colors = Coloring::new(&crate::sampler_core::CpuGraph::from_base(&graph));
+        let mut rng = SmallRng::seed_from_u64(1);
+        let mut states = vec![MscState::random(8, &mut rng), MscState::random(8, &mut rng)];
+        let before: Vec<_> = states.iter().map(|s| s.spin.clone()).collect();
+        let token = CancelToken::default();
+        token.cancel_through(7);
+        let result = anneal_words(
+            &int,
+            &counts,
+            &colors,
+            &[0.1, 1.0],
+            &SampleParams::default(),
+            &mut states,
+            Some((&token, Some(7))),
+        );
+        assert!(result.is_err());
+        for (state, expected) in states.iter().zip(before) {
+            assert_eq!(state.spin, expected);
+        }
+        assert!(
+            anneal_words(
+                &int,
+                &counts,
+                &colors,
+                &[0.1, 1.0],
+                &SampleParams::default(),
+                &mut states,
+                Some((&token, Some(8))),
+            )
+            .is_ok(),
+            "a newer generation must still run"
+        );
+    }
+
+    #[test]
     fn rejects_degrees_beyond_the_plane_budget() {
         // A field larger than one cannot be a single ghost bond.
         let g = IsingGraph::new(vec![2.0, 0.0], vec![1.0], vec![(0, 1)]);
         let int = IntGraph::from_base(&g).expect("unit couplings qualify");
         assert!(bond_counts(&int).is_none());
+    }
+
+    fn signed_star(neighbors: usize, field: f64, seed: u64) -> IsingGraph {
+        let mut rng = SmallRng::seed_from_u64(seed);
+        let n = neighbors + 1;
+        let mut h = vec![0.0; n];
+        h[0] = field;
+        let edges: Vec<(usize, usize)> = (1..n).map(|v| (0, v)).collect();
+        let j: Vec<f64> = (0..neighbors)
+            .map(|_| if rng.gen::<bool>() { 1.0 } else { -1.0 })
+            .collect();
+        IsingGraph::new(h, j, edges)
+    }
+
+    /// Independent per-lane popcount of satisfied bonds, including the field.
+    fn scalar_satisfied(graph: &IntGraph, var: usize, spin: &[u64], lane: usize) -> u8 {
+        let bi = (spin[var] >> lane) & 1;
+        let mut acc = 0u8;
+        let h = graph.bias(var);
+        if h != 0 {
+            acc += if h < 0 { 1 ^ bi } else { bi } as u8;
+        }
+        for &e in graph.neighbors(var) {
+            let sign = u64::from(e >> 31);
+            let bj = (spin[(e & 0x7fff_ffff) as usize] >> lane) & 1;
+            acc += (sign ^ bi ^ bj) as u8;
+        }
+        acc
+    }
+
+    fn decode_planes(planes: &[u64; PLANES]) -> [u8; LANES] {
+        let mut out = [0u8; LANES];
+        for (lane, slot) in out.iter_mut().enumerate() {
+            let mut c = 0u8;
+            for (k, plane) in planes.iter().enumerate() {
+                c |= (((plane >> lane) & 1) as u8) << k;
+            }
+            *slot = c;
+        }
+        out
+    }
+
+    fn threshold_samples(d: usize) -> [usize; 3] {
+        let below = d.saturating_sub(1);
+        [below, d, d.saturating_add(1)]
+    }
+
+    #[test]
+    fn packed_counts_match_scalar_for_listed_degrees() {
+        const NEIGHBORS: [usize; 7] = [0, 1, 6, 20, 21, 48, 63];
+        const FIELDS: [f64; 3] = [-1.0, 0.0, 1.0];
+        const SEEDS: [u64; 3] = [1, 7, 99];
+        for &nbrs in &NEIGHBORS {
+            for &field in &FIELDS {
+                if nbrs + usize::from(field != 0.0) > MAX_DEGREE {
+                    continue;
+                }
+                for &seed in &SEEDS {
+                    let graph = signed_star(nbrs, field, seed);
+                    let int = IntGraph::from_base(&graph).expect("unit star");
+                    let counts = bond_counts(&int).expect("degree within bounds");
+                    let n = int.num_nodes();
+                    let mut rng = SmallRng::seed_from_u64(seed ^ 0x00C0_FFEE);
+                    let spin_sets = [
+                        MscState::random(n, &mut rng).spin,
+                        vec![0u64; n],
+                        vec![u64::MAX; n],
+                    ];
+                    for spin in &spin_sets {
+                        let var = 0usize;
+                        let d = usize::from(counts[var]);
+                        assert_eq!(d, nbrs + usize::from(field != 0.0), "d' at center");
+                        let packed = decode_planes(&count_planes(&int, var, spin[var], spin));
+                        for (lane, packed_count) in packed.iter().enumerate() {
+                            let expect = scalar_satisfied(&int, var, spin, lane);
+                            assert_eq!(
+                                *packed_count, expect,
+                                "nbrs {nbrs} field {field} seed {seed} lane {lane}"
+                            );
+                        }
+                        for m in threshold_samples(d) {
+                            let mut state = MscState { spin: spin.clone() };
+                            let row = vec![m as u8; draw_row()];
+                            sweep_word(&int, &counts, &row, &[0], 0, &mut state);
+                            let limit = (d + m) / 2;
+                            for (lane, packed_count) in packed.iter().enumerate() {
+                                let accept = usize::from(*packed_count) <= limit;
+                                let before = (spin[var] >> lane) & 1;
+                                let after = (state.spin[var] >> lane) & 1;
+                                assert_eq!(
+                                    after != before,
+                                    accept,
+                                    "nbrs {nbrs} field {field} seed {seed} m {m} lane {lane}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn early_accept_flips_every_lane_when_threshold_covers_degree() {
+        let graph = signed_star(6, 1.0, 3);
+        let int = IntGraph::from_base(&graph).expect("unit star");
+        let counts = bond_counts(&int).expect("degree within bounds");
+        let d = usize::from(counts[0]);
+        let mut rng = SmallRng::seed_from_u64(5);
+        let spin = MscState::random(int.num_nodes(), &mut rng).spin;
+        for m in [d, d + 1] {
+            let mut state = MscState { spin: spin.clone() };
+            let row = vec![m as u8; draw_row()];
+            sweep_word(&int, &counts, &row, &[0], 0, &mut state);
+            assert_eq!(state.spin[0], !spin[0], "m {m} must flip every lane");
+        }
+    }
+
+    #[test]
+    fn anneal_words_matches_per_word_sweep_word() {
+        let graph = unit_graph(24, 11, &[-1.0, 0.0, 1.0], 0.4);
+        let int = IntGraph::from_base(&graph).expect("unit couplings qualify");
+        let counts = bond_counts(&int).expect("degree within bounds");
+        let colors = Coloring::new(&crate::sampler_core::CpuGraph::from_base(&graph));
+        let betas = [0.2_f64, 1.5];
+        let params = SampleParams {
+            seed: 42,
+            sweeps_per_beta: 3,
+            ..Default::default()
+        };
+        let mut rng = SmallRng::seed_from_u64(1);
+        let mut states = vec![
+            MscState::random(int.num_nodes(), &mut rng),
+            MscState::random(int.num_nodes(), &mut rng),
+        ];
+        let mut replay: Vec<MscState> = states
+            .iter()
+            .map(|s| MscState {
+                spin: s.spin.clone(),
+            })
+            .collect();
+        anneal_words(&int, &counts, &colors, &betas, &params, &mut states, None)
+            .expect("no cancel token");
+
+        let mut row = vec![0; draw_row()];
+        let mut cut = vec![0; int.max_field() + 1];
+        let mut table_rng = SmallRng::seed_from_u64(params.seed ^ 0x5341_5F54_424C_4531);
+        for (beta_idx, &beta) in betas.iter().enumerate() {
+            fill_threshold_row(beta, &mut cut, &mut table_rng, &mut row);
+            for sweep in 0..params.sweeps_per_beta.max(1) {
+                let off = sweep_offset(params.seed, beta_idx, sweep);
+                for class in colors.classes() {
+                    for state in replay.iter_mut() {
+                        sweep_word(&int, &counts, &row, class, off, state);
+                    }
+                }
+            }
+        }
+        for (got, expect) in states.iter().zip(&replay) {
+            assert_eq!(got.spin, expect.spin);
+        }
     }
 }
