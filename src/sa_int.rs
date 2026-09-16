@@ -185,9 +185,9 @@ impl IntGraph {
 /// The table is `rungs * row_len` `f64` where the `f64` kernel needs only the
 /// `rungs` of the beta ladder itself, so an unbounded rung count would cost up
 /// to `MAX_FIELD + 1` times the memory `cpu-sa` used before this path existed.
-/// A mining job runs at most `CPU_ADAPT.max_sweeps` rungs, so nothing in the
-/// miner approaches this bound. It is here for a caller that hands the library
-/// an unbounded `num_sweeps` directly: past the cap [`acceptance_table`]
+/// The scalar FSA budget uses at most `CPU_ADAPT.max_sweeps` rungs. Deeper
+/// MSA jobs can reach this path when packed sampling is unavailable, as can
+/// library callers with an unbounded `num_sweeps`: past the cap [`acceptance_table`]
 /// declines, and the caller keeps the `f64` kernel, which produces the same
 /// spins from the same random stream.
 const MAX_TABLE_ENTRIES: usize = 1 << 20;
@@ -265,8 +265,9 @@ const _: () = assert!(DRAW_ROW.is_power_of_two());
 /// Largest threshold table this path draws, in bytes.
 ///
 /// One `DRAW_ROW` per rung, so the cost is `rungs * 8 KiB` however small the
-/// problem. A mining job runs at most `CPU_ADAPT.max_sweeps` rungs, which costs
-/// 8 MiB, so nothing in the miner approaches this bound. Past it
+/// problem. The scalar FSA budget uses at most `CPU_ADAPT.max_sweeps` rungs,
+/// which costs 8 MiB. Deeper MSA jobs can exceed this cap when packed sampling
+/// is unavailable. Past it
 /// [`threshold_draws`] declines and the caller falls back to `cpu-sa`, which is
 /// what every other precondition failure in these kernels does.
 const MAX_DRAW_BYTES: usize = 64 << 20;
@@ -312,26 +313,34 @@ pub(crate) fn threshold_draws(
     let mut cut = vec![0u64; max_field + 1];
     let mut out = vec![0u8; betas.len() * DRAW_ROW];
     for (b, &beta) in betas.iter().enumerate() {
-        let scale = -2.0 * beta;
-        for (k, c) in cut.iter_mut().enumerate() {
-            *c = scale_u64((scale * k as f64).exp());
-        }
-        // A problem with no bonds and no fields has no uphill move, so there
-        // is no level to compare against and every threshold is 0.
-        let first = cut.get(1).copied().unwrap_or(0);
-        for slot in out[b * DRAW_ROW..(b + 1) * DRAW_ROW].iter_mut() {
-            let u = rng.gen::<u64>();
-            // `cut` is non-increasing, so the accepted levels are a prefix and
-            // `M` is where that prefix ends. Over most of the ladder the
-            // prefix is empty, so check that before searching.
-            *slot = if u >= first {
-                0
-            } else {
-                cut[1..].partition_point(|&c| u < c) as u8
-            };
-        }
+        fill_threshold_row(
+            beta,
+            &mut cut,
+            rng,
+            &mut out[b * DRAW_ROW..(b + 1) * DRAW_ROW],
+        );
     }
     Some(out)
+}
+
+/// Redraw one temperature's thresholds, reusing the row and acceptance cuts.
+/// `cut` has one entry for every possible field magnitude, including zero.
+pub(crate) fn fill_threshold_row(beta: f64, cut: &mut [u64], rng: &mut SmallRng, row: &mut [u8]) {
+    let scale = -2.0 * beta;
+    for (k, c) in cut.iter_mut().enumerate() {
+        *c = scale_u64((scale * k as f64).exp());
+    }
+    // With no bonds or fields there is no uphill move, so every threshold is 0.
+    let first = cut.get(1).copied().unwrap_or(0);
+    for slot in row {
+        let u = rng.gen::<u64>();
+        // Accepted levels form a prefix of the non-increasing cuts.
+        *slot = if u >= first {
+            0
+        } else {
+            cut[1..].partition_point(|&c| u < c) as u8
+        };
+    }
 }
 
 /// Cyclic shifts into the threshold table, one per sweep.

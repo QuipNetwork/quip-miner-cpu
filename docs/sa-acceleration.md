@@ -6,7 +6,38 @@ Commun. **192**, 265 (2015), [arXiv:1401.1084](https://arxiv.org/abs/1401.1084))
 apply to this miner. It states which ones this crate now ships, and what they
 measure.
 
-## Result
+## Current MSA kernel
+
+MSA visits color classes in order at each sweep and processes every replica word
+at each temperature. It fills one reusable 8 KiB threshold row per temperature.
+Sweep offsets use the CUDA seed mixing and are shared across replica words.
+The CPU retains SmallRng and f64 temperatures, so CPU and CUDA trajectories can differ.
+
+The packed kernel skips neighbor counting when the threshold accepts every lane.
+For up to 20 neighbors plus a field, it uses carry-save counting. Larger supported
+degrees use ripple counting. A single-entry cache reuses coloring for an identical
+ordered topology across sampler clones and streaming jobs.
+
+The adaptive budget matches CUDA MSA: 7,392 to 29,568 sweeps and 128 reads.
+This budget has not yet been validated against the approximately –14,600 target
+on the current problem corpus.
+
+Run the deterministic synthetic benchmark with:
+
+```sh
+cargo run --release --locked --example msa_bench -- --repeats 7
+```
+
+Use `--quick` for the smaller matrix. The CSV reports runtime and output fingerprints.
+On a Ryzen 9 5950X, the CPU optimizations measured 1.62 to 1.87 times faster
+for degree-20 cases than the initial CPU port of the CUDA sweep loop.
+All seven cases preserved output fingerprints in five alternating rounds with
+seven timed repeats per case. Target-energy success rates require a separate corpus study.
+
+## Earlier corpus results
+
+The corpus tables below describe the earlier kernel, before the
+color-ordered sweep loop, CPU optimizations, and deeper adaptive budget.
 
 On the two bundled Zephyr corpora, at equal sweep and read counts:
 
@@ -86,9 +117,8 @@ downhill or flat candidate has `n ≤ 0 ≤ M`, the whole Metropolis test collap
 to one integer comparison, `m ≥ -M`. The kernel draws no random number per
 candidate flip.
 
-This crate draws the thresholds once per job into a table shared by every read,
-and shifts the read position by a random amount each sweep, so that no site
-reads the same threshold twice in a row.
+The FSA kernel draws a threshold table per job. MSA fills one reusable row per
+temperature. Both share thresholds across reads and shift the row offset each sweep.
 
 The field-free case, `h = 0`, buys nothing extra here. A field in `{-1, 0, +1}`
 folds into the same kernel as one extra bond to a spin pinned at `+1`, so
@@ -113,9 +143,9 @@ described earlier.
 
 **The multi-spin coded kernel**, exposed as `cpu-msa`. One `u64` holds the same
 lattice spin across 64 replicas. A replica is a read, so a 64-read job is one
-word pass. Satisfied bonds accumulate in 6 bit planes through a ripple
-carry-save adder, and the acceptance test is a branchless comparison of that
-counter against a scalar.
+word pass. Satisfied bonds accumulate in six bit planes through carry-save or
+ripple counting. The acceptance test compares that counter against a scalar
+threshold. An early acceptance check skips counting when every lane must flip.
 
 ## Why `cpu-sa` itself changed
 
@@ -151,14 +181,13 @@ One more condition bounds memory rather than correctness. The acceptance table
 holds one row per temperature rung. For an unbounded sweep count that reaches
 101 times the memory the `f64` kernel needs for the same ladder. Past 2^20 table
 entries the integer path declines, which leaves the caller on the `f64` kernel,
-whose spins are the same. A mining job runs at most 1024 rungs, so
-nothing in the miner approaches the bound.
+whose spins are the same. The scalar adaptive budget uses at most 1024 rungs.
+Deeper MSA requests can reach the table limit when packed sampling is unavailable.
 
-`cpu-fsa` and `cpu-msa` draw a threshold row of 8 KiB per rung, and decline past
-64 MiB of them, which falls back to `cpu-sa`. A problem with more than 8192
-nodes reuses a threshold within one sweep, for sites 8192 apart. The per-sweep
-offset repairs the pairing every sweep, so no two sites share a threshold twice,
-but the count of independent thresholds in one sweep is capped there.
+`cpu-fsa` stores an 8 KiB threshold row per rung and falls back to `cpu-sa`
+when the table exceeds 64 MiB. Packed `cpu-msa` reuses one 8 KiB row.
+A problem with more than 8192 nodes reuses thresholds for sites 8192 apart.
+Changing the sweep offset changes the selected threshold but preserves that pairing.
 
 `cpu-msa` needs two more conditions, and falls back to the tabulated kernel
 otherwise:
@@ -209,10 +238,10 @@ node order and edge order, not merely matching counts.
 | kernel | mean gap | vs `sa-base` | gate | median wall | jobs/min | speedup | diversity |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | `sa-base` | +1.641% | — | 10% | 4916 ms | 94.1 | 1.00x | 443.40 |
-| `cpu-sa` | +1.641% | -0.001% (t -0.1) | 11% | 4174 ms | 110.8 | 1.18x | 443.44 |
+| `cpu-sa` | +1.641% | –0.001% (t –0.1) | 11% | 4174 ms | 110.8 | 1.18x | 443.44 |
 | `cpu-fsa` | +1.642% | +0.001% (t +0.2) | 10% | 3337 ms | 137.7 | 1.46x | 443.39 |
 | `cpu-msa` | +1.645% | +0.003% (t +0.8) | 10% | 380 ms | 958.7 | 10.19x | 443.13 |
-| `cpu-sb` | +1.565% | -0.076% (t -19.3) | 16% | 5744 ms | 80.9 | 0.86x | 437 |
+| `cpu-sb` | +1.565% | –0.076% (t –19.3) | 16% | 5744 ms | 80.9 | 0.86x | 437 |
 
 #### Hardness 0.5, 36 reads
 
@@ -221,8 +250,8 @@ node order and edge order, not merely matching counts.
 | `sa-base` | +1.941% | — | 1% | 1560 ms | 288.0 | 1.00x | 450.14 |
 | `cpu-sa` | +1.945% | +0.004% (t +0.8) | 0% | 1328 ms | 337.5 | 1.17x | 450.14 |
 | `cpu-fsa` | +1.941% | +0.000% (t +0.1) | 1% | 1067 ms | 414.4 | 1.44x | 450.10 |
-| `cpu-msa` | +1.939% | -0.002% (t -0.3) | 1% | 213 ms | 1623.0 | 5.64x | 449.80 |
-| `cpu-sb` | +1.823% | -0.118% (t -24.3) | 4% | 1820 ms | 246.9 | 0.86x | 445 |
+| `cpu-msa` | +1.939% | –0.002% (t –0.3) | 1% | 213 ms | 1623.0 | 5.64x | 449.80 |
+| `cpu-sb` | +1.823% | –0.118% (t –24.3) | 4% | 1820 ms | 246.9 | 0.86x | 445 |
 
 #### What the mean gap does and does not say
 
@@ -250,40 +279,40 @@ is for these kernels.
 | kernel | mean gap | vs `sa-base` | gate | median wall | jobs/min | speedup | diversity |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | `sa-base` | +0.701% | — | 7% | 1392 ms | 294.7 | 1.00x | 446 |
-| `cpu-sa` | +0.682% | -0.019% (t -1.4) | 8% | 1149 ms | 352.7 | 1.20x | 445 |
+| `cpu-sa` | +0.682% | –0.019% (t –1.4) | 8% | 1149 ms | 352.7 | 1.20x | 445 |
 | `cpu-fsa` | +0.704% | +0.003% (t +0.2) | 7% | 926 ms | 431.8 | 1.47x | 446 |
 | `cpu-msa` | +0.711% | +0.011% (t +0.8) | 11% | 196 ms | 1576.2 | 5.35x | 445 |
-| `cpu-sb` | +0.589% | -0.112% (t -8.3) | 15% | 1628 ms | 253.3 | 0.86x | 440 |
+| `cpu-sb` | +0.589% | –0.112% (t –8.3) | 15% | 1628 ms | 253.3 | 0.86x | 440 |
 
 #### Hardness 0.5, `chain-ternary`
 
 | kernel | mean gap | vs `sa-base` | gate | median wall | jobs/min | speedup | diversity |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | `sa-base` | +0.106% | — | 65% | 1405 ms | 291.0 | 1.00x | 286 |
-| `cpu-sa` | +0.094% | -0.013% (t -1.1) | 65% | 1170 ms | 345.8 | 1.19x | 286 |
-| `cpu-fsa` | +0.099% | -0.007% (t -0.8) | 65% | 933 ms | 429.5 | 1.48x | 286 |
-| `cpu-msa` | +0.098% | -0.008% (t -0.8) | 64% | 204 ms | 1539.6 | 5.29x | 285 |
-| `cpu-sb` | +0.032% | -0.074% (t -8.3) | 65% | 1727 ms | 239.7 | 0.82x | 272 |
+| `cpu-sa` | +0.094% | –0.013% (t –1.1) | 65% | 1170 ms | 345.8 | 1.19x | 286 |
+| `cpu-fsa` | +0.099% | –0.007% (t –0.8) | 65% | 933 ms | 429.5 | 1.48x | 286 |
+| `cpu-msa` | +0.098% | –0.008% (t –0.8) | 64% | 204 ms | 1539.6 | 5.29x | 285 |
+| `cpu-sb` | +0.032% | –0.074% (t –8.3) | 65% | 1727 ms | 239.7 | 0.82x | 272 |
 
 #### Hardness 1.0, `chain-h0`
 
 | kernel | mean gap | vs `sa-base` | gate | median wall | jobs/min | speedup | diversity |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | `sa-base` | +0.390% | — | 45% | 4620 ms | 91.6 | 1.00x | 438 |
-| `cpu-sa` | +0.387% | -0.003% (t -0.3) | 49% | 3816 ms | 110.1 | 1.20x | 438 |
+| `cpu-sa` | +0.387% | –0.003% (t –0.3) | 49% | 3816 ms | 110.1 | 1.20x | 438 |
 | `cpu-fsa` | +0.391% | +0.002% (t +0.1) | 51% | 2988 ms | 139.2 | 1.52x | 438 |
 | `cpu-msa` | +0.391% | +0.002% (t +0.2) | 48% | 363 ms | 915.7 | 10.00x | 438 |
-| `cpu-sb` | +0.313% | -0.077% (t -6.7) | 61% | 5336 ms | 79.1 | 0.86x | 432 |
+| `cpu-sb` | +0.313% | –0.077% (t –6.7) | 61% | 5336 ms | 79.1 | 0.86x | 432 |
 
 #### Hardness 1.0, `chain-ternary`
 
 | kernel | mean gap | vs `sa-base` | gate | median wall | jobs/min | speedup | diversity |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| `sa-base` | -0.125% | — | 71% | 4658 ms | 85.8 | 1.00x | 261 |
-| `cpu-sa` | -0.124% | +0.001% (t +0.1) | 71% | 3822 ms | 102.2 | 1.19x | 260 |
-| `cpu-fsa` | -0.124% | +0.001% (t +0.2) | 73% | 3007 ms | 137.1 | 1.60x | 260 |
-| `cpu-msa` | -0.133% | -0.008% (t -1.0) | 72% | 387 ms | 840.6 | 9.80x | 258 |
-| `cpu-sb` | -0.168% | -0.043% (t -6.0) | 74% | 5674 ms | 71.9 | 0.84x | 241 |
+| `sa-base` | –0.125% | — | 71% | 4658 ms | 85.8 | 1.00x | 261 |
+| `cpu-sa` | –0.124% | +0.001% (t +0.1) | 71% | 3822 ms | 102.2 | 1.19x | 260 |
+| `cpu-fsa` | –0.124% | +0.001% (t +0.2) | 73% | 3007 ms | 137.1 | 1.60x | 260 |
+| `cpu-msa` | –0.133% | –0.008% (t –1.0) | 72% | 387 ms | 840.6 | 9.80x | 258 |
+| `cpu-sb` | –0.168% | –0.043% (t –6.0) | 74% | 5674 ms | 71.9 | 0.84x | 241 |
 
 ### How to read these tables
 
