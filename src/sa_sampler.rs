@@ -32,7 +32,8 @@ use crate::coloring::Coloring;
 use crate::sa_int::{anneal_from, sweep_offsets, threshold_draws, IntGraph};
 use crate::sa_msc::{anneal_words, bond_counts, MscState, LANES};
 use crate::sampler_core::{
-    build_beta_schedule, sample_ising_cancellable, CpuGraph, SampleCancelled,
+    build_beta_schedule, build_seeded_beta_schedule, sample_ising_cancellable, CpuGraph,
+    SampleCancelled,
 };
 use crate::{run_stream_pump, CPU_ADAPT, DEFAULT_MAX_EDGES, DEFAULT_MAX_NODES};
 
@@ -80,6 +81,82 @@ pub(crate) const CPU_MSA_ADAPT: AdaptBounds = AdaptBounds {
     reads_solution_max_factor: 0,
     reads_solution_floor_factor: 0,
 };
+
+/// Start states and the start point for a seeded anneal.
+///
+/// Read `r` starts from `spins[r]`. A read past the last state starts from a
+/// random configuration, as every read of a cold run does, and a state past
+/// the last read is not used.
+#[derive(Debug, Clone, Copy)]
+pub struct SeededStart<'a> {
+    /// One `{-1, +1}` entry per variable in each state, best state first.
+    pub spins: &'a [Vec<i8>],
+    /// Inverse temperature the anneal starts from. `None` takes the geometric
+    /// midpoint of the cold run's beta range. A seeded anneal that starts at
+    /// the hot end forgets its seed.
+    pub start_beta: Option<f64>,
+}
+
+/// Why a seeded run was refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SeedError {
+    /// State `index` does not have one spin per variable.
+    WrongLength {
+        /// Position of the state in [`SeededStart::spins`].
+        index: usize,
+        /// Variables in the problem.
+        expected: usize,
+        /// Spins in the state.
+        got: usize,
+    },
+    /// State `index` holds a value other than `-1` or `+1`.
+    BadSpin {
+        /// Position of the state in [`SeededStart::spins`].
+        index: usize,
+    },
+    /// The problem has a coupling or field the integer kernels do not take,
+    /// and the scalar fallback has no seeded form.
+    UnsupportedProblem,
+}
+
+impl std::fmt::Display for SeedError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::WrongLength {
+                index,
+                expected,
+                got,
+            } => write!(
+                f,
+                "start state {index} has {got} spins; the problem has {expected} variables"
+            ),
+            Self::BadSpin { index } => {
+                write!(f, "start state {index} holds a value other than -1 or +1")
+            }
+            Self::UnsupportedProblem => f.write_str(
+                "the problem needs the scalar SA fallback, which cannot start from a state",
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SeedError {}
+
+fn check_seeds(start: SeededStart<'_>, nodes: usize) -> Result<(), SeedError> {
+    for (index, state) in start.spins.iter().enumerate() {
+        if state.len() != nodes {
+            return Err(SeedError::WrongLength {
+                index,
+                expected: nodes,
+                got: state.len(),
+            });
+        }
+        if state.iter().any(|&s| s != 1 && s != -1) {
+            return Err(SeedError::BadSpin { index });
+        }
+    }
+    Ok(())
+}
 
 /// Which annealing kernel a binary drives.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -152,6 +229,59 @@ impl SaSampler {
             coloring: Arc::new(Mutex::new(None)),
         }
     }
+
+    /// Anneal from `start` instead of from random configurations.
+    ///
+    /// The run keeps the sweep count of `params` and spreads it over the part
+    /// of the beta ladder above [`SeededStart::start_beta`]. It shares this
+    /// sampler's colouring cache with [`Sampler::sample`].
+    ///
+    /// # Errors
+    ///
+    /// [`SeedError`] when a state does not fit the problem, or when the
+    /// problem does not qualify for an integer kernel.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use quip_miner_cpu::{IsingGraph, SaSampler, SaVariant, SampleParams, SeededStart};
+    ///
+    /// # fn main() -> Result<(), quip_miner_cpu::SeedError> {
+    /// // A ferromagnetic pair, seeded with a ground state and started cold.
+    /// let graph = IsingGraph::new(vec![0.0, 0.0], vec![-1.0], vec![(0, 1)]);
+    /// let params = SampleParams {
+    ///     num_reads: 1,
+    ///     num_sweeps: 8,
+    ///     seed: 1,
+    ///     ..Default::default()
+    /// };
+    /// let seeds = vec![vec![-1i8, -1]];
+    /// let start = SeededStart { spins: &seeds, start_beta: Some(10.0) };
+    /// let results = SaSampler::new(SaVariant::MultiSpin).sample_seeded(&graph, &params, start)?;
+    /// assert_eq!(results[0].spins, vec![-1, -1]);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn sample_seeded(
+        &self,
+        graph: &IsingGraph,
+        params: &SampleParams,
+        start: SeededStart<'_>,
+    ) -> Result<Vec<SamplerResult>, SeedError> {
+        check_seeds(start, graph.h.len())?;
+        if IntGraph::from_base(graph).is_none() {
+            return Err(SeedError::UnsupportedProblem);
+        }
+        Ok(sample_sa_variant_with_cache(
+            graph,
+            params,
+            self.variant,
+            None,
+            Some(&self.coloring),
+            Some(start),
+        )
+        .unwrap_or_default())
+    }
 }
 
 /// Recover a poisoned cache lock.
@@ -208,7 +338,7 @@ pub(crate) fn sample_sa_variant(
     variant: SaVariant,
     cancel: Option<(&CancelToken, Option<u64>)>,
 ) -> Result<Vec<SamplerResult>, SampleCancelled> {
-    sample_sa_variant_with_cache(graph, params, variant, cancel, None)
+    sample_sa_variant_with_cache(graph, params, variant, cancel, None, None)
 }
 
 fn sample_sa_variant_with_cache(
@@ -217,12 +347,18 @@ fn sample_sa_variant_with_cache(
     variant: SaVariant,
     cancel: Option<(&CancelToken, Option<u64>)>,
     cache: Option<&Mutex<Option<Arc<CachedColoring>>>>,
+    start: Option<SeededStart<'_>>,
 ) -> Result<Vec<SamplerResult>, SampleCancelled> {
     let Some(int) = IntGraph::from_base(graph) else {
         return sample_ising_cancellable(graph, params, Algorithm::Sa, cancel);
     };
     let num_reads = params.num_reads.max(1);
-    let betas = build_beta_schedule(graph, params);
+    let betas = match start {
+        Some(s) => build_seeded_beta_schedule(graph, params, s.start_beta),
+        None => build_beta_schedule(graph, params),
+    };
+    // Cut to the reads: a state past the last read has no read to seed.
+    let seeds: &[Vec<i8>] = start.map_or(&[], |s| &s.spins[..s.spins.len().min(num_reads)]);
     let sweeps_per = params.sweeps_per_beta.max(1);
 
     let counts = match variant {
@@ -253,7 +389,18 @@ fn sample_sa_variant_with_cache(
                     }
                 }
                 let mut rng = read_rng(params.seed, read);
-                states.push(MscState::random(int.num_nodes(), &mut rng));
+                // This word's share of the seeds: reads `read..read + LANES`.
+                let word_seeds: Vec<&[i8]> = seeds
+                    .iter()
+                    .skip(read)
+                    .take(LANES)
+                    .map(Vec::as_slice)
+                    .collect();
+                states.push(if word_seeds.is_empty() {
+                    MscState::random(int.num_nodes(), &mut rng)
+                } else {
+                    MscState::seeded(int.num_nodes(), &word_seeds, &mut rng)
+                });
             }
             anneal_words(&int, &counts, colors, &betas, params, &mut states, cancel)?;
             for (word, state) in states.iter().enumerate() {
@@ -276,7 +423,12 @@ fn sample_sa_variant_with_cache(
                     }
                 }
                 let mut rng = read_rng(params.seed, read);
+                // Drawn even for a seeded read, so the offsets that follow
+                // come from the same point in the stream as a cold read's.
                 let mut spins = crate::sampler_core::random_spins(int.num_nodes(), &mut rng);
+                if let Some(seed) = seeds.get(read) {
+                    spins.clone_from(seed);
+                }
                 let offsets = sweep_offsets(betas.len(), sweeps_per, &mut rng);
                 anneal_from(&int, &draws, sweeps_per, &mut spins, &offsets, cancel)?;
                 results.push(score(&spins, graph));
@@ -308,10 +460,15 @@ impl Sampler for SaSampler {
         graph: &IsingGraph,
         params: &SampleParams,
     ) -> Result<Vec<SamplerResult>, SampleError> {
-        Ok(
-            sample_sa_variant_with_cache(graph, params, self.variant, None, Some(&self.coloring))
-                .unwrap_or_default(),
+        Ok(sample_sa_variant_with_cache(
+            graph,
+            params,
+            self.variant,
+            None,
+            Some(&self.coloring),
+            None,
         )
+        .unwrap_or_default())
     }
 
     /// One model per core, the same shape as `CpuSampler::stream_width`.
@@ -351,6 +508,7 @@ impl Sampler for SaSampler {
                     variant,
                     Some((token, watermark)),
                     Some(&coloring),
+                    None,
                 )
                 .map_err(|_| crate::StreamKernelError::Cancelled)
             },
@@ -399,6 +557,175 @@ mod tests {
 
     fn cached_entry(s: &SaSampler) -> Option<Arc<CachedColoring>> {
         s.coloring.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// The conformance driver's proof ring: `planted` satisfies every bond, so
+    /// it and its flip are the only ground states, at `-n` units.
+    fn planted_ring(n: usize) -> (IsingGraph, Vec<i8>) {
+        let spin = |i: usize| -> i8 {
+            if (i.wrapping_mul(2_654_435_761) >> 7) & 1 == 1 {
+                1
+            } else {
+                -1
+            }
+        };
+        let planted: Vec<i8> = (0..n).map(spin).collect();
+        let edges: Vec<(usize, usize)> = (0..n).map(|i| (i, (i + 1) % n)).collect();
+        let j = edges
+            .iter()
+            .map(|&(u, v)| -f64::from(planted[u]) * f64::from(planted[v]))
+            .collect();
+        (IsingGraph::new(vec![0.0; n], j, edges), planted)
+    }
+
+    fn ground_milli(n: usize) -> i64 {
+        -1000 * i64::try_from(n).expect("ring size fits i64")
+    }
+
+    #[test]
+    fn a_seeded_run_keeps_a_ground_state_that_a_cold_run_does_not_reach() {
+        // 1-D coarsening leaves domain walls behind, so a short cold anneal
+        // of a long ring never lands on the planted state. A seeded one that
+        // starts cold has nothing to repair and must not wander off.
+        let (graph, planted) = planted_ring(512);
+        let p = params(1, 64, 5);
+        for variant in [SaVariant::MultiSpin, SaVariant::Tabulated] {
+            let s = SaSampler::new(variant);
+            let cold = s.sample(&graph, &p).expect("cold");
+            assert!(cold[0].energy_milli > ground_milli(512), "{variant:?} cold");
+
+            let seeds = vec![planted.clone()];
+            let start = SeededStart {
+                spins: &seeds,
+                start_beta: Some(10.0),
+            };
+            let warm = s.sample_seeded(&graph, &p, start).expect("seeded");
+            assert_eq!(warm[0].energy_milli, ground_milli(512), "{variant:?}");
+            assert_eq!(warm[0].spins, planted, "{variant:?}");
+        }
+    }
+
+    #[test]
+    fn reads_past_the_last_seed_start_cold() {
+        let (graph, planted) = planted_ring(512);
+        let seeds = vec![planted];
+        let start = SeededStart {
+            spins: &seeds,
+            start_beta: Some(10.0),
+        };
+        for variant in [SaVariant::MultiSpin, SaVariant::Tabulated] {
+            let got = SaSampler::new(variant)
+                .sample_seeded(&graph, &params(3, 64, 5), start)
+                .expect("seeded");
+            assert_eq!(got.len(), 3);
+            assert_eq!(got[0].energy_milli, ground_milli(512), "{variant:?}");
+            // Started cold at beta 10, the other reads freeze where they are.
+            assert!(got[1].energy_milli > ground_milli(512), "{variant:?}");
+            assert!(got[2].energy_milli > ground_milli(512), "{variant:?}");
+        }
+    }
+
+    #[test]
+    fn seeds_past_the_last_read_are_not_used() {
+        let (graph, planted) = planted_ring(64);
+        let flipped: Vec<i8> = planted.iter().map(|s| -s).collect();
+        let seeds = vec![planted.clone(), flipped.clone(), flipped];
+        let start = SeededStart {
+            spins: &seeds,
+            start_beta: Some(10.0),
+        };
+        let got = SaSampler::new(SaVariant::MultiSpin)
+            .sample_seeded(&graph, &params(1, 8, 1), start)
+            .expect("seeded");
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].spins, planted);
+    }
+
+    #[test]
+    fn seeds_carry_across_the_boundary_between_replica_words() {
+        // 70 reads are two words: lanes 0..64 and lanes 0..6. A seed index
+        // that did not advance with the word would seed word two from state 0.
+        let (graph, planted) = planted_ring(64);
+        let flipped: Vec<i8> = planted.iter().map(|s| -s).collect();
+        let seeds: Vec<Vec<i8>> = (0..70)
+            .map(|r| {
+                if r < 64 {
+                    planted.clone()
+                } else {
+                    flipped.clone()
+                }
+            })
+            .collect();
+        let start = SeededStart {
+            spins: &seeds,
+            start_beta: Some(10.0),
+        };
+        let got = SaSampler::new(SaVariant::MultiSpin)
+            .sample_seeded(&graph, &params(70, 8, 1), start)
+            .expect("seeded");
+        assert_eq!(got.len(), 70);
+        assert_eq!(got[63].spins, planted);
+        assert_eq!(got[64].spins, flipped);
+        assert_eq!(got[69].spins, flipped);
+    }
+
+    #[test]
+    fn a_state_that_does_not_fit_the_problem_is_refused() {
+        let (graph, planted) = planted_ring(64);
+        let s = SaSampler::new(SaVariant::MultiSpin);
+        let p = params(1, 8, 1);
+
+        let short = vec![planted[..63].to_vec()];
+        let got = s.sample_seeded(
+            &graph,
+            &p,
+            SeededStart {
+                spins: &short,
+                start_beta: None,
+            },
+        );
+        assert_eq!(
+            got.expect_err("short state"),
+            SeedError::WrongLength {
+                index: 0,
+                expected: 64,
+                got: 63
+            }
+        );
+
+        let mut zeroed = planted;
+        zeroed[5] = 0;
+        let bad = vec![zeroed];
+        let got = s.sample_seeded(
+            &graph,
+            &p,
+            SeededStart {
+                spins: &bad,
+                start_beta: None,
+            },
+        );
+        assert_eq!(got.expect_err("bad spin"), SeedError::BadSpin { index: 0 });
+    }
+
+    #[test]
+    fn a_problem_the_integer_kernels_refuse_cannot_be_seeded() {
+        // A coupling of 0.37 has no integer form, so a cold job falls back to
+        // scalar SA. That kernel has no seeded form, and answering cold would
+        // report a seeded run that never used its seed.
+        let graph = IsingGraph::new(vec![0.0, 0.0], vec![0.37], vec![(0, 1)]);
+        let seeds = vec![vec![1i8, 1]];
+        let got = SaSampler::new(SaVariant::MultiSpin).sample_seeded(
+            &graph,
+            &params(1, 8, 1),
+            SeededStart {
+                spins: &seeds,
+                start_beta: None,
+            },
+        );
+        assert_eq!(
+            got.expect_err("float problem"),
+            SeedError::UnsupportedProblem
+        );
     }
 
     #[test]

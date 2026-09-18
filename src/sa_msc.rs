@@ -118,6 +118,39 @@ impl MscState {
         }
     }
 
+    /// Seeded configurations: lane `r` starts from `seeds[r]`, and each lane
+    /// past the seeds keeps the draw [`MscState::random`] gives it.
+    ///
+    /// One `u64` is drawn per node either way, so the unseeded lanes of a
+    /// partly seeded word start where the same lanes of a cold run start.
+    /// That makes them a like-for-like control inside one job.
+    ///
+    /// `seeds` holds at most [`LANES`] states of `n` spins each; the caller
+    /// checks both.
+    pub(crate) fn seeded(n: usize, seeds: &[&[i8]], rng: &mut impl rand::Rng) -> Self {
+        debug_assert!(seeds.len() <= LANES);
+        debug_assert!(seeds.iter().all(|s| s.len() == n));
+        // Bits at and above `seeds.len()` keep the random draw.
+        let keep = if seeds.len() >= LANES {
+            0
+        } else {
+            u64::MAX << seeds.len()
+        };
+        let spin = (0..n)
+            .map(|i| {
+                let mut word = rng.gen::<u64>() & keep;
+                for (lane, seed) in seeds.iter().enumerate() {
+                    // Bit 1 is spin -1 in this layout.
+                    if seed[i] < 0 {
+                        word |= 1 << lane;
+                    }
+                }
+                word
+            })
+            .collect();
+        Self { spin }
+    }
+
     /// Replica `lane` as `±1` spins.
     pub(crate) fn lane(&self, lane: usize) -> Vec<i8> {
         self.spin
@@ -692,6 +725,49 @@ mod tests {
         }
         for (got, expect) in states.iter().zip(&replay) {
             assert_eq!(got.spin, expect.spin);
+        }
+    }
+
+    #[test]
+    fn seeded_lanes_hold_their_seeds_and_the_rest_keep_the_random_draw() {
+        let n = 50;
+        let seeds: Vec<Vec<i8>> = (0..3)
+            .map(|r| {
+                (0..n)
+                    .map(|i| if (i + r) % 3 == 0 { -1 } else { 1 })
+                    .collect()
+            })
+            .collect();
+        let views: Vec<&[i8]> = seeds.iter().map(Vec::as_slice).collect();
+
+        let seeded = MscState::seeded(n, &views, &mut SmallRng::seed_from_u64(9));
+        let random = MscState::random(n, &mut SmallRng::seed_from_u64(9));
+
+        for (lane, seed) in seeds.iter().enumerate() {
+            assert_eq!(&seeded.lane(lane), seed, "lane {lane}");
+        }
+        // The unseeded lanes are the control: same stream, same start.
+        for lane in seeds.len()..LANES {
+            assert_eq!(seeded.lane(lane), random.lane(lane), "lane {lane}");
+        }
+    }
+
+    #[test]
+    fn a_full_word_of_seeds_leaves_no_random_lane() {
+        let n = 8;
+        let seeds: Vec<Vec<i8>> = (0..LANES)
+            .map(|r| {
+                (0..n)
+                    .map(|i| if (i ^ r) & 1 == 0 { 1 } else { -1 })
+                    .collect()
+            })
+            .collect();
+        let views: Vec<&[i8]> = seeds.iter().map(Vec::as_slice).collect();
+
+        let seeded = MscState::seeded(n, &views, &mut SmallRng::seed_from_u64(9));
+
+        for (lane, seed) in seeds.iter().enumerate() {
+            assert_eq!(&seeded.lane(lane), seed, "lane {lane}");
         }
     }
 }
