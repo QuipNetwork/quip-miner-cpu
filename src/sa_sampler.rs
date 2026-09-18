@@ -29,7 +29,7 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex};
 
 use crate::coloring::Coloring;
-use crate::sa_int::{anneal_from, sweep_offsets, threshold_draws, IntGraph};
+use crate::sa_int::{anneal_from, sweep_offsets, threshold_draws, threshold_table_fits, IntGraph};
 use crate::sa_msc::{anneal_words, bond_counts, MscState, LANES};
 use crate::sampler_core::{
     build_beta_schedule, build_seeded_beta_schedule, sample_ising_cancellable, CpuGraph,
@@ -115,7 +115,9 @@ pub enum SeedError {
         index: usize,
     },
     /// The problem has a coupling or field the integer kernels do not take,
-    /// and the scalar fallback has no seeded form.
+    /// or its beta ladder needs a threshold table too large for the
+    /// tabulated kernel to build — either way, the run would have to fall
+    /// back to the scalar `cpu-sa` kernel, which has no seeded form.
     UnsupportedProblem,
 }
 
@@ -134,7 +136,8 @@ impl std::fmt::Display for SeedError {
                 write!(f, "start state {index} holds a value other than -1 or +1")
             }
             Self::UnsupportedProblem => f.write_str(
-                "the problem needs the scalar SA fallback, which cannot start from a state",
+                "the problem or the requested sweep depth needs the scalar SA fallback, \
+                 which cannot start from a state",
             ),
         }
     }
@@ -269,8 +272,23 @@ impl SaSampler {
         start: SeededStart<'_>,
     ) -> Result<Vec<SamplerResult>, SeedError> {
         check_seeds(start, graph.h.len())?;
-        if IntGraph::from_base(graph).is_none() {
+        let Some(int) = IntGraph::from_base(graph) else {
             return Err(SeedError::UnsupportedProblem);
+        };
+        // The tabulated arm's shared threshold table declines past a beta
+        // ladder length and `sample_sa_variant_with_cache` then falls back to
+        // the scalar `cpu-sa` kernel, silently dropping the seed. Refuse here
+        // instead of letting that fallback answer cold. `MultiSpin` takes the
+        // same tabulated arm whenever `bond_counts` refuses the degree.
+        let counts = match self.variant {
+            SaVariant::MultiSpin => bond_counts(&int),
+            SaVariant::Tabulated => None,
+        };
+        if counts.is_none() {
+            let betas = build_seeded_beta_schedule(graph, params, start.start_beta);
+            if !threshold_table_fits(betas.len()) {
+                return Err(SeedError::UnsupportedProblem);
+            }
         }
         Ok(sample_sa_variant_with_cache(
             graph,
@@ -693,7 +711,7 @@ mod tests {
             }
         );
 
-        let mut zeroed = planted;
+        let mut zeroed = planted.clone();
         zeroed[5] = 0;
         let bad = vec![zeroed];
         let got = s.sample_seeded(
@@ -705,6 +723,45 @@ mod tests {
             },
         );
         assert_eq!(got.expect_err("bad spin"), SeedError::BadSpin { index: 0 });
+
+        // A bad state after a good one still reports its own position.
+        let mut zeroed_second = planted;
+        zeroed_second[5] = 0;
+        let mixed = vec![vec![1i8; 64], zeroed_second];
+        let got = s.sample_seeded(
+            &graph,
+            &p,
+            SeededStart {
+                spins: &mixed,
+                start_beta: None,
+            },
+        );
+        assert_eq!(
+            got.expect_err("bad spin at index 1"),
+            SeedError::BadSpin { index: 1 }
+        );
+    }
+
+    #[test]
+    fn a_beta_ladder_too_deep_for_the_tabulated_table_cannot_be_seeded() {
+        // The tabulated table declines past 8192 rungs and, unseeded, that
+        // falls back to the scalar cpu-sa kernel. A seeded run must not take
+        // that fallback silently: answering cold would report a seeded run
+        // that never used its seed, the same hole a non-integer problem has.
+        let graph = IsingGraph::new(vec![0.0, 0.0], vec![-1.0], vec![(0, 1)]);
+        let seeds = vec![vec![-1i8, -1]];
+        let got = SaSampler::new(SaVariant::Tabulated).sample_seeded(
+            &graph,
+            &params(1, 9000, 1),
+            SeededStart {
+                spins: &seeds,
+                start_beta: None,
+            },
+        );
+        assert_eq!(
+            got.expect_err("beta ladder too deep"),
+            SeedError::UnsupportedProblem
+        );
     }
 
     #[test]

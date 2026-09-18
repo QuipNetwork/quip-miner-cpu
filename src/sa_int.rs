@@ -272,6 +272,17 @@ const _: () = assert!(DRAW_ROW.is_power_of_two());
 /// what every other precondition failure in these kernels does.
 const MAX_DRAW_BYTES: usize = 64 << 20;
 
+/// Whether [`threshold_draws`] would accept a ladder of `num_betas` rungs,
+/// without paying for the table itself.
+///
+/// A caller that cannot tolerate the cold `cpu-sa` fallback `threshold_draws`
+/// takes past this cap — a seeded run, whose seed that fallback would drop —
+/// checks this first, cheaply, instead of building the table only to throw it
+/// away.
+pub(crate) fn threshold_table_fits(num_betas: usize) -> bool {
+    num_betas.saturating_mul(DRAW_ROW) <= MAX_DRAW_BYTES
+}
+
 /// Largest `u64` below `p * 2^64`, saturating at `u64::MAX`.
 fn scale_u64(p: f64) -> u64 {
     if p >= 1.0 {
@@ -307,7 +318,7 @@ pub(crate) fn threshold_draws(
     max_field: usize,
     rng: &mut SmallRng,
 ) -> Option<Vec<u8>> {
-    if betas.len().saturating_mul(DRAW_ROW) > MAX_DRAW_BYTES {
+    if !threshold_table_fits(betas.len()) {
         return None;
     }
     let mut cut = vec![0u64; max_field + 1];
