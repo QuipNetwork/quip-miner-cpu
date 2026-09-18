@@ -21,3 +21,4 @@
 # and a local virtual environment.
 /py/target
 /py/.venv
+__pycache__/
