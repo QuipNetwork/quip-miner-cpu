@@ -16,3 +16,8 @@
 .beads-*/
 .beads-credential-key
 .dolt/
+
+# The Python binding is its own cargo workspace, with its own build directory
+# and a local virtual environment.
+/py/target
+/py/.venv

@@ -1,0 +1,25 @@
+[package]
+name = "quip-msa-py"
+version = "0.1.0"
+edition = "2021"
+description = "PyO3 binding to the quip-miner-cpu multi-spin annealing kernel"
+license = "AGPL-3.0-or-later"
+repository = "https://gitlab.com/quip.network/quip-miner-cpu"
+rust-version = "1.97"
+# Ships as a Python wheel built by maturin, never to crates.io: a cdylib with
+# PyO3's extension-module feature cannot link without a Python interpreter.
+publish = false
+
+[lib]
+name = "quip_msa"
+crate-type = ["cdylib"]
+
+[dependencies]
+quip-miner-cpu = { path = ".." }
+pyo3 = { version = "0.29", features = ["abi3-py311", "extension-module"] }
+numpy = "0.29"
+
+# Its own workspace root. Without this table cargo walks up to the miner's
+# manifest and refuses the build, because that manifest does not list this
+# package as a member.
+[workspace]
