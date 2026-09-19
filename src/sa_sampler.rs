@@ -17,7 +17,7 @@
 //! degree is too large to pack into a machine word, runs on the tabulated
 //! kernel of [`SaVariant::Tabulated`], which is still faster than `cpu-sa`.
 
-use quip_protocol::scoring::energy_milli;
+use quip_protocol::scoring::{energy_milli, ENERGY_MILLI_NON_FINITE};
 use quip_solver_core::adapt::AdaptBounds;
 use quip_solver_core::{
     Algorithm, BackendIdentity, CancelToken, IsingGraph, SampleError, SampleParams, Sampler,
@@ -422,9 +422,8 @@ fn sample_sa_variant_with_cache(
             }
             anneal_words(&int, &counts, colors, &betas, params, &mut states, cancel)?;
             for (word, state) in states.iter().enumerate() {
-                for lane in 0..LANES.min(num_reads - word * LANES) {
-                    results.push(score(&state.lane(lane), graph));
-                }
+                let word_reads = LANES.min(num_reads - word * LANES);
+                results.extend(score_word(state, graph, word_reads));
             }
         }
         None => {
@@ -470,6 +469,95 @@ fn score(spins: &[i8], graph: &IsingGraph) -> SamplerResult {
         spins: spins.to_vec(),
         energy_milli: energy_milli(spins, &graph.h, &graph.j, &graph.edges),
     }
+}
+
+/// Mirrors `quip_protocol::scoring::coefficient_milli`, which is private to
+/// that crate. Every wire coefficient is `v as f64 / 1000.0` for an `i32`
+/// milli value `v`, so this recovers the exact integer and, like the
+/// original, saturates a too-large finite value on the final cast rather than
+/// reporting the non-finite sentinel.
+fn coefficient_milli(c: f64) -> Option<i64> {
+    if !c.is_finite() {
+        return None;
+    }
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "round() is exact over the i32 wire range; larger finite values saturate by design"
+    )]
+    Some((c * 1000.0).round() as i64)
+}
+
+/// Score every lane of one replica word in a single pass over the graph,
+/// instead of one scalar `energy_milli` call per lane.
+///
+/// For a `u64` bit-plane pair, `sign(su) * sign(sv)` is `+1` where the bits
+/// agree and `-1` where they disagree, so one coefficient conversion per node
+/// or edge is shared by all `num_reads` lanes; only the cheap sign pick and
+/// the saturating add repeat per lane. Results match calling
+/// [`score`] on `state.lane(lane)` for `lane` in `0..num_reads`, including the
+/// non-finite sentinel and the saturation behavior.
+fn score_word(state: &MscState, graph: &IsingGraph, num_reads: usize) -> Vec<SamplerResult> {
+    debug_assert!(num_reads <= LANES);
+    let spin = state.spins();
+    let mut acc = [0i128; LANES];
+    let mut non_finite = false;
+
+    for (i, &w) in spin.iter().enumerate() {
+        let Some(&coeff) = graph.h.get(i) else {
+            continue;
+        };
+        let Some(milli) = coefficient_milli(coeff) else {
+            non_finite = true;
+            break;
+        };
+        let milli = i128::from(milli);
+        for (lane, a) in acc.iter_mut().enumerate().take(num_reads) {
+            let term = if (w >> lane) & 1 == 0 { milli } else { -milli };
+            *a = a.saturating_add(term);
+        }
+    }
+
+    if !non_finite {
+        for (k, &(u, v)) in graph.edges.iter().enumerate() {
+            let (Some(&coeff), Some(&wu), Some(&wv)) = (graph.j.get(k), spin.get(u), spin.get(v))
+            else {
+                continue;
+            };
+            let Some(milli) = coefficient_milli(coeff) else {
+                non_finite = true;
+                break;
+            };
+            let milli = i128::from(milli);
+            // Bits agree (bond satisfied) where the XOR is clear.
+            let disagree = wu ^ wv;
+            for (lane, a) in acc.iter_mut().enumerate().take(num_reads) {
+                let term = if (disagree >> lane) & 1 == 0 {
+                    milli
+                } else {
+                    -milli
+                };
+                *a = a.saturating_add(term);
+            }
+        }
+    }
+
+    (0..num_reads)
+        .map(|lane| {
+            let energy_milli = if non_finite {
+                ENERGY_MILLI_NON_FINITE
+            } else {
+                i64::try_from(acc[lane]).unwrap_or(if acc[lane].is_negative() {
+                    i64::MIN
+                } else {
+                    i64::MAX
+                })
+            };
+            SamplerResult {
+                spins: state.lane(lane),
+                energy_milli,
+            }
+        })
+        .collect()
 }
 
 impl Sampler for SaSampler {
@@ -552,6 +640,24 @@ mod tests {
         for u in 0..n {
             for v in (u + 1)..n {
                 if rng.gen::<f64>() < 0.3 {
+                    edges.push((u, v));
+                    j.push(if rng.gen::<bool>() { 1.0 } else { -1.0 });
+                }
+            }
+        }
+        IsingGraph::new(h, j, edges)
+    }
+
+    fn zephyr_like_p(n: usize, seed: u64, fields: &[f64], p: f64) -> IsingGraph {
+        let mut rng = SmallRng::seed_from_u64(seed);
+        let h: Vec<f64> = (0..n)
+            .map(|_| fields[rng.gen_range(0..fields.len())])
+            .collect();
+        let mut edges = Vec::new();
+        let mut j = Vec::new();
+        for u in 0..n {
+            for v in (u + 1)..n {
+                if rng.gen::<f64>() < p {
                     edges.push((u, v));
                     j.push(if rng.gen::<bool>() { 1.0 } else { -1.0 });
                 }
@@ -685,6 +791,177 @@ mod tests {
         assert_eq!(got[63].spins, planted);
         assert_eq!(got[64].spins, flipped);
         assert_eq!(got[69].spins, flipped);
+    }
+
+    /// Phase-timing profile: where does the fixed per-call cost of
+    /// [`SaVariant::MultiSpin`] actually go? Times setup (`IntGraph` build,
+    /// coloring, `bond_counts`), the sweep loop (`anneal_words`), and
+    /// finalisation (unpacking lanes and scoring) separately, on a graph
+    /// close to the 4,800-node / 45,864-coupler shape from the field
+    /// measurement. Run with:
+    /// `cargo test --lib sa_sampler::tests::zz_profile_finalise -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    #[expect(
+        clippy::print_stderr,
+        reason = "an ignored profiling test reports phase timings on stderr"
+    )]
+    fn zz_profile_finalise() {
+        use std::time::Instant;
+        let graph = zephyr_like_p(4800, 1, &[0.0], 0.003_982);
+        eprintln!(
+            "graph: {} nodes, {} couplers",
+            graph.h.len(),
+            graph.edges.len()
+        );
+        for sweeps in [1usize, 128, 1024] {
+            let params = SampleParams {
+                num_reads: 64,
+                num_sweeps: sweeps,
+                sweeps_per_beta: 1,
+                beta_range: Some((0.05, 4.0)),
+                seed: 7,
+            };
+
+            let t_setup = Instant::now();
+            let int = IntGraph::from_base(&graph).expect("qualifies");
+            let counts = bond_counts(&int).expect("degree within bounds");
+            let colors = Coloring::new(&CpuGraph::from_base(&graph));
+            let betas = build_beta_schedule(&graph, &params);
+            let setup_ns = t_setup.elapsed().as_nanos();
+
+            let num_reads = params.num_reads.max(1);
+            let t_states = Instant::now();
+            let mut states = Vec::with_capacity(num_reads.div_ceil(LANES));
+            for read in (0..num_reads).step_by(LANES) {
+                let mut rng = read_rng(params.seed, read);
+                states.push(MscState::random(int.num_nodes(), &mut rng));
+            }
+            let states_ns = t_states.elapsed().as_nanos();
+
+            let t_anneal = Instant::now();
+            anneal_words(&int, &counts, &colors, &betas, &params, &mut states, None)
+                .expect("no cancel token");
+            let anneal_ns = t_anneal.elapsed().as_nanos();
+
+            let t_finalize = Instant::now();
+            let mut results = Vec::with_capacity(num_reads);
+            for (word, state) in states.iter().enumerate() {
+                let word_reads = LANES.min(num_reads - word * LANES);
+                results.extend(score_word(state, &graph, word_reads));
+            }
+            let finalize_ns = t_finalize.elapsed().as_nanos();
+            std::hint::black_box(&results);
+
+            eprintln!(
+                "sweeps={sweeps:>4} setup={:>8.3}ms states={:>8.3}ms anneal={:>8.3}ms finalize={:>8.3}ms total={:>8.3}ms",
+                setup_ns as f64 / 1e6,
+                states_ns as f64 / 1e6,
+                anneal_ns as f64 / 1e6,
+                finalize_ns as f64 / 1e6,
+                (setup_ns + states_ns + anneal_ns + finalize_ns) as f64 / 1e6,
+            );
+        }
+    }
+
+    /// Energies captured from the scalar per-lane finalisation, before
+    /// [`score_word`] existed (commit f6e432c), on a 90-node graph with 70
+    /// reads — both a node count and a read count that are not multiples of
+    /// [`LANES`], so the run spans a partial word. The bit-parallel
+    /// finalisation must reproduce these exactly.
+    #[test]
+    fn finalisation_matches_the_pre_optimisation_baseline() {
+        const COLD: [i64; 70] = [
+            -313000, -301000, -293000, -313000, -295000, -269000, -291000, -327000, -273000,
+            -329000, -251000, -287000, -285000, -295000, -297000, -305000, -295000, -329000,
+            -295000, -285000, -279000, -285000, -311000, -303000, -293000, -317000, -275000,
+            -323000, -293000, -289000, -293000, -285000, -297000, -281000, -291000, -291000,
+            -295000, -321000, -255000, -323000, -307000, -287000, -275000, -263000, -285000,
+            -295000, -271000, -259000, -305000, -299000, -291000, -311000, -295000, -287000,
+            -285000, -295000, -311000, -313000, -285000, -315000, -303000, -289000, -317000,
+            -307000, -293000, -315000, -319000, -269000, -317000, -283000,
+        ];
+        const WARM: [i64; 70] = [
+            -311000, -295000, -293000, -311000, -309000, -313000, -305000, -291000, -307000,
+            -301000, -307000, -323000, -319000, -281000, -311000, -285000, -277000, -327000,
+            -269000, -285000, -279000, -295000, -267000, -277000, -277000, -309000, -327000,
+            -301000, -311000, -321000, -327000, -301000, -305000, -321000, -335000, -317000,
+            -297000, -323000, -305000, -327000, -309000, -303000, -327000, -317000, -309000,
+            -307000, -319000, -323000, -315000, -285000, -301000, -287000, -287000, -331000,
+            -333000, -305000, -297000, -285000, -325000, -297000, -303000, -299000, -295000,
+            -281000, -287000, -333000, -313000, -291000, -273000, -303000,
+        ];
+        let graph = zephyr_like(90, 77, &[-1.0, 0.0, 1.0]);
+        let cold = SaSampler::new(SaVariant::MultiSpin)
+            .sample(&graph, &params(70, 5, 123))
+            .expect("cold");
+        let got_cold: Vec<i64> = cold.iter().map(|r| r.energy_milli).collect();
+        assert_eq!(got_cold, COLD);
+
+        let seeds: Vec<Vec<i8>> = (0..70)
+            .map(|r| {
+                let mut rng = SmallRng::seed_from_u64(r as u64 + 900);
+                (0..90)
+                    .map(|_| if rng.gen::<bool>() { 1 } else { -1 })
+                    .collect()
+            })
+            .collect();
+        let start = SeededStart {
+            spins: &seeds,
+            start_beta: Some(3.0),
+        };
+        let warm = SaSampler::new(SaVariant::MultiSpin)
+            .sample_seeded(&graph, &params(70, 5, 123), start)
+            .expect("warm");
+        let got_warm: Vec<i64> = warm.iter().map(|r| r.energy_milli).collect();
+        assert_eq!(got_warm, WARM);
+    }
+
+    /// [`score_word`]'s bit-parallel finalisation must match the plain
+    /// scalar `energy_milli` reference exactly, on random graphs with
+    /// non-zero fields and non-unit couplings, at sizes that are and are not
+    /// multiples of [`LANES`], and at read counts that split a word.
+    #[test]
+    fn score_word_matches_scalar_energy_milli() {
+        fn weighted_graph(n: usize, seed: u64) -> IsingGraph {
+            let mut rng = SmallRng::seed_from_u64(seed);
+            let h: Vec<f64> = (0..n)
+                .map(|_| rng.gen_range(-3..=3) as f64 * 0.25)
+                .collect();
+            let mut edges = Vec::new();
+            let mut j = Vec::new();
+            for u in 0..n {
+                for v in (u + 1)..n {
+                    if rng.gen::<f64>() < 0.15 {
+                        edges.push((u, v));
+                        j.push(rng.gen_range(-4..=4) as f64 * 0.5);
+                    }
+                }
+            }
+            IsingGraph::new(h, j, edges)
+        }
+
+        for (n, reads, seed) in [
+            (8usize, 5usize, 1u64),
+            (64, 64, 2),
+            (100, 70, 3),
+            (200, 200, 4),
+        ] {
+            let graph = weighted_graph(n, seed);
+            let mut rng = SmallRng::seed_from_u64(seed ^ 0xABCD);
+            for word_start in (0..reads).step_by(LANES) {
+                let word_reads = LANES.min(reads - word_start);
+                let state = MscState::random(n, &mut rng);
+                let got = score_word(&state, &graph, word_reads);
+                assert_eq!(got.len(), word_reads);
+                for (lane, result) in got.iter().enumerate() {
+                    let spins = state.lane(lane);
+                    assert_eq!(result.spins, spins, "n {n} reads {reads} lane {lane}");
+                    let want = energy_milli(&spins, &graph.h, &graph.j, &graph.edges);
+                    assert_eq!(result.energy_milli, want, "n {n} reads {reads} lane {lane}");
+                }
+            }
+        }
     }
 
     #[test]

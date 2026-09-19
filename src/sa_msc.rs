@@ -158,6 +158,14 @@ impl MscState {
             .map(|w| if (w >> lane) & 1 == 0 { 1i8 } else { -1i8 })
             .collect()
     }
+
+    /// The raw per-node replica words, bit `r` of `spin[i]` being node `i` of
+    /// replica `r`. Used by the bit-parallel finalisation pass, which scores
+    /// all lanes of a word in one pass over the graph instead of one scalar
+    /// `energy_milli` call per lane.
+    pub(crate) fn spins(&self) -> &[u64] {
+        &self.spin
+    }
 }
 
 /// `d'`, the bond count including the field's ghost bond, for every node.
