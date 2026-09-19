@@ -116,6 +116,18 @@ impl Msa {
                 "start_beta applies to a seeded run; pass initial_spins too",
             ));
         }
+        if let Some(beta) = start_beta {
+            if !beta.is_finite() || beta <= 0.0 {
+                return Err(PyValueError::new_err(format!(
+                    "start_beta must be a finite inverse temperature above zero; got {beta}"
+                )));
+            }
+        }
+        if num_reads < 1 {
+            return Err(PyValueError::new_err(format!(
+                "num_reads must be at least 1; got {num_reads}"
+            )));
+        }
         let graph = build_graph(&h, &edges, &j)?;
         let nodes = graph.h.len();
         let seeds = initial_spins.map_or_else(Vec::new, |states| {

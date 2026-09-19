@@ -91,6 +91,35 @@ def test_a_start_beta_without_states_is_refused():
         quip_msa.Msa().sample(h, edges, j, num_sweeps=8, num_reads=1, start_beta=2.0)
 
 
+def test_a_start_beta_that_is_not_finite_is_refused():
+    h, edges, j, planted = ring(8)
+    with pytest.raises(ValueError, match="start_beta"):
+        quip_msa.Msa().sample(
+            h, edges, j, num_sweeps=8, num_reads=1,
+            initial_spins=planted[None, :], start_beta=float("nan"),
+        )
+
+
+def test_a_start_beta_that_is_not_positive_is_refused():
+    h, edges, j, planted = ring(8)
+    with pytest.raises(ValueError, match="start_beta"):
+        quip_msa.Msa().sample(
+            h, edges, j, num_sweeps=8, num_reads=1,
+            initial_spins=planted[None, :], start_beta=0.0,
+        )
+    with pytest.raises(ValueError, match="start_beta"):
+        quip_msa.Msa().sample(
+            h, edges, j, num_sweeps=8, num_reads=1,
+            initial_spins=planted[None, :], start_beta=-5.0,
+        )
+
+
+def test_a_num_reads_of_zero_is_refused():
+    h, edges, j, _ = ring(8)
+    with pytest.raises(ValueError, match="num_reads"):
+        quip_msa.Msa().sample(h, edges, j, num_sweeps=8, num_reads=0)
+
+
 def test_the_anneal_runs_with_the_gil_released():
     # While a worker thread anneals, this thread must keep running Python.
     # Counting loop passes does not show that: with the GIL held, this thread
