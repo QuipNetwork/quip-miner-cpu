@@ -180,6 +180,27 @@ quip-cpu-sa --capabilities   # capabilities JSON
 quip-cpu-sa --check          # probe the backend is runnable
 ```
 
+## Python binding
+
+`py/` holds `quip_msa`, a PyO3 binding to the multi-spin annealing kernel. It
+is its own cargo workspace, and it is not published. Build it into a virtual
+environment:
+
+    cd py
+    python3 -m venv .venv
+    .venv/bin/pip install "maturin>=1,<2" numpy pytest
+    .venv/bin/maturin develop --release
+    .venv/bin/pytest tests -q
+
+To install it into the environment of another project, activate that
+environment first and run `maturin develop --release` from `py/`.
+
+`quip_msa.Msa().sample(h, edges, j, num_sweeps=...)` anneals one Ising problem
+and returns `(spins, energy_milli)` as numpy arrays. The call releases the GIL,
+and the kernel runs one job on one core, so call it from several threads to
+use several cores. `initial_spins` starts reads from given states, and
+`start_beta` sets where a seeded anneal enters the beta ladder.
+
 ## Tests
 
 ```sh

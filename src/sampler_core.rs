@@ -120,6 +120,27 @@ pub(crate) fn build_beta_schedule(graph: &IsingGraph, params: &SampleParams) -> 
     geometric_beta_schedule(hot, cold, num_betas)
 }
 
+/// Beta schedule for a seeded run: the same ladder, entered part of the way up.
+///
+/// A seeded anneal that starts at the hot end forgets its seed, because a hot
+/// sweep accepts almost every flip. `start_beta` replaces the hot end. With no
+/// value it is the geometric midpoint of the cold run's range, which is the
+/// middle rung of a geometric ladder. The cold end never drops below the
+/// start, so the ladder cannot run backwards.
+pub(crate) fn build_seeded_beta_schedule(
+    graph: &IsingGraph,
+    params: &SampleParams,
+    start_beta: Option<f64>,
+) -> Vec<f64> {
+    let sweeps_per = params.sweeps_per_beta.max(1);
+    let num_betas = (params.num_sweeps / sweeps_per).max(1);
+    let (hot, cold) = params
+        .beta_range
+        .unwrap_or_else(|| default_ising_beta_range(graph));
+    let start = start_beta.unwrap_or_else(|| (hot * cold).sqrt());
+    geometric_beta_schedule(start, cold.max(start), num_betas)
+}
+
 fn spin_sign(s: i8) -> f64 {
     if s > 0 {
         1.0
@@ -740,5 +761,39 @@ mod tests {
         let mut short = vec![1i8, -1];
         polish_from(&mut short, &cpu, 8);
         assert_eq!(short, vec![1i8, -1], "a length mismatch must be a no-op");
+    }
+
+    #[test]
+    fn a_seeded_ladder_starts_at_the_geometric_midpoint_unless_told_otherwise() {
+        let graph = IsingGraph::new(vec![0.0, 0.0], vec![-1.0], vec![(0, 1)]);
+        let params = SampleParams {
+            num_sweeps: 16,
+            beta_range: Some((0.1, 10.0)),
+            ..Default::default()
+        };
+
+        let midpoint = build_seeded_beta_schedule(&graph, &params, None);
+        assert_eq!(midpoint.len(), 16);
+        assert!((midpoint[0] - 1.0).abs() < 1e-12, "sqrt(0.1 * 10) is 1");
+        assert!((midpoint[15] - 10.0).abs() < 1e-9);
+
+        let told = build_seeded_beta_schedule(&graph, &params, Some(4.0));
+        assert!((told[0] - 4.0).abs() < 1e-12);
+        assert!((told[15] - 10.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_start_colder_than_the_cold_end_holds_there_and_never_reheats() {
+        let graph = IsingGraph::new(vec![0.0, 0.0], vec![-1.0], vec![(0, 1)]);
+        let params = SampleParams {
+            num_sweeps: 8,
+            beta_range: Some((0.1, 10.0)),
+            ..Default::default()
+        };
+        let ladder = build_seeded_beta_schedule(&graph, &params, Some(25.0));
+        assert!(
+            ladder.iter().all(|&b| (b - 25.0).abs() < 1e-9),
+            "{ladder:?}"
+        );
     }
 }

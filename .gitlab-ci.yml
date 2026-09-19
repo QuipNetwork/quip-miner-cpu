@@ -105,6 +105,22 @@ test:
     - cargo test --release --all-features
     - cargo clippy --release --all-targets --all-features -- -D warnings
 
+# The Python binding is its own cargo workspace, so the job above never builds
+# it. Without this job it breaks unseen the first time the sampler API moves.
+# The rust image is bookworm, whose python3 is 3.11, the binding's floor.
+test-py:
+  stage: test
+  script:
+    - rustup component add clippy rustfmt
+    - apt-get update -qq && apt-get install -y --no-install-recommends python3 python3-venv python3-pip
+    - python3 -m venv py/.venv
+    - py/.venv/bin/pip install -q "maturin>=1,<2" numpy pytest
+    - cd py
+    - cargo fmt -- --check
+    - cargo clippy --release -- -D warnings
+    - .venv/bin/maturin develop --release
+    - .venv/bin/pytest tests -q
+
 .build:
   stage: build
   artifacts:

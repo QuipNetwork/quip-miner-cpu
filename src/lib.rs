@@ -32,8 +32,10 @@ pub use flatiron_sampler::{FlatironSampler, CPU_FLATIRON_IDENTITY};
 pub use gibbs_parallel::{ConfigError, GibbsConfig, GibbsParallelism};
 pub use mps::{sample_ising_mps, InitMode, MpsConfig};
 pub use mps_sampler::{MpsSampler, CPU_MFA_IDENTITY, CPU_MPS_IDENTITY};
-pub use quip_solver_core::{Algorithm, IsingGraph, SampleParams, SamplerResult};
-pub use sa_sampler::{SaSampler, SaVariant, CPU_FSA_IDENTITY, CPU_MSA_IDENTITY};
+pub use quip_solver_core::{Algorithm, IsingGraph, SampleParams, Sampler, SamplerResult};
+pub use sa_sampler::{
+    SaSampler, SaVariant, SeedError, SeededStart, CPU_FSA_IDENTITY, CPU_MSA_IDENTITY,
+};
 pub use sampler_core::sample_ising;
 pub use sb_core::{
     sample_sb, sample_sb_with_workers, Coupling, SbVariant, BSB, DSB, EDGE_OF_CHAOS_CONTROL, GBSB,
@@ -49,7 +51,7 @@ pub use sb_tesb::{sample_tesb, TesbConfig};
 
 use quip_solver_core::adapt::AdaptBounds;
 use quip_solver_core::{
-    BackendIdentity, CancelToken, SampleError, Sampler, StreamJob, StreamOutcome, StreamResult,
+    BackendIdentity, CancelToken, SampleError, StreamJob, StreamOutcome, StreamResult,
 };
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
