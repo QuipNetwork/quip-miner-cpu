@@ -857,6 +857,8 @@ dependencies = [
  "numpy",
  "pyo3",
  "quip-miner-cpu",
+ "quip-protocol",
+ "quip-solver-core",
 ]
 
 [[package]]

@@ -150,3 +150,58 @@ def test_the_anneal_runs_with_the_gil_released():
     assert responsive > 0.5 * alone, (
         f"responsive for {responsive * 1000:.0f} ms of a {alone * 1000:.0f} ms anneal"
     )
+
+
+NONCE = bytes(range(32))
+
+
+def test_draw_ising_returns_one_value_per_node_and_per_edge():
+    h, j = quip_msa.draw_ising(NONCE, 7, 11, [0], [-1000, 1000])
+    assert h.shape == (7,) and h.dtype == np.float64
+    assert j.shape == (11,) and j.dtype == np.float64
+
+
+def test_draw_ising_only_draws_allowed_values_in_energy_units():
+    h, j = quip_msa.draw_ising(NONCE, 50, 400, [0], [-1000, 1000])
+    assert set(np.unique(h)) == {0.0}
+    assert set(np.unique(j)) == {-1.0, 1.0}
+
+
+def test_draw_ising_is_a_pure_function_of_the_nonce():
+    first = quip_msa.draw_ising(NONCE, 50, 400, [0], [-1000, 1000])
+    again = quip_msa.draw_ising(NONCE, 50, 400, [0], [-1000, 1000])
+    other = quip_msa.draw_ising(bytes(32), 50, 400, [0], [-1000, 1000])
+    assert np.array_equal(first[1], again[1])
+    assert not np.array_equal(first[1], other[1])
+
+
+def test_draw_ising_spends_one_draw_per_node_before_the_couplings():
+    # The protocol draws h first, even from a one-value set. A draw that
+    # skipped it would make these two coupling vectors equal.
+    _, j_after_5 = quip_msa.draw_ising(NONCE, 5, 64, [0], [-1000, 1000])
+    _, j_after_6 = quip_msa.draw_ising(NONCE, 6, 64, [0], [-1000, 1000])
+    assert np.array_equal(j_after_5[1:], j_after_6[:-1])
+
+
+def test_draw_ising_rejects_a_nonce_that_is_not_32_bytes():
+    with pytest.raises(ValueError, match="32 bytes"):
+        quip_msa.draw_ising(b"short", 5, 5, [0], [-1000, 1000])
+
+
+def test_draw_ising_rejects_an_empty_allowed_set():
+    with pytest.raises(ValueError):
+        quip_msa.draw_ising(NONCE, 5, 5, [0], [])
+
+
+def test_default_beta_range_is_the_range_a_default_run_uses():
+    h = np.zeros(4)
+    edges = np.array([[0, 1], [1, 2], [2, 3], [3, 0]], dtype=np.int64)
+    j = np.array([1.0, -1.0, 1.0, 1.0])
+    hot, cold = quip_msa.default_beta_range(h, edges, j)
+    assert 0.0 < hot < cold
+    kernel = quip_msa.Msa()
+    default = kernel.sample(h, edges, j, num_sweeps=64, num_reads=8, seed=3)
+    explicit = kernel.sample(
+        h, edges, j, num_sweeps=64, num_reads=8, seed=3, beta_range=(hot, cold)
+    )
+    assert np.array_equal(default[0], explicit[0])

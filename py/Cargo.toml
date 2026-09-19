@@ -16,6 +16,8 @@ crate-type = ["cdylib"]
 
 [dependencies]
 quip-miner-cpu = { path = ".." }
+quip-protocol = "0.0.1-rc2"
+quip-solver-core = "0.0.1-rc2"
 pyo3 = { version = "0.29", features = ["abi3-py311", "extension-module"] }
 numpy = "0.29"
 

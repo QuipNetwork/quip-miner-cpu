@@ -21,6 +21,9 @@ struct Msa {
 /// `(spins, energy_milli)`: int8 `(reads, nodes)` and int64 `(reads,)`.
 type SampleOutput<'py> = (Bound<'py, PyArray2<i8>>, Bound<'py, PyArray1<i64>>);
 
+/// `(h, j)`, both float64, in energy units.
+type IsingDraw<'py> = (Bound<'py, PyArray1<f64>>, Bound<'py, PyArray1<f64>>);
+
 /// Everything a run needs, copied out of numpy so the GIL can be released.
 struct Run {
     graph: IsingGraph,
@@ -182,8 +185,56 @@ impl Msa {
     }
 }
 
+/// Draw the Ising model of a nonce, as the protocol does: one h value per
+/// node, then one J value per edge, in edge order. Values come back in energy
+/// units (milli / 1000) so they feed `Msa.sample` directly.
+#[pyfunction]
+fn draw_ising<'py>(
+    py: Python<'py>,
+    nonce: &[u8],
+    n_nodes: usize,
+    n_edges: usize,
+    allowed_h_milli: Vec<i32>,
+    allowed_j_milli: Vec<i32>,
+) -> PyResult<IsingDraw<'py>> {
+    let nonce: [u8; 32] = nonce
+        .try_into()
+        .map_err(|_| PyValueError::new_err("nonce must be 32 bytes"))?;
+    let (h_milli, j_milli) = quip_protocol::chacha8::draw_ising_milli(
+        nonce,
+        n_nodes,
+        n_edges,
+        &allowed_h_milli,
+        &allowed_j_milli,
+    )
+    .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    let to_units = |v: Vec<i32>| {
+        v.into_iter()
+            .map(|m| f64::from(m) / 1000.0)
+            .collect::<Vec<f64>>()
+    };
+    Ok((
+        PyArray1::from_vec(py, to_units(h_milli)),
+        PyArray1::from_vec(py, to_units(j_milli)),
+    ))
+}
+
+/// The (hot, cold) beta range `Msa.sample` uses when `beta_range` is `None`.
+#[pyfunction]
+fn default_beta_range(
+    h: PyReadonlyArray1<'_, f64>,
+    edges: PyReadonlyArray2<'_, i64>,
+    j: PyReadonlyArray1<'_, f64>,
+) -> PyResult<(f64, f64)> {
+    let graph = build_graph(&h, &edges, &j)?;
+    Ok(quip_solver_core::beta::default_ising_beta_range(&graph))
+}
+
 /// Python module `quip_msa`.
 #[pymodule]
 fn quip_msa(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add_class::<Msa>()
+    m.add_class::<Msa>()?;
+    m.add_function(wrap_pyfunction!(draw_ising, m)?)?;
+    m.add_function(wrap_pyfunction!(default_beta_range, m)?)?;
+    Ok(())
 }
