@@ -166,6 +166,12 @@ impl MscState {
     pub(crate) fn spins(&self) -> &[u64] {
         &self.spin
     }
+
+    /// Mutable view of the replica words, for a kernel that computes its own
+    /// accept mask and XORs it into a node's word.
+    pub(crate) fn spins_mut(&mut self) -> &mut [u64] {
+        &mut self.spin
+    }
 }
 
 /// `d'`, the bond count including the field's ghost bond, for every node.

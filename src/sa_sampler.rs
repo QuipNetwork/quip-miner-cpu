@@ -145,7 +145,7 @@ impl std::fmt::Display for SeedError {
 
 impl std::error::Error for SeedError {}
 
-fn check_seeds(start: SeededStart<'_>, nodes: usize) -> Result<(), SeedError> {
+pub(crate) fn check_seeds(start: SeededStart<'_>, nodes: usize) -> Result<(), SeedError> {
     for (index, state) in start.spins.iter().enumerate() {
         if state.len() != nodes {
             return Err(SeedError::WrongLength {
@@ -399,32 +399,7 @@ fn sample_sa_variant_with_cache(
                     &fresh
                 }
             };
-            let mut states = Vec::with_capacity(num_reads.div_ceil(LANES));
-            for read in (0..num_reads).step_by(LANES) {
-                if let Some((guard, watermark)) = cancel {
-                    if guard.is_cancelled(watermark) {
-                        return Err(SampleCancelled);
-                    }
-                }
-                let mut rng = read_rng(params.seed, read);
-                // This word's share of the seeds: reads `read..read + LANES`.
-                let word_seeds: Vec<&[i8]> = seeds
-                    .iter()
-                    .skip(read)
-                    .take(LANES)
-                    .map(Vec::as_slice)
-                    .collect();
-                states.push(if word_seeds.is_empty() {
-                    MscState::random(int.num_nodes(), &mut rng)
-                } else {
-                    MscState::seeded(int.num_nodes(), &word_seeds, &mut rng)
-                });
-            }
-            anneal_words(&int, &counts, colors, &betas, params, &mut states, cancel)?;
-            for (word, state) in states.iter().enumerate() {
-                let word_reads = LANES.min(num_reads - word * LANES);
-                results.extend(score_word(state, graph, word_reads));
-            }
+            results = anneal_packed(&int, &counts, colors, &betas, params, seeds, graph, cancel)?;
         }
         None => {
             // The scalar tabulated path retains its shared full-ladder table
@@ -455,8 +430,78 @@ fn sample_sa_variant_with_cache(
     Ok(results)
 }
 
+/// The packed multi-spin arm: seed or draw every replica word, anneal, and
+/// score each word in one pass. `seeds` is already cut to the read count.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a private arm with two callers; a struct here would exist only for the count"
+)]
+fn anneal_packed(
+    int: &IntGraph,
+    counts: &[u8],
+    colors: &Coloring,
+    betas: &[f64],
+    params: &SampleParams,
+    seeds: &[Vec<i8>],
+    graph: &IsingGraph,
+    cancel: Option<(&CancelToken, Option<u64>)>,
+) -> Result<Vec<SamplerResult>, SampleCancelled> {
+    let num_reads = params.num_reads.max(1);
+    let mut states = Vec::with_capacity(num_reads.div_ceil(LANES));
+    for read in (0..num_reads).step_by(LANES) {
+        if let Some((guard, watermark)) = cancel {
+            if guard.is_cancelled(watermark) {
+                return Err(SampleCancelled);
+            }
+        }
+        let mut rng = read_rng(params.seed, read);
+        // This word's share of the seeds: reads `read..read + LANES`.
+        let word_seeds: Vec<&[i8]> = seeds
+            .iter()
+            .skip(read)
+            .take(LANES)
+            .map(Vec::as_slice)
+            .collect();
+        states.push(if word_seeds.is_empty() {
+            MscState::random(int.num_nodes(), &mut rng)
+        } else {
+            MscState::seeded(int.num_nodes(), &word_seeds, &mut rng)
+        });
+    }
+    anneal_words(int, counts, colors, betas, params, &mut states, cancel)?;
+    let mut results = Vec::with_capacity(num_reads);
+    for (word, state) in states.iter().enumerate() {
+        let word_reads = LANES.min(num_reads - word * LANES);
+        results.extend(score_word(state, graph, word_reads));
+    }
+    Ok(results)
+}
+
+/// The packed unit kernel with no fallback, for the research entry point.
+///
+/// `int` and `counts` come from the caller's own eligibility check, so this
+/// path cannot reach the tabulated or scalar arms. The caller rejects seeds
+/// beyond the read count; any left would be cut here as the sampler does.
+pub(crate) fn sample_unit_packed(
+    graph: &IsingGraph,
+    params: &SampleParams,
+    int: &IntGraph,
+    counts: &[u8],
+    start: Option<SeededStart<'_>>,
+    cancel: Option<(&CancelToken, Option<u64>)>,
+) -> Result<Vec<SamplerResult>, SampleCancelled> {
+    let num_reads = params.num_reads.max(1);
+    let betas = match start {
+        Some(s) => build_seeded_beta_schedule(graph, params, s.start_beta),
+        None => build_beta_schedule(graph, params),
+    };
+    let seeds: &[Vec<i8>] = start.map_or(&[], |s| &s.spins[..s.spins.len().min(num_reads)]);
+    let colors = Coloring::new(&CpuGraph::from_base(graph));
+    anneal_packed(int, counts, &colors, &betas, params, seeds, graph, cancel)
+}
+
 /// Per-read random stream, seeded the same way `cpu-sa` seeds its reads.
-fn read_rng(base: u64, read_idx: usize) -> SmallRng {
+pub(crate) fn read_rng(base: u64, read_idx: usize) -> SmallRng {
     SmallRng::seed_from_u64(
         base.wrapping_mul(0x9E37_79B9_7F4A_7C15)
             .wrapping_add(read_idx as u64)
