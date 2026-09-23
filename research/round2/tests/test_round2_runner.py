@@ -11,8 +11,14 @@ is the only way to force those specific failure paths deterministically.
 
 from __future__ import annotations
 
+import os
+import signal
+import sys
+import threading
+import time
 import types
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pytest
@@ -22,6 +28,8 @@ from quip_miner_dwave import regimes, round2_io
 import round2_runner as runner
 
 BUNDLE_EDGES = np.array([[0, 1], [1, 2]], dtype=np.int64)
+
+FAKE_IDENTITY = {"package": "quip_msa", "version": "0.1.0", "binary_sha256": "abc123", "error": None}
 
 
 def _nonce(i: int) -> str:
@@ -119,8 +127,8 @@ def test_run_key_changes_with_every_identity_field(tmp_path):
         cell="native-pm1", nonce=_nonce(1), kernel="cpu-msa-f64", sweeps=512, reads=64,
         repetition_id=0, repetition_kind="timing", variant="timing", seed=1, seed_input_hash="h",
     )
-    assert base.run_key(tmp_path) != changed.run_key(tmp_path)
-    assert base.run_key(tmp_path) == base.run_key(tmp_path)
+    assert base.run_key(tmp_path, FAKE_IDENTITY) != changed.run_key(tmp_path, FAKE_IDENTITY)
+    assert base.run_key(tmp_path, FAKE_IDENTITY) == base.run_key(tmp_path, FAKE_IDENTITY)
 
 
 def test_run_key_is_sensitive_to_the_bundles_root(tmp_path):
@@ -128,7 +136,18 @@ def test_run_key_is_sensitive_to_the_bundles_root(tmp_path):
         cell="native-pm1", nonce=_nonce(1), kernel="cpu-sa", sweeps=512, reads=64,
         repetition_id=0, repetition_kind="timing", variant="timing", seed=1, seed_input_hash="h",
     )
-    assert job.run_key(tmp_path / "a") != job.run_key(tmp_path / "b")
+    assert job.run_key(tmp_path / "a", FAKE_IDENTITY) != job.run_key(tmp_path / "b", FAKE_IDENTITY)
+
+
+def test_run_key_is_sensitive_to_the_solvers_build_identity(tmp_path):
+    # review finding 5: a quip_msa rebuild partway through a campaign must not let
+    # resume silently mix results from two different builds.
+    job = runner.CpuJob(
+        cell="native-pm1", nonce=_nonce(1), kernel="cpu-sa", sweeps=512, reads=64,
+        repetition_id=0, repetition_kind="timing", variant="timing", seed=1, seed_input_hash="h",
+    )
+    other_build = {**FAKE_IDENTITY, "binary_sha256": "def456"}
+    assert job.run_key(tmp_path, FAKE_IDENTITY) != job.run_key(tmp_path, other_build)
 
 
 def test_job_round_trips_through_to_dict_and_from_dict():
@@ -156,7 +175,9 @@ def test_pilot_job_order_is_deterministic_across_builds(tmp_path):
     index = _index(tmp_path, rows)
     first = runner.build_pilot_jobs(index, ["native-pm1"])
     second = runner.build_pilot_jobs(index, ["native-pm1"])
-    assert [job.run_key(tmp_path) for job in first] == [job.run_key(tmp_path) for job in second]
+    assert [job.run_key(tmp_path, FAKE_IDENTITY) for job in first] == [
+        job.run_key(tmp_path, FAKE_IDENTITY) for job in second
+    ]
 
 
 def test_pilot_job_order_is_not_the_trivial_nested_loop_order(tmp_path):
@@ -222,10 +243,11 @@ class _FakeSampler:
         return spins, np.asarray(energies, dtype=np.float64), meta
 
 
-def _fake_msa_module(sampler: _FakeSampler):
+def _fake_msa_module(sampler: Any):
     module = types.SimpleNamespace()
     module.Msa = lambda: sampler
     module.default_beta_range = lambda h, edges, j: (0.1, 5.0)
+    module.__file__ = "/fake/quip_msa/__init__.py"  # solver_identity() degrades cleanly on this
     return module
 
 
@@ -267,16 +289,39 @@ def test_nonfinite_score_is_rejected(tmp_path, monkeypatch):
         runner.execute_cpu_job(_job("native-pm1", _nonce(0)), tmp_path)
 
 
-def test_unsupported_unit_kernel_is_skipped_not_substituted_with_sa(tmp_path, monkeypatch):
-    _write_bundle(tmp_path, "native-125", _nonce(0))
-    monkeypatch.setattr(
-        runner, "_msa",
-        lambda: _fake_msa_module(_FakeSampler(raise_error=ValueError("the unit kernel takes couplings in {-1,0,1}"))),
-    )
+def test_unsupported_unit_kernel_is_decided_before_ever_calling_the_kernel(tmp_path, monkeypatch):
+    # native-125's alphabet is not unit-representable: the runner must catch this with
+    # its own explicit pre-check, never by calling the kernel and reacting to its
+    # ValueError (review finding 8: "record unsupported only for explicit, pre-checked
+    # eligibility reasons").
+    _write_bundle(tmp_path, "native-125", _nonce(0), j=np.array([0.5, -0.5]))
+    calls = []
+
+    class _NeverCalledSampler(_FakeSampler):
+        def sample_research(self, *args, **kwargs):
+            calls.append(1)
+            return super().sample_research(*args, **kwargs)
+
+    monkeypatch.setattr(runner, "_msa", lambda: _fake_msa_module(_NeverCalledSampler()))
     record, samples = runner.execute_cpu_job(_job("native-125", _nonce(0), kernel="cpu-msa-unit"), tmp_path)
     assert record["unsupported"] is True
     assert record["exit_ok"] is True
     assert "unit kernel" in record["unsupported_reason"]
+    assert samples is None
+    assert calls == []  # the kernel was never invoked
+
+
+def test_a_value_error_from_the_unit_kernel_after_a_clean_precheck_is_a_failure(tmp_path, monkeypatch):
+    # j=[1.0, -1.0] passes the eligibility pre-check; a ValueError the kernel still
+    # raises here is an unanticipated defect (e.g. a bad reconstruction), not a known
+    # ineligibility, and must never be hidden as "unsupported".
+    _write_bundle(tmp_path, "native-pm1", _nonce(0), j=np.array([1.0, -1.0]))
+    monkeypatch.setattr(
+        runner, "_msa", lambda: _fake_msa_module(_FakeSampler(raise_error=ValueError("unexpected defect")))
+    )
+    record, samples = runner.execute_cpu_job(_job("native-pm1", _nonce(0), kernel="cpu-msa-unit"), tmp_path)
+    assert record["exit_ok"] is False
+    assert record["unsupported"] is False
     assert samples is None
 
 
@@ -289,6 +334,16 @@ def test_a_real_value_error_on_a_non_unit_kernel_is_a_failure_not_unsupported(tm
     assert record["exit_ok"] is False
     assert record["unsupported"] is False
     assert samples is None
+
+
+def test_unit_kernel_ineligibility_reason_flags_non_unit_couplings():
+    assert runner.unit_kernel_ineligibility_reason(np.zeros(2), np.array([0.5, -1.0])) is not None
+    assert runner.unit_kernel_ineligibility_reason(np.zeros(2), np.array([1.0, -1.0])) is None
+
+
+def test_unit_kernel_ineligibility_reason_flags_fractional_fields():
+    assert runner.unit_kernel_ineligibility_reason(np.array([0.5, 0.0]), np.array([1.0])) is not None
+    assert runner.unit_kernel_ineligibility_reason(np.array([1.0, 0.0]), np.array([1.0])) is None
 
 
 # ------------------------------------------------- cubic-dimer-pm1 unit-kernel reconstruction
@@ -327,10 +382,12 @@ def test_kernel_input_for_reconstructs_cubic_dimer_repeated_unit_bonds():
 
 
 def test_kernel_input_for_rejects_a_non_half_unit_coupling():
+    # A pre-checked eligibility gap, not a defect: KernelIneligible, never RunnerError
+    # (review finding 8 -- only explicit, pre-checked reasons become "unsupported").
     h = np.zeros(2)
     edges = np.array([[0, 1]])
     j = np.array([0.37])
-    with pytest.raises(runner.RunnerError, match="not a multiple"):
+    with pytest.raises(runner.KernelIneligible, match="not a multiple"):
         runner.kernel_input_for("cubic-dimer-pm1", "cpu-msa-unit", h, edges, j, (0.2, 4.0))
 
 
@@ -492,6 +549,47 @@ def test_qpu_seed_lanes_rejects_a_genuine_mismatch(tmp_path):
         runner.qpu_seed_lanes("native-pm1", _nonce(0), h, edges, j, tmp_path, lanes=2)
 
 
+# ------------------------------------------------------------- execute_seeded_sweep_job
+
+
+class _SeededSweepFakeSampler:
+    """cpu-msa-f64 has no eligibility limit at all: any ValueError it raises is an
+    unanticipated defect, never a known ineligibility (review findings 7/8).
+    """
+
+    def __init__(self, *, fail_on_main: bool):
+        self._fail_on_main = fail_on_main
+
+    def sample_research(self, h, edges, j, *, kernel, num_sweeps, num_reads, seed, beta_range, initial_spins=None):
+        if self._fail_on_main and num_sweeps == runner.SEEDED_SWEEPS:
+            raise ValueError("unexpected defect")
+        spins = np.ones((num_reads, len(h)), dtype=np.int8)
+        energies = regimes.energy(spins, h, edges, j)
+        meta = {
+            "observed_kernel": "cpu-msa-f64", "representation": "fake", "rng_scheme": "fake",
+            "seeded_reads": 0, "workspace_bytes": None,
+        }
+        return spins, energies, meta
+
+
+def test_seeded_sweep_value_error_is_a_failure_not_unsupported(tmp_path, monkeypatch):
+    _write_bundle(tmp_path, "native-pm1", _nonce(0))
+    monkeypatch.setattr(runner, "_msa", lambda: _fake_msa_module(_SeededSweepFakeSampler(fail_on_main=True)))
+    record, samples = runner.execute_seeded_sweep_job("native-pm1", _nonce(0), tmp_path, tmp_path, "cpu-lite")
+    assert record["exit_ok"] is False
+    assert record["unsupported"] is False
+    assert samples is None
+
+
+def test_seeded_sweep_completes_when_the_kernel_behaves(tmp_path, monkeypatch):
+    _write_bundle(tmp_path, "native-pm1", _nonce(0))
+    monkeypatch.setattr(runner, "_msa", lambda: _fake_msa_module(_SeededSweepFakeSampler(fail_on_main=False)))
+    record, samples = runner.execute_seeded_sweep_job("native-pm1", _nonce(0), tmp_path, tmp_path, "cpu-lite")
+    assert record["exit_ok"] is True
+    assert record["unsupported"] is False
+    assert samples is not None
+
+
 # ------------------------------------------------------------ portfolio deadline arm
 #
 # These need P's pinned environment (qpo, dimod, dwave.samplers) on the path, unlike
@@ -536,3 +634,103 @@ def test_portfolio_deadline_arm_masks_the_seed_to_32_bits(monkeypatch):
     assert 0 <= captured["seed"] < (1 << 31)
     assert captured["num_reads"] == runner.PORTFOLIO_NEAL_READS
     assert captured["num_sweeps"] == runner.PORTFOLIO_NEAL_SWEEPS
+
+
+# ------------------------------------------------------------ hard deadline scaling
+
+
+def test_estimate_hard_deadline_scales_with_sweeps_and_size():
+    shallow = runner.estimate_hard_deadline_s(sweeps=2048, n_spins=4575, reads=64)
+    deep = runner.estimate_hard_deadline_s(sweeps=131072, n_spins=4575, reads=64)
+    assert deep > shallow
+    # deep is 64x the sweeps of shallow, so (above the floor) it must scale ~64x too
+    assert deep == pytest.approx(shallow * 64, rel=0.05)
+
+
+def test_estimate_hard_deadline_never_drops_below_the_floor():
+    tiny = runner.estimate_hard_deadline_s(sweeps=1, n_spins=1, reads=1)
+    assert tiny == runner.HARD_DEADLINE_FLOOR_S
+
+
+def test_estimate_hard_deadline_covers_the_pilots_worst_observed_case_with_margin():
+    # the exact case the review flagged: native-125 cpu-sa, 2,048 sweeps, 64 reads,
+    # n=4,575, observed at 43.57 s under heavy contention.
+    deadline = runner.estimate_hard_deadline_s(sweeps=2048, n_spins=4575, reads=64)
+    assert deadline > 43.57 * 2  # comfortable margin, not just barely above
+
+
+# --------------------------------------------------- run_subprocess_with_hard_deadline
+
+
+def test_run_subprocess_with_hard_deadline_lets_a_quick_process_finish():
+    exit_ok, wall_s = runner.run_subprocess_with_hard_deadline(
+        [sys.executable, "-c", "pass"], hard_deadline_s=10.0,
+    )
+    assert exit_ok is True
+    assert wall_s < 10.0
+
+
+def test_run_subprocess_with_hard_deadline_kills_a_hung_process():
+    pids = []
+    start = time.perf_counter()
+    exit_ok, wall_s = runner.run_subprocess_with_hard_deadline(
+        [sys.executable, "-c", "import time; time.sleep(30)"],
+        hard_deadline_s=0.2,
+        on_spawn=pids.append,
+    )
+    elapsed = time.perf_counter() - start
+    assert exit_ok is False
+    assert elapsed < 10.0  # killed promptly, never waited out the 30 s sleep
+    assert len(pids) == 1
+    with pytest.raises(ProcessLookupError):
+        os.kill(pids[0], 0)  # the child is actually gone, not orphaned
+
+
+def test_run_subprocess_with_hard_deadline_kills_the_child_and_raises_on_sigterm():
+    pids: list = []
+    timer = threading.Timer(0.2, lambda: os.kill(os.getpid(), signal.SIGTERM))
+    timer.start()
+    try:
+        with pytest.raises(runner.Cancelled):
+            runner.run_subprocess_with_hard_deadline(
+                [sys.executable, "-c", "import time; time.sleep(30)"],
+                hard_deadline_s=30.0,
+                on_spawn=pids.append,
+            )
+    finally:
+        timer.cancel()
+    assert len(pids) == 1
+    with pytest.raises(ProcessLookupError):
+        os.kill(pids[0], 0)
+
+
+def test_run_subprocess_with_hard_deadline_restores_signal_handlers_afterward():
+    previous_term = signal.getsignal(signal.SIGTERM)
+    previous_int = signal.getsignal(signal.SIGINT)
+    runner.run_subprocess_with_hard_deadline([sys.executable, "-c", "pass"], hard_deadline_s=10.0)
+    assert signal.getsignal(signal.SIGTERM) == previous_term
+    assert signal.getsignal(signal.SIGINT) == previous_int
+def test_portfolio_deadline_arm_records_weighting_status_and_raw_feasible_count():
+    pytest.importorskip("qpo")
+    pytest.importorskip("dwave.samplers")
+    # a real, small basket, run against the real reference sampler (fast: <1s), to
+    # verify the actual weighting-status wiring against P's real implementation
+    # rather than a fake.
+    seed, _ = runner.seed_for("4-2-beta-zero", "neal-500-500", 500, 500, "portfolio-deadline")
+    record = runner.run_portfolio_deadline_arm(4, 2, "beta-zero", seed)
+    assert record["exit_ok"] is True
+    assert "weighting_failed" in record
+    assert record["weighting_failed"] in (None, True, False)
+    assert isinstance(record["raw_feasible_count"], int)
+
+
+def test_run_subprocess_with_hard_deadline_passes_a_custom_env(tmp_path):
+    marker = tmp_path / "seen.txt"
+    cmd = [
+        sys.executable, "-c",
+        f"import os; open({str(marker)!r}, 'w').write(os.environ.get('MARKER_VAR', ''))",
+    ]
+    custom_env = {**os.environ, "MARKER_VAR": "custom-value"}
+    exit_ok, _wall_s = runner.run_subprocess_with_hard_deadline(cmd, hard_deadline_s=10.0, env=custom_env)
+    assert exit_ok is True
+    assert marker.read_text() == "custom-value"

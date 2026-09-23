@@ -40,7 +40,7 @@ import sys
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -106,6 +106,16 @@ def deadline_status(elapsed_s: float, deadline_s: float, exit_ok: bool) -> str:
 
 class RunnerError(RuntimeError):
     """A controlled-comparison invariant broke: wrong observed kernel, nonfinite score."""
+
+
+class KernelIneligible(Exception):
+    """A model fails an explicit, pre-checked eligibility rule for the requested kernel.
+
+    Distinct from :class:`RunnerError`: this is never a defect, only an anticipated
+    "this model cannot use this kernel" outcome, decided BEFORE the kernel is ever
+    called (review finding 8: "record 'unsupported' only for the explicit,
+    pre-checked eligibility reasons... any other exception is a 'failed' record").
+    """
 
 
 # --------------------------------------------------------- host contamination
@@ -286,8 +296,12 @@ class CpuJob:
     seed: int
     seed_input_hash: str
 
-    def run_key(self, bundles_root: PathLike) -> str:
-        """The resume identity of this job: change any field here and it is a different run."""
+    def run_key(self, bundles_root: PathLike, solver_identity: Mapping[str, Any]) -> str:
+        """The resume identity of this job: change any field here, OR the solver's own
+        build identity, and it is a different run (review finding 5: if ``quip_msa`` is
+        rebuilt partway through a campaign, resume must not silently mix results from
+        two different builds).
+        """
         return round2_io.run_id(
             {
                 "bundles_root": str(bundles_root),
@@ -301,6 +315,7 @@ class CpuJob:
                 "variant": self.variant,
                 "seed": self.seed,
                 "seed_input_hash": self.seed_input_hash,
+                "solver_identity": dict(solver_identity),
             }
         )
 
@@ -381,6 +396,43 @@ def _msa():
     return quip_msa
 
 
+def solver_identity() -> Dict[str, Any]:
+    """``quip_msa``'s package version and a content hash of its loaded compiled extension.
+
+    Recorded in every run record and folded into the run key (review finding 5), so a
+    resume never silently mixes results from two different ``quip_msa`` builds, and
+    every record on disk names exactly which build produced it. Degrades to an
+    ``"error"``-carrying shape rather than raising: identity-gathering must never crash
+    an otherwise-successful, or otherwise-failing, run.
+    """
+    import hashlib
+    import importlib.metadata
+
+    try:
+        quip_msa = _msa()
+        version = importlib.metadata.version("quip_msa")
+        module_file = Path(quip_msa.__file__).resolve()
+        binaries = sorted(module_file.parent.glob("*.so"))
+        binary_file: Optional[str] = None
+        binary_sha256: Optional[str] = None
+        if len(binaries) == 1:
+            binary_file = str(binaries[0])
+            digest = hashlib.sha256()
+            with open(binaries[0], "rb") as handle:
+                for block in iter(lambda: handle.read(1 << 20), b""):
+                    digest.update(block)
+            binary_sha256 = digest.hexdigest()
+        return {
+            "package": "quip_msa", "version": version, "module_file": str(module_file),
+            "binary_file": binary_file, "binary_sha256": binary_sha256, "error": None,
+        }
+    except Exception as exc:
+        return {
+            "package": "quip_msa", "version": None, "module_file": None,
+            "binary_file": None, "binary_sha256": None, "error": f"{type(exc).__name__}: {exc}",
+        }
+
+
 #: cubic-dimer-pm1's unit bond, in energy units (UNIT_MILLI["cubic-dimer-pm1"] = 500 milli
 #: in quip_miner_dwave.regimes, divided by the milli-to-energy-units factor of 1000).
 CUBIC_DIMER_UNIT_ENERGY = 0.5
@@ -433,7 +485,7 @@ def kernel_input_for(
     ratios = np.abs(j) / unit
     rounded = np.rint(ratios).astype(np.int64)
     if not np.allclose(ratios, rounded, rtol=0.0, atol=1e-9):
-        raise RunnerError(
+        raise KernelIneligible(
             f"cubic-dimer-pm1: found a coupling that is not a multiple of the unit {unit}; "
             "cannot build a repeated-unit input for cpu-msa-unit"
         )
@@ -445,6 +497,28 @@ def kernel_input_for(
         "h": kernel_h, "edges": kernel_edges, "j": kernel_j, "beta_range": kernel_beta,
         "energy_scale": unit, "input_hash": _array_input_hash(kernel_h, kernel_edges, kernel_j),
     }
+
+
+def unit_kernel_ineligibility_reason(h: np.ndarray, j: np.ndarray) -> Optional[str]:
+    """Why ``cpu-msa-unit`` cannot take this canonical model, checked BEFORE the kernel
+    is ever called -- so an eligibility gap is recorded as "unsupported", and any OTHER
+    ``ValueError`` the kernel itself raises is a real "failed" record, never mistaken
+    for a known ineligibility (review finding 8).
+
+    Mirrors the kernel's own stated bound (its error message): couplings in
+    ``{-1, 0, +1}``, and whole-number fields. Returns None when the model looks
+    eligible by this check; the kernel call afterward is the final authority (a
+    cubic-dimer-pm1 model instead goes through :func:`kernel_input_for`'s own
+    pre-check, which covers its repeated-unit reconstruction).
+    """
+    j = np.asarray(j, dtype=np.float64)
+    h = np.asarray(h, dtype=np.float64)
+    rounded_j = np.round(j)
+    if not (np.isin(rounded_j, (-1.0, 0.0, 1.0)).all() and np.allclose(j, rounded_j, atol=1e-9)):
+        return "the unit kernel takes couplings in {-1, 0, +1}; this model has another value"
+    if not np.allclose(h, np.round(h), atol=1e-9):
+        return "the unit kernel takes whole-number fields; this model has a fractional value"
+    return None
 
 
 def execute_cpu_job(
@@ -465,6 +539,7 @@ def execute_cpu_job(
     samples, not a different kernel's answer.
     """
     quip_msa = _msa()
+    identity = solver_identity()
     t_start = time.perf_counter()
 
     manifest, arrays = round2_io.read_bundle(Path(bundles_root) / job.cell / job.nonce)
@@ -475,18 +550,9 @@ def execute_cpu_job(
     beta_range = quip_msa.default_beta_range(h, edges, j)
     t_setup_end = time.perf_counter()
 
-    kernel_input = kernel_input_for(job.cell, job.kernel, h, edges, j, beta_range)
-    bundle_unit_hash = manifest.get("unit_kernel_input_hash")
-    if job.kernel == UNIT_KERNEL and bundle_unit_hash is not None and bundle_unit_hash != kernel_input["input_hash"]:
-        raise RunnerError(
-            f"{job.cell}/{job.nonce}: the reconstructed repeated-unit input hashes to "
-            f"{kernel_input['input_hash']!r}, and the bundle records {bundle_unit_hash!r}; refusing "
-            "to submit an input that does not match round2_export.py's own reconstruction"
-        )
-
     record: Dict[str, Any] = {
         "schema": "round2-cpu-run-v1",
-        "run_key": job.run_key(bundles_root),
+        "run_key": job.run_key(bundles_root, identity),
         "cell": job.cell,
         "nonce": job.nonce,
         "model_hash": manifest["hash"],
@@ -494,9 +560,6 @@ def execute_cpu_job(
         "reads": job.reads,
         "sweeps": job.sweeps,
         "beta_range": [float(beta_range[0]), float(beta_range[1])],
-        "submitted_beta_range": [float(kernel_input["beta_range"][0]), float(kernel_input["beta_range"][1])],
-        "kernel_energy_scale": kernel_input["energy_scale"],
-        "kernel_input_hash": kernel_input["input_hash"],
         "seed": job.seed,
         "seed_input_hash": job.seed_input_hash,
         "repetition_id": job.repetition_id,
@@ -504,7 +567,56 @@ def execute_cpu_job(
         "variant": job.variant,
         "setup_s": t_setup_end - t_setup_start,
         "graph_setup_s": None,  # not exposed by quip_msa's API; see module docstring
+        "solver_identity": identity,
     }
+
+    def _unsupported(reason: str) -> Tuple[Dict[str, Any], None]:
+        record.update(
+            unsupported=True, unsupported_reason=reason, exit_ok=True, error=None,
+            observed_kernel=None, representation=None, workspace_bytes=None, rng_scheme=None,
+            elapsed_sampling_s=None, best_energy=None, mean_energy=None, unique_reads=None,
+            submitted_beta_range=None, kernel_energy_scale=None, kernel_input_hash=None,
+        )
+        record["wall_s"] = time.perf_counter() - t_start
+        record["peak_rss_kb"] = _peak_rss_kb()
+        return record, None
+
+    def _failed(reason: str) -> Tuple[Dict[str, Any], None]:
+        record.update(
+            unsupported=False, unsupported_reason=None, exit_ok=False, error=reason,
+            observed_kernel=None, representation=None, workspace_bytes=None, rng_scheme=None,
+            elapsed_sampling_s=None, best_energy=None, mean_energy=None, unique_reads=None,
+            submitted_beta_range=None, kernel_energy_scale=None, kernel_input_hash=None,
+        )
+        record["wall_s"] = time.perf_counter() - t_start
+        record["peak_rss_kb"] = _peak_rss_kb()
+        return record, None
+
+    # Eligibility for cpu-msa-unit is decided BEFORE the kernel is ever called, by an
+    # explicit, pre-checked rule -- never by reacting to whatever ValueError the kernel
+    # itself happens to raise (review finding 8). cubic-dimer-pm1's own pre-check lives
+    # inside kernel_input_for (its repeated-unit reconstruction); every other cell is
+    # checked here directly against the kernel's stated bound.
+    if job.kernel == UNIT_KERNEL and job.cell != "cubic-dimer-pm1":
+        reason = unit_kernel_ineligibility_reason(h, j)
+        if reason is not None:
+            return _unsupported(reason)
+
+    try:
+        kernel_input = kernel_input_for(job.cell, job.kernel, h, edges, j, beta_range)
+    except KernelIneligible as exc:
+        return _unsupported(str(exc))
+
+    bundle_unit_hash = manifest.get("unit_kernel_input_hash")
+    if job.kernel == UNIT_KERNEL and bundle_unit_hash is not None and bundle_unit_hash != kernel_input["input_hash"]:
+        raise RunnerError(
+            f"{job.cell}/{job.nonce}: the reconstructed repeated-unit input hashes to "
+            f"{kernel_input['input_hash']!r}, and the bundle records {bundle_unit_hash!r}; refusing "
+            "to submit an input that does not match round2_export.py's own reconstruction"
+        )
+    record["submitted_beta_range"] = [float(kernel_input["beta_range"][0]), float(kernel_input["beta_range"][1])]
+    record["kernel_energy_scale"] = kernel_input["energy_scale"]
+    record["kernel_input_hash"] = kernel_input["input_hash"]
 
     try:
         t_sample_start = time.perf_counter()
@@ -514,23 +626,9 @@ def execute_cpu_job(
         )
         t_sample_end = time.perf_counter()
     except ValueError as exc:
-        if job.kernel == UNIT_KERNEL:
-            record.update(
-                unsupported=True, unsupported_reason=str(exc), exit_ok=True, error=None,
-                observed_kernel=None, representation=None, workspace_bytes=None,
-                elapsed_sampling_s=None, best_energy=None, mean_energy=None, unique_reads=None,
-            )
-            record["wall_s"] = time.perf_counter() - t_start
-            record["peak_rss_kb"] = _peak_rss_kb()
-            return record, None
-        record.update(
-            unsupported=False, unsupported_reason=None, exit_ok=False, error=f"{type(exc).__name__}: {exc}",
-            observed_kernel=None, representation=None, workspace_bytes=None,
-            elapsed_sampling_s=None, best_energy=None, mean_energy=None, unique_reads=None,
-        )
-        record["wall_s"] = time.perf_counter() - t_start
-        record["peak_rss_kb"] = _peak_rss_kb()
-        return record, None
+        # Past the pre-check, ANY ValueError here is an unanticipated defect -- a
+        # "failed" record, never "unsupported" (review finding 8).
+        return _failed(f"{type(exc).__name__}: {exc}")
 
     observed_kernel = meta["observed_kernel"]
     if observed_kernel != job.kernel:
@@ -559,7 +657,7 @@ def execute_cpu_job(
     record.update(
         unsupported=False, unsupported_reason=None, exit_ok=True, error=None,
         observed_kernel=observed_kernel, representation=meta["representation"],
-        workspace_bytes=meta["workspace_bytes"],
+        workspace_bytes=meta["workspace_bytes"], rng_scheme=meta.get("rng_scheme"),
         elapsed_sampling_s=t_sample_end - t_sample_start,
         best_energy=float(rescored.min()), mean_energy=float(rescored.mean()),
         unique_reads=int(len(np.unique(spins, axis=0))),
@@ -581,12 +679,16 @@ def _peak_rss_kb() -> int:
 
 _RECORD_FIELDS = (
     "unsupported", "unsupported_reason", "exit_ok", "error", "observed_kernel", "representation",
-    "workspace_bytes", "elapsed_sampling_s", "best_energy", "mean_energy", "unique_reads",
-    "setup_s", "graph_setup_s", "beta_range", "wall_s", "peak_rss_kb",
+    "workspace_bytes", "rng_scheme", "elapsed_sampling_s", "best_energy", "mean_energy", "unique_reads",
+    "setup_s", "graph_setup_s", "beta_range", "submitted_beta_range", "kernel_energy_scale",
+    "kernel_input_hash", "wall_s", "peak_rss_kb",
 )
 
 
-def failure_record(job: CpuJob, bundles_root: PathLike, exc: BaseException) -> Dict[str, Any]:
+def failure_record(
+    job: CpuJob, bundles_root: PathLike, exc: BaseException,
+    *, identity: Optional[Mapping[str, Any]] = None, model_hash: Optional[str] = None,
+) -> Dict[str, Any]:
     """A well-formed, fully-shaped run record for a job that raised before it could produce one.
 
     Used for anything :func:`execute_cpu_job` did not itself catch: a
@@ -594,13 +696,20 @@ def failure_record(job: CpuJob, bundles_root: PathLike, exc: BaseException) -> D
     other unexpected exception. Never drops the job silently -- the record
     always exists, with every field :func:`execute_cpu_job` would have set,
     so downstream analysis never has to special-case a missing key.
+
+    ``identity`` (the solver's build identity, see :func:`solver_identity`) defaults to
+    a freshly computed one when not given (the caller may already have one and want to
+    reuse it, e.g. across many failures in a loop). ``model_hash`` is carried through
+    when the caller already knows it (the bundle loaded fine and something else failed
+    afterward); otherwise it stays None.
     """
+    identity = dict(identity) if identity is not None else solver_identity()
     record: Dict[str, Any] = {
         "schema": "round2-cpu-run-v1",
-        "run_key": job.run_key(bundles_root),
+        "run_key": job.run_key(bundles_root, identity),
         "cell": job.cell,
         "nonce": job.nonce,
-        "model_hash": None,
+        "model_hash": model_hash,
         "requested_kernel": job.kernel,
         "reads": job.reads,
         "sweeps": job.sweeps,
@@ -609,6 +718,7 @@ def failure_record(job: CpuJob, bundles_root: PathLike, exc: BaseException) -> D
         "repetition_id": job.repetition_id,
         "repetition_kind": job.repetition_kind,
         "variant": job.variant,
+        "solver_identity": identity,
     }
     for field in _RECORD_FIELDS:
         record[field] = None
@@ -620,10 +730,103 @@ def failure_record(job: CpuJob, bundles_root: PathLike, exc: BaseException) -> D
 
 # ------------------------------------------------------- subprocess orchestration
 
-#: Crash protection only (task brief, step 5: "a subprocess timeout and
-#: cleanup"). This is NOT the application/comparison deadline a caller
-#: classifies with :func:`deadline_status` -- see :func:`run_one_subprocess`.
+#: A generous floor under :func:`estimate_hard_deadline_s`, and the fallback for
+#: callers that have no per-job size estimate at all. Crash protection only (task
+#: brief, step 5: "a subprocess timeout and cleanup") -- NOT the application/
+#: comparison deadline a caller classifies with :func:`deadline_status` -- see
+#: :func:`run_one_subprocess`.
 DEFAULT_HARD_DEADLINE_S = 600.0
+
+#: Calibrated from the five-model pilot's own slowest observed run (native-125,
+#: cpu-sa, 2,048 sweeps, 64 reads, n=4,575 spins, under heavy host contention:
+#: 43.57 s). ``HARD_DEADLINE_SAFETY_FACTOR`` on top of that gives generous headroom,
+#: so :func:`estimate_hard_deadline_s` only ever kills a genuinely hung process, never
+#: a slow-but-progressing one -- even at the deepest campaign rung on the largest cell.
+COST_PER_SWEEP_SPIN_READ_S = 43.57 / (2048 * 4575 * 64)
+HARD_DEADLINE_FLOOR_S = 120.0
+HARD_DEADLINE_SAFETY_FACTOR = 5.0
+
+
+def estimate_hard_deadline_s(sweeps: int, n_spins: int, reads: int) -> float:
+    """A generous, sweep/size/read-scaled hard-kill deadline for one measured run.
+
+    Not a timing estimate -- a crash-protection ceiling (task brief, step 1's "the
+    hard deadline kills the deepest rungs" defect this fixes): a single fixed value
+    across every sweep depth and model size either kills the deepest, largest-model
+    rungs or is uselessly loose on the shallowest, smallest ones. A CLI
+    ``--hard-deadline-s`` overrides this outright when given.
+    """
+    return max(
+        HARD_DEADLINE_FLOOR_S,
+        HARD_DEADLINE_SAFETY_FACTOR * COST_PER_SWEEP_SPIN_READ_S * sweeps * n_spins * reads,
+    )
+
+
+class Cancelled(RuntimeError):
+    """The parent process received SIGTERM or SIGINT (e.g. taskd cancelling a run)
+    while waiting on a measured subprocess. The child's whole process group is killed
+    before this is raised; the caller must let it propagate, writing no record for
+    the interrupted job (review finding 9) -- a cancelled run is not a "completed" one.
+    """
+
+
+def _kill_process_group(proc: "subprocess.Popen[bytes]") -> None:
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+
+
+def run_subprocess_with_hard_deadline(
+    cmd: Sequence[str], hard_deadline_s: float,
+    *, env: Optional[Mapping[str, str]] = None, on_spawn: Optional[Any] = None,
+) -> Tuple[bool, float]:
+    """Run ``cmd`` to completion, or kill its whole process group after ``hard_deadline_s``.
+
+    Crash protection only, shared by the CPU-job and portfolio-deadline-arm
+    subprocess wrappers (task brief, step 5, and step 6's "a real subprocess
+    deadline, with timeout and cleanup, like the CPU arms"). Returns
+    ``(exit_ok, wall_s)`` -- ``exit_ok`` is only ever the process's own exit
+    code, never an application-level judgment about the answer it produced.
+
+    Also handles the parent itself being cancelled (SIGTERM/SIGINT, exactly what
+    taskd sends on cancel, review finding 9): installs handlers for the duration of
+    the wait that kill the child's process group and raise :class:`Cancelled`,
+    which the caller must not catch -- letting it propagate means no record is ever
+    written for a job the parent was told to abandon mid-run.
+
+    ``env``, if given, replaces the child's environment outright (the caller is
+    responsible for including anything the child needs, e.g. this parent's own
+    ``PYTHONPATH`` when the child runs under a different interpreter, such as P's
+    pinned venv, that would not otherwise see it). ``on_spawn``, if given, is
+    called once with the child's pid right after it starts -- a testing hook,
+    never used by production callers.
+    """
+    start = time.perf_counter()
+    proc = subprocess.Popen(cmd, start_new_session=True, env=dict(env) if env is not None else None)
+    if on_spawn is not None:
+        on_spawn(proc.pid)
+
+    def _cancel(signum: int, _frame: Any) -> None:
+        raise Cancelled(f"the parent received signal {signum} while waiting on pid {proc.pid}")
+
+    previous_term = signal.signal(signal.SIGTERM, _cancel)
+    previous_int = signal.signal(signal.SIGINT, _cancel)
+    try:
+        try:
+            returncode = proc.wait(timeout=hard_deadline_s)
+            return returncode == 0, time.perf_counter() - start
+        except subprocess.TimeoutExpired:
+            _kill_process_group(proc)
+            proc.wait()
+            return False, time.perf_counter() - start
+        except Cancelled:
+            _kill_process_group(proc)
+            proc.wait()
+            raise
+    finally:
+        signal.signal(signal.SIGTERM, previous_term)
+        signal.signal(signal.SIGINT, previous_int)
 
 
 def run_one_subprocess(
@@ -631,44 +834,43 @@ def run_one_subprocess(
     *,
     bundles_root: PathLike,
     out_dir: PathLike,
-    cpu: int,
+    cpu: Optional[int],
     script_path: PathLike,
+    attempt: int,
     python_exe: Optional[str] = None,
     hard_deadline_s: float = DEFAULT_HARD_DEADLINE_S,
+    hard_deadline_s_override: Optional[float] = None,
 ) -> Tuple[bool, float]:
     """Run one job in a fresh ``run-one`` subprocess, pinned to ``cpu``. Returns ``(exit_ok, wall_s)``.
 
-    ``hard_deadline_s`` only protects the orchestrator from a runaway or
-    hung subprocess: a process that blows through it is killed (its whole
-    process group, not just the direct child) and the run comes back
-    ``exit_ok=False``. It never means "timeout" in :func:`deadline_status`'s
-    sense of a late-but-good answer -- an application deadline like the
-    portfolio historical arm's 10 seconds is classified separately, from
-    the subprocess's own reported elapsed time, only once it has actually
-    returned an answer (``exit_ok=True``). One-process-at-a-time timing
-    (task brief, step 4) is the caller's responsibility: this starts exactly
-    one subprocess and waits for it before returning.
+    ``attempt`` is the EXACT attempt number the orchestrator already decided on (via
+    its own resolve/repeat-contaminated logic) and is always passed down explicitly:
+    the child must write to (or confirm as already-done) that exact attempt, never
+    re-derive its own -- a self-resolving child would silently disagree with a
+    parent running in ``--repeat-contaminated`` mode, which picks an attempt for a
+    reason (contamination) plain resolution has no way to see. ``hard_deadline_s``
+    is what THIS process enforces via :func:`run_subprocess_with_hard_deadline`;
+    ``hard_deadline_s_override``, when given, is also passed to the child via
+    ``--hard-deadline-s`` so both sides use the identical explicit value rather
+    than each independently recomputing the size-scaled default. One-process-at-a-
+    time timing (task brief, step 4) is the caller's responsibility: this starts
+    exactly one subprocess and waits for it before returning. See
+    :func:`run_subprocess_with_hard_deadline` for the crash-protection and
+    cancellation semantics.
     """
     python_exe = python_exe or sys.executable
     cmd = [
         python_exe, str(script_path), "run-one",
         "--job-json", json.dumps(job.to_dict()),
         "--bundles-root", str(bundles_root),
+        "--attempt", str(attempt),
         "--out-dir", str(out_dir),
-        "--cpu", str(cpu),
     ]
-    start = time.perf_counter()
-    proc = subprocess.Popen(cmd, start_new_session=True)
-    try:
-        returncode = proc.wait(timeout=hard_deadline_s)
-        return returncode == 0, time.perf_counter() - start
-    except subprocess.TimeoutExpired:
-        try:
-            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        proc.wait()
-        return False, time.perf_counter() - start
+    if cpu is not None:
+        cmd += ["--cpu", str(cpu)]
+    if hard_deadline_s_override is not None:
+        cmd += ["--hard-deadline-s", str(hard_deadline_s_override)]
+    return run_subprocess_with_hard_deadline(cmd, hard_deadline_s)
 
 
 # ------------------------------------------------------- QPU deadline record
@@ -877,6 +1079,26 @@ def run_portfolio_deadline_arm(n: int, k: int, beta_label: str, seed: int) -> Di
         record["feasible"] = bool(scored["feasible"])
         record["raw_feasible_count"] = scored["raw_feasible_count"]
         record["returned_reads"] = int(scored["returned_reads"])
+
+        # "feasible" above comes entirely from P's own repair and weighting; a raw read
+        # rarely satisfies the cardinality constraint on its own (raw_feasible_count is
+        # commonly 0). Report the WINNING read's own weighting status too, so a reader
+        # never mistakes a repaired-feasible answer for a raw one (review finding 6).
+        # weighting_failed is P's own tri-state: None means "not observed to fail,"
+        # never "succeeded" -- an unknown weighting result is recorded as unknown.
+        diagnostics = pr.per_read_diagnostics(problem, spins)
+        selected_bits = np.asarray(scored["selected_bits"], dtype=np.int8)
+        match = np.all(bits.astype(np.int8) == selected_bits, axis=1)
+        if match.any():
+            selected_record = diagnostics["records"][int(np.argmax(match))]
+            record["weighting_failed"] = selected_record["weighting_failed"]
+            record["selected_raw_cardinality"] = selected_record["raw_cardinality"]
+        else:
+            # Should not happen (selected_bits always comes from one of the input
+            # reads); recorded as unknown rather than silently assumed one way or
+            # the other if it ever does.
+            record["weighting_failed"] = None
+            record["selected_raw_cardinality"] = None
     return record
 
 
@@ -997,7 +1219,10 @@ def execute_seeded_sweep_job(
             seed=seed, beta_range=beta_range, initial_spins=lanes["spins"],
         )
     except ValueError as exc:
-        record.update(unsupported=True, unsupported_reason=str(exc), exit_ok=True, error=None)
+        # cpu-msa-f64 has no eligibility limit at all (unlike cpu-msa-unit): any
+        # ValueError here is an unanticipated defect, never a known ineligibility
+        # (review findings 7/8 -- "unsupported" is reserved for pre-checked reasons).
+        record.update(unsupported=False, unsupported_reason=None, exit_ok=False, error=f"{type(exc).__name__}: {exc}")
         return record, None
 
     observed_kernel = meta["observed_kernel"]
