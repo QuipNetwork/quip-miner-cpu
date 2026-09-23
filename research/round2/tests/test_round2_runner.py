@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import os
 import signal
+import subprocess
 import sys
 import threading
 import time
@@ -76,7 +77,7 @@ def test_contamination_flags_high_loadavg_but_never_drops_the_sample():
                                 sibling_cpu_times=(0.0, 100.0))
     after = runner.HostSample(loadavg_1m=1.0, loadavg_5m=1.0, loadavg_15m=1.0, governor="performance",
                                sibling_cpu_times=(1.0, 200.0))
-    verdict = runner.check_contamination(before, after)
+    verdict = runner.check_contamination(before, after, concurrent_workers=1)
     assert verdict.contaminated
     assert any("loadavg_1m before" in reason for reason in verdict.reasons)
     # the thresholds used are recorded, not just implied
@@ -86,7 +87,7 @@ def test_contamination_flags_high_loadavg_but_never_drops_the_sample():
 def test_contamination_flags_a_busy_sibling():
     before = runner.HostSample(0.1, 0.1, 0.1, "performance", sibling_cpu_times=(0.0, 100.0))
     after = runner.HostSample(0.1, 0.1, 0.1, "performance", sibling_cpu_times=(60.0, 200.0))
-    verdict = runner.check_contamination(before, after)
+    verdict = runner.check_contamination(before, after, concurrent_workers=1)
     assert verdict.contaminated
     assert verdict.sibling_busy_fraction == pytest.approx(0.6)
 
@@ -94,9 +95,61 @@ def test_contamination_flags_a_busy_sibling():
 def test_a_quiet_host_is_not_contaminated():
     before = runner.HostSample(0.1, 0.1, 0.1, "performance", sibling_cpu_times=(0.0, 100.0))
     after = runner.HostSample(0.2, 0.1, 0.1, "performance", sibling_cpu_times=(1.0, 200.0))
-    verdict = runner.check_contamination(before, after)
+    verdict = runner.check_contamination(before, after, concurrent_workers=1)
     assert not verdict.contaminated
     assert verdict.reasons == ()
+
+
+# ------------------------------------------ contamination under parallel workers
+#
+# Controller ruling (workers change, fix round 1, item 3): the loadavg is compared
+# to the threshold after subtracting the run's own concurrent_workers -- its own
+# workers are not competing load. This is one uniform formula for every
+# timing_mode: a serial run (concurrent_workers=1) now subtracts 1 too, a small,
+# documented departure from the exact-raw comparison the original pilot used,
+# not an attempt to reproduce that number bit for bit.
+
+
+def test_check_contamination_records_raw_and_adjusted_loadavg():
+    before = runner.HostSample(10.0, 1.0, 1.0, "performance", sibling_cpu_times=(0.0, 100.0))
+    after = runner.HostSample(10.0, 1.0, 1.0, "performance", sibling_cpu_times=(1.0, 200.0))
+    verdict = runner.check_contamination(before, after, concurrent_workers=8)
+    data = verdict.to_dict()
+    assert data["loadavg_1m_raw_before"] == 10.0
+    assert data["loadavg_1m_raw_after"] == 10.0
+    assert data["loadavg_1m_adjusted_before"] == pytest.approx(2.0)
+    assert data["loadavg_1m_adjusted_after"] == pytest.approx(2.0)
+    assert data["concurrent_workers"] == 8
+    assert data["thresholds"]["loadavg_1m_max"] == runner.LOADAVG_1M_CONTAMINATION_THRESHOLD
+
+
+def test_eight_workers_on_an_otherwise_idle_host_are_not_contaminated():
+    # raw loadavg ~8 comes entirely from this run's own 8 workers.
+    before = runner.HostSample(8.0, 1.0, 1.0, "performance", sibling_cpu_times=(0.0, 100.0))
+    after = runner.HostSample(8.2, 1.0, 1.0, "performance", sibling_cpu_times=(1.0, 200.0))
+    verdict = runner.check_contamination(before, after, concurrent_workers=8)
+    assert not verdict.contaminated
+
+
+def test_heavy_external_load_still_contaminates_an_eight_worker_run():
+    # raw loadavg is 8 (this run's own workers) plus 10 of real external load.
+    before = runner.HostSample(18.0, 1.0, 1.0, "performance", sibling_cpu_times=(0.0, 100.0))
+    after = runner.HostSample(18.0, 1.0, 1.0, "performance", sibling_cpu_times=(1.0, 200.0))
+    verdict = runner.check_contamination(before, after, concurrent_workers=8)
+    assert verdict.contaminated
+    assert any("adjusted loadavg_1m" in reason for reason in verdict.reasons)
+
+
+def test_a_serial_run_now_subtracts_one_worker_from_the_raw_loadavg():
+    # documents the chosen behavior explicitly: serial is not byte-identical to
+    # fix round 1 (raw, no subtraction) -- it subtracts concurrent_workers=1, the
+    # same uniform formula parallel runs use.
+    before = runner.HostSample(8.5, 1.0, 1.0, "performance", sibling_cpu_times=(0.0, 100.0))
+    after = runner.HostSample(8.5, 1.0, 1.0, "performance", sibling_cpu_times=(1.0, 200.0))
+    verdict = runner.check_contamination(before, after, concurrent_workers=1)
+    # raw (8.5) would exceed the 8.0 threshold; adjusted (8.5 - 1 = 7.5) does not.
+    assert not verdict.contaminated
+    assert verdict.to_dict()["loadavg_1m_adjusted_before"] == pytest.approx(7.5)
 
 
 def test_busy_fraction_is_none_for_a_run_too_short_to_tick_the_jiffy_clock():
@@ -770,14 +823,23 @@ def test_run_subprocess_with_hard_deadline_passes_a_custom_env(tmp_path):
 
 
 def _fake_siblings(pairs):
-    """A sibling_of function for a synthetic topology: pairs like {0: 16, 16: 0}."""
-    return lambda cpu: pairs.get(cpu)
+    """A siblings_of function for a synthetic topology: pairs like {0: [16], 16: [0]}."""
+    return lambda cpu: pairs.get(cpu, [])
+
+
+def _pair_siblings(*pairs):
+    """Build a full pairs dict from (a, b) pairs, each other's sole sibling."""
+    mapping: dict = {}
+    for a, b in pairs:
+        mapping[a] = [b]
+        mapping[b] = [a]
+    return mapping
 
 
 def test_select_worker_cpus_skips_smt_siblings():
     # host shape from the change brief: cpu n and n+16 are SMT siblings
-    siblings = _fake_siblings({i: i + 16 for i in range(16)} | {i + 16: i for i in range(16)})
-    chosen = runner.select_worker_cpus(4, allowed=range(32), sibling_of=siblings)
+    siblings = _fake_siblings(_pair_siblings(*((i, i + 16) for i in range(16))))
+    chosen = runner.select_worker_cpus(4, allowed=range(32), siblings_of=siblings, avoid_cpu0=False)
     assert chosen == [0, 1, 2, 3]  # ascending, never touching 16-31 until 0-15 exhausted
     for cpu in chosen:
         assert cpu + 16 not in chosen
@@ -785,31 +847,89 @@ def test_select_worker_cpus_skips_smt_siblings():
 
 
 def test_select_worker_cpus_never_doubles_up_a_physical_core():
-    siblings = _fake_siblings({0: 16, 16: 0, 1: 17, 17: 1})
+    siblings = _fake_siblings(_pair_siblings((0, 16), (1, 17)))
     # An allowed set that lists both members of each physical core: still only one
     # logical CPU per physical core comes back.
-    chosen = runner.select_worker_cpus(2, allowed=[0, 16, 1, 17], sibling_of=siblings)
+    chosen = runner.select_worker_cpus(2, allowed=[0, 16, 1, 17], siblings_of=siblings, avoid_cpu0=False)
     assert len(chosen) == 2
-    physical_cores = {frozenset({cpu, siblings(cpu)}) for cpu in chosen}
+    physical_cores = {frozenset({cpu, *siblings(cpu)}) for cpu in chosen}
     assert len(physical_cores) == 2  # two DISTINCT physical cores, not one core twice
 
 
 def test_select_worker_cpus_raises_when_not_enough_physical_cores():
-    siblings = _fake_siblings({0: 16, 16: 0})
+    siblings = _fake_siblings(_pair_siblings((0, 16)))
     with pytest.raises(ValueError, match="need 3"):
-        runner.select_worker_cpus(3, allowed=[0, 16], sibling_of=siblings)
+        runner.select_worker_cpus(3, allowed=[0, 16], siblings_of=siblings, avoid_cpu0=False)
 
 
 def test_select_worker_cpus_with_explicit_cpus_validates_distinct_physical_cores():
-    siblings = _fake_siblings({0: 16, 16: 0, 1: 17, 17: 1})
+    siblings = _fake_siblings(_pair_siblings((0, 16), (1, 17)))
     with pytest.raises(ValueError, match="same physical core"):
-        runner.select_worker_cpus(2, cpus=[0, 16], sibling_of=siblings)
+        runner.select_worker_cpus(2, cpus=[0, 16], allowed=[0, 16, 1, 17], siblings_of=siblings)
 
 
 def test_select_worker_cpus_with_explicit_cpus_accepts_distinct_physical_cores():
-    siblings = _fake_siblings({0: 16, 16: 0, 1: 17, 17: 1})
-    chosen = runner.select_worker_cpus(2, cpus=[0, 17], sibling_of=siblings)
+    siblings = _fake_siblings(_pair_siblings((0, 16), (1, 17)))
+    chosen = runner.select_worker_cpus(2, cpus=[0, 17], allowed=[0, 16, 1, 17], siblings_of=siblings)
     assert chosen == [0, 17]
+
+
+def test_select_worker_cpus_handles_more_than_two_threads_per_core():
+    # a hypothetical 4-way-SMT core: 0, 8, 16, 24 all share one physical core
+    siblings = _fake_siblings({0: [8, 16, 24], 8: [0, 16, 24], 16: [0, 8, 24], 24: [0, 8, 16]})
+    chosen = runner.select_worker_cpus(1, allowed=[0, 8, 16, 24], siblings_of=siblings, avoid_cpu0=False)
+    assert chosen == [0]
+
+
+def test_select_worker_cpus_automatic_choice_avoids_physical_core_0_by_default():
+    # review finding 1: core 0 handles interrupts and may be pinned to other work;
+    # the automatic choice must not land there unless explicitly asked to.
+    siblings = _fake_siblings(_pair_siblings(*((i, i + 16) for i in range(16))))
+    chosen = runner.select_worker_cpus(4, allowed=range(32), siblings_of=siblings)
+    assert 0 not in chosen
+    assert 16 not in chosen
+    assert chosen == [1, 2, 3, 4]
+
+
+def test_select_worker_cpus_explicit_cpus_may_still_name_core_0():
+    # avoid_cpu0 only changes the AUTOMATIC choice; an explicit --cpus can still ask
+    # for core 0 outright.
+    siblings = _fake_siblings(_pair_siblings((0, 16)))
+    chosen = runner.select_worker_cpus(1, cpus=[0], allowed=[0, 16], siblings_of=siblings)
+    assert chosen == [0]
+
+
+def test_select_worker_cpus_rejects_workers_below_one():
+    siblings = _fake_siblings(_pair_siblings((0, 16)))
+    with pytest.raises(ValueError, match="at least 1"):
+        runner.select_worker_cpus(0, allowed=[0, 16], siblings_of=siblings)
+
+
+def test_select_worker_cpus_rejects_an_empty_explicit_cpus_list():
+    siblings = _fake_siblings(_pair_siblings((0, 16)))
+    with pytest.raises(ValueError, match="empty"):
+        runner.select_worker_cpus(1, cpus=[], allowed=[0, 16], siblings_of=siblings)
+
+
+def test_select_worker_cpus_rejects_an_explicit_cpu_outside_the_allowed_set():
+    siblings = _fake_siblings(_pair_siblings((0, 16), (1, 17)))
+    with pytest.raises(ValueError, match="not in the allowed"):
+        runner.select_worker_cpus(1, cpus=[9], allowed=[0, 16, 1, 17], siblings_of=siblings)
+
+
+# ------------------------------------------------------------------- cpu_siblings
+
+
+def test_parse_sibling_list_handles_a_comma_list():
+    assert runner._parse_sibling_list("4,20", 4) == [20]
+
+
+def test_parse_sibling_list_handles_a_range():
+    assert runner._parse_sibling_list("4-7", 4) == [5, 6, 7]
+
+
+def test_parse_sibling_list_handles_a_mix_of_ranges_and_commas():
+    assert sorted(runner._parse_sibling_list("0-1,16-17", 0)) == [1, 16, 17]
 
 
 # ------------------------------------------------------ parallel subprocess tracking
@@ -818,9 +938,7 @@ def test_select_worker_cpus_with_explicit_cpus_accepts_distinct_physical_cores()
 def test_active_processes_kill_all_kills_every_registered_process():
     registry = runner.ActiveProcesses()
     procs = [
-        __import__("subprocess").Popen(
-            [sys.executable, "-c", "import time; time.sleep(30)"], start_new_session=True,
-        )
+        subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"], start_new_session=True)
         for _ in range(3)
     ]
     for proc in procs:
@@ -830,6 +948,34 @@ def test_active_processes_kill_all_kills_every_registered_process():
         proc.wait(timeout=5)
         with pytest.raises(ProcessLookupError):
             os.kill(proc.pid, 0)
+
+
+def test_kill_all_skips_a_process_whose_returncode_is_already_set(monkeypatch):
+    # review, minor 5: killing by pid after the child is reaped risks hitting a
+    # reused PID. A process with a known returncode has already been reaped
+    # (wait() sets it), so kill_all must not touch it at all.
+    registry = runner.ActiveProcesses()
+    finished = subprocess.Popen([sys.executable, "-c", "pass"])
+    finished.wait()
+    assert finished.returncode is not None
+    running = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"], start_new_session=True)
+    registry.add(finished)
+    registry.add(running)
+
+    killed = []
+    real_kill = runner._kill_process_group
+
+    def tracking_kill(proc):
+        killed.append(proc)
+        real_kill(proc)
+
+    monkeypatch.setattr(runner, "_kill_process_group", tracking_kill)
+    registry.kill_all()
+
+    assert killed == [running]
+    running.wait(timeout=5)
+    with pytest.raises(ProcessLookupError):
+        os.kill(running.pid, 0)
 
 
 def test_run_subprocess_tracked_raises_cancelled_without_spawning_when_already_cancelled():
@@ -885,3 +1031,17 @@ def test_run_subprocess_tracked_deregisters_the_process_when_done():
         [sys.executable, "-c", "pass"], hard_deadline_s=10.0, registry=registry, cancelled_event=cancelled,
     )
     assert registry.is_empty()
+
+
+def test_run_one_subprocess_tracked_requires_concurrent_workers(tmp_path):
+    # review, minor 7: concurrent_workers=2 was an arbitrary default; every real
+    # caller must say explicitly how many workers this run has.
+    job = runner.CpuJob(
+        cell="native-pm1", nonce=_nonce(0), kernel="cpu-sa", sweeps=8, reads=4,
+        repetition_id=0, repetition_kind="timing", variant="timing", seed=1, seed_input_hash="h",
+    )
+    with pytest.raises(TypeError):
+        runner.run_one_subprocess_tracked(  # type: ignore[call-arg]
+            job, bundles_root=tmp_path, out_dir=tmp_path, cpu=None, script_path=tmp_path, attempt=0,
+            registry=runner.ActiveProcesses(), cancelled_event=threading.Event(),
+        )

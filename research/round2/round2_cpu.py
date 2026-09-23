@@ -243,7 +243,9 @@ def cmd_run_one(args: argparse.Namespace) -> int:
 
     host_after = runner.sample_host(cpu, sibling) if cpu is not None else None
     if host_before is not None and host_after is not None:
-        contamination = runner.check_contamination(host_before, host_after)
+        contamination = runner.check_contamination(
+            host_before, host_after, concurrent_workers=args.concurrent_workers,
+        )
         record["host"] = {
             "cpu": cpu,
             "sibling_cpu": sibling,
@@ -259,6 +261,12 @@ def cmd_run_one(args: argparse.Namespace) -> int:
     # Labeled honestly (change: parallel workers, requirement 2): timing analysis
     # must be able to tell a serially-pinned run apart from one that shared the
     # host with other concurrent workers, without guessing from context.
+    # timing_mode describes only THIS run's own worker count, never the whole
+    # host: a "serial" run launched while an unrelated parallel campaign is
+    # also running on the same machine is still labeled "serial" (review,
+    # workers fix round 1, item 2) -- it says nothing about what else the host
+    # was doing at the time. Contamination sampling is the mechanism that
+    # covers that, not this label.
     record["timing_mode"] = args.timing_mode
     record["concurrent_workers"] = args.concurrent_workers
 
@@ -338,7 +346,7 @@ def _run_one_job(
     fallback["timing_mode"] = timing_mode
     fallback["concurrent_workers"] = concurrent_workers
     if host_before is not None and host_after is not None:
-        contamination = runner.check_contamination(host_before, host_after)
+        contamination = runner.check_contamination(host_before, host_after, concurrent_workers=concurrent_workers)
         fallback["host"] = {
             "cpu": cpu, "sibling_cpu": sibling, "affinity": [cpu],
             "before": host_before.to_dict(), "after": host_after.to_dict(),
@@ -398,10 +406,12 @@ def _run_jobs_serial(
     identity: Dict[str, Any], hard_deadline_s: Optional[float], *, concurrent_workers: int = 1,
 ) -> List[Dict[str, Any]]:
     """Run every ``(job, attempt)`` pair one at a time, each in its own fresh,
-    pinned subprocess. ``concurrent_workers`` is normally 1 here; the timing
-    subset also runs through this path with ``concurrent_workers`` set to
-    whatever ``--workers`` the campaign was otherwise given, purely for an
-    honest label (the timing subset itself is always one worker regardless).
+    pinned subprocess. This is the path both a plain ``--workers 1`` run and
+    the timing subset take (review, minor 9 -- an earlier docstring here
+    wrongly claimed the timing subset's ``concurrent_workers`` reflects the
+    campaign's own ``--workers``; it does not): every caller of this function
+    passes exactly one CPU, so ``concurrent_workers`` defaults to, and stays,
+    1, an honest label for a genuinely single-worker run either way.
     """
     records: List[Dict[str, Any]] = []
     for i, (job, attempt) in enumerate(to_run, 1):
@@ -468,6 +478,15 @@ def _run_jobs_parallel(
             except runner.Cancelled:
                 return
             except BaseException as exc:  # never let one worker's bug hang the others silently
+                # Logged immediately (review, minor 7): only the FIRST error is
+                # re-raised after every thread joins, which can be a long time on
+                # a real campaign; printing here means every failure is visible
+                # right away, not just the one that eventually propagates.
+                print(
+                    f"worker on cpu {cpu} failed on {job.cell}/{job.nonce} {job.kernel} "
+                    f"sweeps={job.sweeps} attempt={attempt}: {type(exc).__name__}: {exc}",
+                    file=sys.stderr,
+                )
                 with records_lock:
                     worker_errors.append(exc)
                 return
@@ -737,7 +756,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--hard-deadline-s", type=float, default=None,
         help="Override the size-scaled default (crash protection only; enforced by the parent, not here).",
     )
-    run_one.add_argument("--timing-mode", choices=("serial", "parallel"), default="serial")
+    run_one.add_argument(
+        "--timing-mode", choices=("serial", "parallel"), default="serial",
+        help="This run's own worker count only -- never a claim about anything else on the host.",
+    )
     run_one.add_argument("--concurrent-workers", type=int, default=1)
     run_one.set_defaults(func=cmd_run_one)
 

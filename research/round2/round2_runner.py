@@ -142,37 +142,90 @@ SIBLING_BUSY_CONTAMINATION_THRESHOLD = 0.20
 _PROC_STAT = Path("/proc/stat")
 
 
-def cpu_sibling(cpu: int) -> Optional[int]:
-    """The other logical CPU on ``cpu``'s physical core, or None with no SMT sibling."""
+def _parse_sibling_list(text: str, cpu: int) -> List[int]:
+    """Every OTHER logical CPU named in one sysfs ``..._siblings_list`` value.
+
+    Handles both the comma form (``"4,20"``, this host's shape) and the range
+    form (``"4-7"``, and mixtures of the two, ``"0-1,16-17"``) -- sysfs uses
+    range notation whenever three or more consecutive IDs share a group, which
+    a plain ``split(",")`` misparses as one huge integer (review, minor 4).
+    """
+    ids: List[int] = []
+    for part in text.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            lo, hi = part.split("-", 1)
+            ids.extend(range(int(lo), int(hi) + 1))
+        else:
+            ids.append(int(part))
+    return [i for i in ids if i != cpu]
+
+
+def cpu_siblings(cpu: int) -> List[int]:
+    """Every OTHER logical CPU on ``cpu``'s physical core (its full thread-sibling
+    set, not just the first one -- review, minor 4: more than two threads per
+    core needs the full set to group physical cores correctly). Empty with no
+    SMT sibling.
+    """
     path = Path(f"/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list")
     if not path.exists():
-        return None
-    ids = [int(x) for x in path.read_text(encoding="utf-8").strip().split(",")]
-    others = [i for i in ids if i != cpu]
-    return others[0] if others else None
+        return []
+    return _parse_sibling_list(path.read_text(encoding="utf-8").strip(), cpu)
+
+
+def cpu_sibling(cpu: int) -> Optional[int]:
+    """The other logical CPU on ``cpu``'s physical core (the first, if there is more
+    than one), or None with no SMT sibling. See :func:`cpu_siblings` for the full
+    set -- this single-value form stays the contamination sampler's own
+    interface, which only ever measures one representative sibling thread.
+    """
+    siblings = cpu_siblings(cpu)
+    return siblings[0] if siblings else None
 
 
 def select_worker_cpus(
-    n: int, *, cpus: Optional[Sequence[int]] = None,
-    allowed: Optional[Sequence[int]] = None, sibling_of: Callable[[int], Optional[int]] = cpu_sibling,
+    n: int, *, cpus: Optional[Sequence[int]] = None, allowed: Optional[Sequence[int]] = None,
+    siblings_of: Callable[[int], Sequence[int]] = cpu_siblings, avoid_cpu0: bool = True,
 ) -> List[int]:
     """``n`` logical CPUs, one per physical core, with no SMT sibling among them.
 
-    If ``cpus`` is given explicitly, validates it names no two logical CPUs on
-    the same physical core (task brief: "never pin two workers to the same
-    physical core") and returns it as given -- its length decides the worker
-    count. Otherwise chooses ``n`` cores automatically from ``allowed`` (this
+    If ``cpus`` is given explicitly, validates every entry is in the allowed
+    affinity set (review, minor 6: a bad value would otherwise only fail once
+    a job's own ``sched_setaffinity`` call does, one failure record at a
+    time), rejects an empty list (review, minor 5), and validates it names no
+    two logical CPUs on the same physical core (task brief: "never pin two
+    workers to the same physical core"). Its length then decides the worker
+    count, and it is returned as given -- including physical core 0 if named
+    explicitly; ``avoid_cpu0`` only affects the AUTOMATIC choice below.
+
+    Otherwise chooses ``n`` cores automatically from ``allowed`` (this
     process's own allowed affinity set, ``os.sched_getaffinity(0)``, by
     default), taking cores in ascending order and skipping any logical CPU
-    whose SMT sibling was already chosen. ``sibling_of`` is :func:`cpu_sibling`
-    by default; injectable for testing against a synthetic topology.
+    whose SMT sibling(s) were already chosen. With ``avoid_cpu0`` true (the
+    default), physical core 0 is never chosen automatically: it is where
+    interrupt handling lands, and may already be pinned to other work the
+    contamination check cannot see (review, must-fix 1) -- pass
+    ``avoid_cpu0=False``, or name core 0 via ``--cpus``, to use it anyway.
+    Raises if fewer than ``n`` distinct (eligible) physical cores are
+    available. ``siblings_of`` is :func:`cpu_siblings` by default; injectable
+    for testing against a synthetic topology.
     """
+    if n < 1:
+        raise ValueError(f"need at least 1 worker, got {n}")
+
     def _physical(cpu: int) -> "frozenset[int]":
-        sibling = sibling_of(cpu)
-        return frozenset({cpu} if sibling is None else {cpu, sibling})
+        return frozenset({cpu, *siblings_of(cpu)})
 
     if cpus is not None:
         cpus = list(cpus)
+        if not cpus:
+            raise ValueError("--cpus must not be empty")
+        allowed_set = set(allowed) if allowed is not None else set(os.sched_getaffinity(0))
+        outside = [cpu for cpu in cpus if cpu not in allowed_set]
+        if outside:
+            raise ValueError(f"--cpus names {outside}, which is not in the allowed affinity set {sorted(allowed_set)}")
         seen: set = set()
         for cpu in cpus:
             physical = _physical(cpu)
@@ -182,11 +235,12 @@ def select_worker_cpus(
         return cpus
 
     pool = sorted(allowed) if allowed is not None else sorted(os.sched_getaffinity(0))
+    excluded = _physical(0) if avoid_cpu0 else frozenset()
     chosen: List[int] = []
     used: set = set()
     for cpu in pool:
         physical = _physical(cpu)
-        if physical in used:
+        if physical in used or physical == excluded:
             continue
         chosen.append(cpu)
         used.add(physical)
@@ -195,7 +249,7 @@ def select_worker_cpus(
     if len(chosen) < n:
         raise ValueError(
             f"only {len(chosen)} distinct physical core(s) available in the allowed affinity set "
-            f"{pool}; need {n}"
+            f"{pool}{' (core 0 excluded by default)' if avoid_cpu0 else ''}; need {n}"
         )
     return chosen
 
@@ -270,6 +324,11 @@ class ContaminationVerdict:
     reasons: Tuple[str, ...]
     sibling_busy_fraction: Optional[float]
     thresholds: Dict[str, float]
+    loadavg_1m_raw_before: float
+    loadavg_1m_raw_after: float
+    loadavg_1m_adjusted_before: float
+    loadavg_1m_adjusted_after: float
+    concurrent_workers: int
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -277,24 +336,46 @@ class ContaminationVerdict:
             "reasons": list(self.reasons),
             "sibling_busy_fraction": self.sibling_busy_fraction,
             "thresholds": self.thresholds,
+            "loadavg_1m_raw_before": self.loadavg_1m_raw_before,
+            "loadavg_1m_raw_after": self.loadavg_1m_raw_after,
+            "loadavg_1m_adjusted_before": self.loadavg_1m_adjusted_before,
+            "loadavg_1m_adjusted_after": self.loadavg_1m_adjusted_after,
+            "concurrent_workers": self.concurrent_workers,
         }
 
 
-def check_contamination(before: HostSample, after: HostSample) -> ContaminationVerdict:
+def check_contamination(before: HostSample, after: HostSample, *, concurrent_workers: int) -> ContaminationVerdict:
     """Whether a run between ``before`` and ``after`` is contaminated, and why.
 
     Never drops a contaminated run: this only labels it, so the caller can
     keep the record and repeat the run under the same manifest (task brief,
     step 4).
+
+    ``concurrent_workers`` is subtracted from the raw loadavg before comparing
+    to the threshold (controller ruling, workers-change fix round 1): the
+    run's OWN workers are not competing load, and without this a parallel run
+    of ``N`` workers would see its raw loadavg rise by roughly ``N`` from its
+    own presence alone, mislabeling most of a large run as contaminated. This
+    is ONE formula for every ``timing_mode``, required (not defaulted) so no
+    caller can forget to pass it: a serial run (``concurrent_workers=1``) now
+    also subtracts 1, a small, deliberate departure from the exact-raw
+    comparison used before this change -- not an attempt to reproduce that
+    exact historical number, but the same rule applied uniformly. Both the
+    raw and the adjusted loadavg are recorded, alongside ``concurrent_workers``
+    and the threshold, so a record never hides which one drove the label.
     """
+    adjusted_before = before.loadavg_1m - concurrent_workers
+    adjusted_after = after.loadavg_1m - concurrent_workers
     reasons: List[str] = []
-    if before.loadavg_1m > LOADAVG_1M_CONTAMINATION_THRESHOLD:
+    if adjusted_before > LOADAVG_1M_CONTAMINATION_THRESHOLD:
         reasons.append(
-            f"loadavg_1m before ({before.loadavg_1m}) exceeds {LOADAVG_1M_CONTAMINATION_THRESHOLD}"
+            f"adjusted loadavg_1m before ({adjusted_before:.3f}, raw {before.loadavg_1m} minus "
+            f"{concurrent_workers} worker(s)) exceeds {LOADAVG_1M_CONTAMINATION_THRESHOLD}"
         )
-    if after.loadavg_1m > LOADAVG_1M_CONTAMINATION_THRESHOLD:
+    if adjusted_after > LOADAVG_1M_CONTAMINATION_THRESHOLD:
         reasons.append(
-            f"loadavg_1m after ({after.loadavg_1m}) exceeds {LOADAVG_1M_CONTAMINATION_THRESHOLD}"
+            f"adjusted loadavg_1m after ({adjusted_after:.3f}, raw {after.loadavg_1m} minus "
+            f"{concurrent_workers} worker(s)) exceeds {LOADAVG_1M_CONTAMINATION_THRESHOLD}"
         )
     sibling_busy: Optional[float] = None
     if before.sibling_cpu_times is not None and after.sibling_cpu_times is not None:
@@ -312,6 +393,11 @@ def check_contamination(before: HostSample, after: HostSample) -> ContaminationV
             "loadavg_1m_max": LOADAVG_1M_CONTAMINATION_THRESHOLD,
             "sibling_busy_max": SIBLING_BUSY_CONTAMINATION_THRESHOLD,
         },
+        loadavg_1m_raw_before=before.loadavg_1m,
+        loadavg_1m_raw_after=after.loadavg_1m,
+        loadavg_1m_adjusted_before=adjusted_before,
+        loadavg_1m_adjusted_after=adjusted_after,
+        concurrent_workers=concurrent_workers,
     )
 
 
@@ -958,7 +1044,12 @@ class ActiveProcesses:
         with self._lock:
             procs = list(self._procs)
         for proc in procs:
-            _kill_process_group(proc)
+            # A process with a known returncode has already been reaped by wait();
+            # its pid could since have been recycled by the OS. Never signal it
+            # (review, minor 5): the whole point of a pid-based kill is that the
+            # pid still names the process we think it does.
+            if proc.returncode is None:
+                _kill_process_group(proc)
 
 
 def run_subprocess_tracked(
@@ -1070,15 +1161,23 @@ def run_one_subprocess_tracked(
     attempt: int,
     registry: ActiveProcesses,
     cancelled_event: threading.Event,
+    concurrent_workers: int,
     python_exe: Optional[str] = None,
     hard_deadline_s: float = DEFAULT_HARD_DEADLINE_S,
     hard_deadline_s_override: Optional[float] = None,
-    concurrent_workers: int = 2,
 ) -> Tuple[bool, float]:
     """Like :func:`run_one_subprocess`, but for one worker thread of a parallel run
     (``timing_mode`` is always ``"parallel"`` here -- a single-worker run uses
     :func:`run_one_subprocess` instead). See :func:`run_subprocess_tracked` for the
     cross-thread cancellation semantics.
+
+    ``concurrent_workers`` is required (review, minor 7: a default here was an
+    arbitrary number with no real meaning): every caller must say explicitly
+    how many workers this run has, since it is recorded on every job's record
+    and used to adjust the contamination check. It is the size of the worker
+    POOL this run started with, not a live count of jobs actually in flight at
+    any instant -- the tail of a run, or a resume with fewer remaining jobs
+    than workers, still reports the full pool size (review, minor 8).
     """
     cmd = _run_one_cmd(
         job, bundles_root=bundles_root, out_dir=out_dir, cpu=cpu, script_path=script_path, attempt=attempt,

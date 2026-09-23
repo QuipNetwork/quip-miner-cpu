@@ -449,3 +449,26 @@ def test_parallel_run_killed_by_sigterm_leaves_no_false_completed_record(tmp_pat
     # the cancel must have actually interrupted something, or this test proves
     # nothing about the cancellation path
     assert len(completed) < len(jobs)
+
+
+def test_worker_exception_is_logged_with_job_and_cpu(tmp_path, monkeypatch, capsys):
+    # review, minor 7: a worker's real bug (not a job failure -- those already
+    # produce a normal failed record) must be visible immediately, with enough
+    # context to find it, even though only the first is re-raised after join.
+    bundles_root = tmp_path / "bundles"
+    _write_bundle(bundles_root, "native-pm1", _nonce(0))
+    job = _job()
+    out_dir = tmp_path / "out"
+
+    def fake_run_one_job(*args, **kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(cpu, "_run_one_job", fake_run_one_job)
+    with pytest.raises(RuntimeError, match="boom"):
+        cpu._run_jobs([job], bundles_root, out_dir, cpus=[0, 1])
+
+    captured = capsys.readouterr()
+    combined = captured.out + captured.err
+    assert job.nonce in combined
+    assert job.cell in combined
+    assert "boom" in combined
