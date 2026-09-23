@@ -217,6 +217,36 @@ def test_campaign_job_count(tmp_path):
     assert len(jobs) == 3 * len(runner.SWEEP_DEPTHS) * len(runner.CONTROLLED_KERNELS)
 
 
+def test_timing_subset_selects_one_model_per_cell(tmp_path):
+    rows = _five_model_index(tmp_path, "native-pm1", count=5)
+    index = _index(tmp_path, rows)
+    jobs = runner.build_timing_subset_jobs(index, ["native-pm1"])
+    nonces = {job.nonce for job in jobs}
+    assert nonces == {sorted(row["nonce"] for row in rows)[0]}
+    assert len(jobs) == len(runner.SWEEP_DEPTHS) * len(runner.CONTROLLED_KERNELS)
+
+
+def test_timing_subset_uses_a_distinct_repetition_kind_from_the_campaign(tmp_path):
+    rows = _five_model_index(tmp_path, "native-pm1", count=1)
+    index = _index(tmp_path, rows)
+    subset_jobs = runner.build_timing_subset_jobs(index, ["native-pm1"])
+    campaign_jobs = runner.build_campaign_jobs(index, ["native-pm1"])
+    assert {job.repetition_kind for job in subset_jobs} != {job.repetition_kind for job in campaign_jobs}
+
+
+def test_timing_subset_reuses_the_campaigns_seed_for_the_same_arm(tmp_path):
+    # the timing subset measures the exact same arm the campaign does, just under
+    # controlled serial conditions -- same seed, same deterministic answer.
+    rows = _five_model_index(tmp_path, "native-pm1", count=1)
+    index = _index(tmp_path, rows)
+    subset_job = runner.build_timing_subset_jobs(index, ["native-pm1"])[0]
+    matching_campaign_job = next(
+        job for job in runner.build_campaign_jobs(index, ["native-pm1"])
+        if job.kernel == subset_job.kernel and job.sweeps == subset_job.sweeps
+    )
+    assert subset_job.seed == matching_campaign_job.seed
+
+
 # ---------------------------------------------------------------- execute_cpu_job
 
 
@@ -734,3 +764,124 @@ def test_run_subprocess_with_hard_deadline_passes_a_custom_env(tmp_path):
     exit_ok, _wall_s = runner.run_subprocess_with_hard_deadline(cmd, hard_deadline_s=10.0, env=custom_env)
     assert exit_ok is True
     assert marker.read_text() == "custom-value"
+
+
+# --------------------------------------------------------- select_worker_cpus
+
+
+def _fake_siblings(pairs):
+    """A sibling_of function for a synthetic topology: pairs like {0: 16, 16: 0}."""
+    return lambda cpu: pairs.get(cpu)
+
+
+def test_select_worker_cpus_skips_smt_siblings():
+    # host shape from the change brief: cpu n and n+16 are SMT siblings
+    siblings = _fake_siblings({i: i + 16 for i in range(16)} | {i + 16: i for i in range(16)})
+    chosen = runner.select_worker_cpus(4, allowed=range(32), sibling_of=siblings)
+    assert chosen == [0, 1, 2, 3]  # ascending, never touching 16-31 until 0-15 exhausted
+    for cpu in chosen:
+        assert cpu + 16 not in chosen
+        assert cpu - 16 not in chosen
+
+
+def test_select_worker_cpus_never_doubles_up_a_physical_core():
+    siblings = _fake_siblings({0: 16, 16: 0, 1: 17, 17: 1})
+    # An allowed set that lists both members of each physical core: still only one
+    # logical CPU per physical core comes back.
+    chosen = runner.select_worker_cpus(2, allowed=[0, 16, 1, 17], sibling_of=siblings)
+    assert len(chosen) == 2
+    physical_cores = {frozenset({cpu, siblings(cpu)}) for cpu in chosen}
+    assert len(physical_cores) == 2  # two DISTINCT physical cores, not one core twice
+
+
+def test_select_worker_cpus_raises_when_not_enough_physical_cores():
+    siblings = _fake_siblings({0: 16, 16: 0})
+    with pytest.raises(ValueError, match="need 3"):
+        runner.select_worker_cpus(3, allowed=[0, 16], sibling_of=siblings)
+
+
+def test_select_worker_cpus_with_explicit_cpus_validates_distinct_physical_cores():
+    siblings = _fake_siblings({0: 16, 16: 0, 1: 17, 17: 1})
+    with pytest.raises(ValueError, match="same physical core"):
+        runner.select_worker_cpus(2, cpus=[0, 16], sibling_of=siblings)
+
+
+def test_select_worker_cpus_with_explicit_cpus_accepts_distinct_physical_cores():
+    siblings = _fake_siblings({0: 16, 16: 0, 1: 17, 17: 1})
+    chosen = runner.select_worker_cpus(2, cpus=[0, 17], sibling_of=siblings)
+    assert chosen == [0, 17]
+
+
+# ------------------------------------------------------ parallel subprocess tracking
+
+
+def test_active_processes_kill_all_kills_every_registered_process():
+    registry = runner.ActiveProcesses()
+    procs = [
+        __import__("subprocess").Popen(
+            [sys.executable, "-c", "import time; time.sleep(30)"], start_new_session=True,
+        )
+        for _ in range(3)
+    ]
+    for proc in procs:
+        registry.add(proc)
+    registry.kill_all()
+    for proc in procs:
+        proc.wait(timeout=5)
+        with pytest.raises(ProcessLookupError):
+            os.kill(proc.pid, 0)
+
+
+def test_run_subprocess_tracked_raises_cancelled_without_spawning_when_already_cancelled():
+    registry = runner.ActiveProcesses()
+    cancelled = threading.Event()
+    cancelled.set()
+    pids = []
+    with pytest.raises(runner.Cancelled):
+        runner.run_subprocess_tracked(
+            [sys.executable, "-c", "import time; time.sleep(30)"], hard_deadline_s=30.0,
+            registry=registry, cancelled_event=cancelled, on_spawn=pids.append,
+        )
+    assert pids == []  # never spawned a subprocess once already cancelled
+    assert registry.is_empty()
+
+
+def test_run_subprocess_tracked_kills_the_child_if_cancelled_races_the_spawn():
+    # Simulate the narrow window between _spawn() and registry.add(): the event
+    # becomes set only once a process already exists (via a real thread racing
+    # in), which the post-registration re-check must still catch.
+    registry = runner.ActiveProcesses()
+    cancelled = threading.Event()
+    pids = []
+
+    def set_event_on_spawn(pid):
+        pids.append(pid)
+        cancelled.set()
+
+    with pytest.raises(runner.Cancelled):
+        runner.run_subprocess_tracked(
+            [sys.executable, "-c", "import time; time.sleep(30)"], hard_deadline_s=30.0,
+            registry=registry, cancelled_event=cancelled, on_spawn=set_event_on_spawn,
+        )
+    assert len(pids) == 1
+    with pytest.raises(ProcessLookupError):
+        os.kill(pids[0], 0)
+
+
+def test_run_subprocess_tracked_returns_normally_when_not_cancelled():
+    registry = runner.ActiveProcesses()
+    cancelled = threading.Event()
+    exit_ok, wall_s = runner.run_subprocess_tracked(
+        [sys.executable, "-c", "pass"], hard_deadline_s=10.0, registry=registry, cancelled_event=cancelled,
+    )
+    assert exit_ok is True
+    assert wall_s < 10.0
+
+
+def test_run_subprocess_tracked_deregisters_the_process_when_done():
+    registry = runner.ActiveProcesses()
+    cancelled = threading.Event()
+    runner.run_subprocess_tracked(
+        [sys.executable, "-c", "pass"], hard_deadline_s=10.0, registry=registry, cancelled_event=cancelled,
+    )
+    assert registry.is_empty()

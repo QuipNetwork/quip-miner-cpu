@@ -48,10 +48,13 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import queue
+import signal
 import sys
+import threading
 from pathlib import Path
 from statistics import median
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from quip_miner_dwave import regime_io, round2_io
 
@@ -67,11 +70,6 @@ DEFAULT_P_PYTHON = "/home/carback1/quip-data/regimes/round2/reference/qportfolio
 #: round2_cpu) -- P's venv has qpo/dimod/dwave.samplers but neither of those on its own.
 DEFAULT_PORTFOLIO_PYTHONPATH = f"/home/carback1/quip-miner-dwave:{Path(__file__).resolve().parent}"
 
-#: Which physical core this runner pins every measured subprocess to.
-#: Core 4 (and its SMT sibling) is an arbitrary but fixed and documented
-#: choice, away from core 0 where most interrupt handling lands.
-DEFAULT_CPU = 4
-
 DEFAULT_CELLS = ["clique-portfolio", "cubic-dimer-pm1", "diamond-pm1", "native-125", "native-pm1"]
 
 #: Crash protection for the portfolio-deadline arm's own subprocess (finding 7:
@@ -83,6 +81,10 @@ PORTFOLIO_HARD_DEADLINE_S = 300.0
 
 def _load_index(bundles_root: Path) -> Dict[str, Any]:
     return json.loads((bundles_root / "index.json").read_text(encoding="utf-8"))
+
+
+def _parse_cpu_list(value: str) -> List[int]:
+    return [int(x) for x in value.split(",") if x.strip()]
 
 
 # ------------------------------------------------------------- attempt-based paths
@@ -254,6 +256,11 @@ def cmd_run_one(args: argparse.Namespace) -> int:
         record["host"] = None
     record["attempt"] = attempt
     record["hard_deadline_s"] = hard_deadline_s
+    # Labeled honestly (change: parallel workers, requirement 2): timing analysis
+    # must be able to tell a serially-pinned run apart from one that shared the
+    # host with other concurrent workers, without guessing from context.
+    record["timing_mode"] = args.timing_mode
+    record["concurrent_workers"] = args.concurrent_workers
 
     record_path, samples_path = _attempt_paths(out_dir, job, attempt)
     record_path.parent.mkdir(parents=True, exist_ok=True)
@@ -271,10 +278,20 @@ def cmd_run_one(args: argparse.Namespace) -> int:
 def _run_one_job(
     job: "runner.CpuJob", bundles_root: Path, out_dir: Path, cpu: Optional[int], attempt: int,
     identity: Dict[str, Any], hard_deadline_s_override: Optional[float],
+    *, concurrent_workers: int = 1,
+    registry: Optional["runner.ActiveProcesses"] = None,
+    cancelled_event: Optional["threading.Event"] = None,
 ) -> Dict[str, Any]:
     """Spawn exactly one fresh, pinned ``run-one`` subprocess for ``job``'s given
     ``attempt``, and return its record -- persisting a fallback record if the
     subprocess was killed before it could write anything at all (review finding 1).
+
+    ``registry``/``cancelled_event`` given together means this is one worker
+    thread of a parallel run (change: parallel workers): the underlying spawn is
+    then :func:`runner.run_one_subprocess_tracked`, which raises
+    :class:`runner.Cancelled` instead of returning if the parent was told to
+    cancel -- propagated here uncaught, so a cancelled job gets no record at all,
+    real or fallback (requirement 4: "writes no false completed record").
     """
     hard_deadline_s = hard_deadline_s_override
     if hard_deadline_s is None:
@@ -283,10 +300,22 @@ def _run_one_job(
     sibling = runner.cpu_sibling(cpu) if cpu is not None else None
     host_before = runner.sample_host(cpu, sibling) if cpu is not None else None
 
-    exit_ok, wall_s = runner.run_one_subprocess(
-        job, bundles_root=bundles_root, out_dir=out_dir, cpu=cpu, script_path=SCRIPT_PATH, attempt=attempt,
-        hard_deadline_s=hard_deadline_s, hard_deadline_s_override=hard_deadline_s_override,
-    )
+    if registry is not None:
+        assert cancelled_event is not None
+        exit_ok, wall_s = runner.run_one_subprocess_tracked(
+            job, bundles_root=bundles_root, out_dir=out_dir, cpu=cpu, script_path=SCRIPT_PATH, attempt=attempt,
+            registry=registry, cancelled_event=cancelled_event,
+            hard_deadline_s=hard_deadline_s, hard_deadline_s_override=hard_deadline_s_override,
+            concurrent_workers=concurrent_workers,
+        )
+        timing_mode = "parallel"
+    else:
+        exit_ok, wall_s = runner.run_one_subprocess(
+            job, bundles_root=bundles_root, out_dir=out_dir, cpu=cpu, script_path=SCRIPT_PATH, attempt=attempt,
+            hard_deadline_s=hard_deadline_s, hard_deadline_s_override=hard_deadline_s_override,
+            timing_mode="serial" if concurrent_workers == 1 else "parallel", concurrent_workers=concurrent_workers,
+        )
+        timing_mode = "serial" if concurrent_workers == 1 else "parallel"
 
     record_path, _samples_path = _attempt_paths(out_dir, job, attempt)
     if record_path.exists():
@@ -306,6 +335,8 @@ def _run_one_job(
     fallback["attempt"] = attempt
     fallback["hard_deadline_s"] = hard_deadline_s
     fallback["killed_reason"] = "hard_deadline" if not exit_ok else "no_record_written"
+    fallback["timing_mode"] = timing_mode
+    fallback["concurrent_workers"] = concurrent_workers
     if host_before is not None and host_after is not None:
         contamination = runner.check_contamination(host_before, host_after)
         fallback["host"] = {
@@ -320,24 +351,26 @@ def _run_one_job(
     return fallback
 
 
-def _run_jobs(
-    jobs: List["runner.CpuJob"], bundles_root: Path, out_dir: Path, cpu: Optional[int],
-    *, hard_deadline_s: Optional[float] = None, repeat_contaminated: bool = False,
-) -> List[Dict[str, Any]]:
-    """Run every job in ``jobs`` one at a time, each in its own fresh, pinned subprocess.
+def _jobs_needing_a_run(
+    jobs: List["runner.CpuJob"], bundles_root: Path, out_dir: Path, identity: Dict[str, Any],
+    *, hard_deadline_s: Optional[float], repeat_contaminated: bool,
+) -> Tuple[List[Tuple["runner.CpuJob", int]], List[Dict[str, Any]]]:
+    """``(to_run, already_done)``: which ``(job, attempt)`` pairs still need a fresh
+    subprocess this pass, and the already-terminal records to report as-is.
 
-    Resumable: a job whose latest attempt is already terminal (completed with its
-    samples present, explicitly unsupported, or hard-killed under this same hard
-    deadline) is skipped without spawning a subprocess.
+    Resolved entirely up front, in the (single) calling thread, before any worker
+    (serial or parallel) starts: safe by construction for parallel dispatch,
+    since each job then appears in ``to_run`` at most once and is handed to
+    exactly one worker (task brief change: "no two workers may ever take the
+    same job").
 
     ``repeat_contaminated``: only jobs whose latest attempt is a completed-but-
-    contaminated record get a new attempt; every other job (never run, or already
-    clean) is left untouched. Earlier attempts are never overwritten or deleted
-    (review finding 3).
+    contaminated record get a new attempt; every other job (never run, or
+    already clean) is left untouched. Earlier attempts are never overwritten or
+    deleted (review finding 3).
     """
-    identity = runner.solver_identity()
-    records: List[Dict[str, Any]] = []
-    considered = 0
+    to_run: List[Tuple["runner.CpuJob", int]] = []
+    already_done: List[Dict[str, Any]] = []
     for job in jobs:
         job_hard_deadline_s = hard_deadline_s if hard_deadline_s is not None else _default_hard_deadline(
             bundles_root, job,
@@ -350,22 +383,139 @@ def _run_jobs(
             latest_record = _read_validated_record(record_path, job, bundles_root, identity)
             if not _is_contaminated_and_terminal(latest_record):
                 continue
-            attempt = attempts[-1] + 1
-            existing = None
+            to_run.append((job, attempts[-1] + 1))
         else:
             existing, attempt = resolve_run(out_dir, job, bundles_root, identity, job_hard_deadline_s)
+            if existing is not None:
+                already_done.append(existing)
+            else:
+                to_run.append((job, attempt))
+    return to_run, already_done
 
-        considered += 1
-        if existing is not None:
-            records.append(existing)
-            continue
 
-        record = _run_one_job(job, bundles_root, out_dir, cpu, attempt, identity, hard_deadline_s)
+def _run_jobs_serial(
+    to_run: List[Tuple["runner.CpuJob", int]], bundles_root: Path, out_dir: Path, cpu: Optional[int],
+    identity: Dict[str, Any], hard_deadline_s: Optional[float], *, concurrent_workers: int = 1,
+) -> List[Dict[str, Any]]:
+    """Run every ``(job, attempt)`` pair one at a time, each in its own fresh,
+    pinned subprocess. ``concurrent_workers`` is normally 1 here; the timing
+    subset also runs through this path with ``concurrent_workers`` set to
+    whatever ``--workers`` the campaign was otherwise given, purely for an
+    honest label (the timing subset itself is always one worker regardless).
+    """
+    records: List[Dict[str, Any]] = []
+    for i, (job, attempt) in enumerate(to_run, 1):
+        record = _run_one_job(
+            job, bundles_root, out_dir, cpu, attempt, identity, hard_deadline_s,
+            concurrent_workers=concurrent_workers,
+        )
         records.append(record)
         print(
-            f"[{considered}/{len(jobs)}] {job.cell}/{job.nonce} {job.kernel} sweeps={job.sweeps} "
+            f"[{i}/{len(to_run)}] {job.cell}/{job.nonce} {job.kernel} sweeps={job.sweeps} "
             f"attempt={attempt}: exit_ok={record.get('exit_ok')} wall_s={record.get('wall_s')}"
         )
+    return records
+
+
+def _run_jobs_parallel(
+    to_run: List[Tuple["runner.CpuJob", int]], bundles_root: Path, out_dir: Path, cpus: Sequence[int],
+    identity: Dict[str, Any], hard_deadline_s: Optional[float],
+) -> List[Dict[str, Any]]:
+    """Run every ``(job, attempt)`` pair through a pool of ``len(cpus)`` worker
+    threads, one physical core each, one job at a time per worker.
+
+    A shared ``queue.Queue`` hands out jobs one at a time, so no two workers can
+    ever take the same job (task brief change, requirement 4). SIGTERM/SIGINT
+    install ONE handler here, in the main thread (``signal.signal`` cannot be
+    called from a worker thread), that kills every worker's currently-running
+    child via a shared :class:`runner.ActiveProcesses` registry and sets a
+    ``threading.Event`` every worker checks; a job whose subprocess was killed
+    this way raises :class:`runner.Cancelled` in its own worker thread and gets
+    no record (requirement 4: "writes no false completed record"). Once every
+    worker has stopped, a cancelled run re-raises :class:`runner.Cancelled` in
+    the main thread too, so the caller's own exit reflects the cancellation.
+    """
+    workers = len(cpus)
+    job_queue: "queue.Queue[Tuple[runner.CpuJob, int]]" = queue.Queue()
+    for item in to_run:
+        job_queue.put(item)
+    total = job_queue.qsize()
+
+    records: List[Dict[str, Any]] = []
+    records_lock = threading.Lock()
+    worker_errors: List[BaseException] = []
+    registry = runner.ActiveProcesses()
+    cancelled = threading.Event()
+
+    def handle_cancel(signum: int, _frame: Any) -> None:
+        cancelled.set()
+        registry.kill_all()
+
+    previous_term = signal.signal(signal.SIGTERM, handle_cancel)
+    previous_int = signal.signal(signal.SIGINT, handle_cancel)
+
+    def worker(cpu: int) -> None:
+        while not cancelled.is_set():
+            try:
+                job, attempt = job_queue.get_nowait()
+            except queue.Empty:
+                return
+            try:
+                record = _run_one_job(
+                    job, bundles_root, out_dir, cpu, attempt, identity, hard_deadline_s,
+                    concurrent_workers=workers, registry=registry, cancelled_event=cancelled,
+                )
+            except runner.Cancelled:
+                return
+            except BaseException as exc:  # never let one worker's bug hang the others silently
+                with records_lock:
+                    worker_errors.append(exc)
+                return
+            with records_lock:
+                records.append(record)
+                count = len(records)
+            print(
+                f"[{count}/{total}] {job.cell}/{job.nonce} {job.kernel} sweeps={job.sweeps} "
+                f"attempt={attempt} cpu={cpu}: exit_ok={record.get('exit_ok')} wall_s={record.get('wall_s')}"
+            )
+
+    threads = [threading.Thread(target=worker, args=(cpu,), name=f"round2-worker-cpu{cpu}") for cpu in cpus]
+    try:
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+    finally:
+        signal.signal(signal.SIGTERM, previous_term)
+        signal.signal(signal.SIGINT, previous_int)
+
+    if cancelled.is_set():
+        raise runner.Cancelled("the parent received a cancel signal during a parallel run")
+    if worker_errors:
+        raise worker_errors[0]
+    return records
+
+
+def _run_jobs(
+    jobs: List["runner.CpuJob"], bundles_root: Path, out_dir: Path, cpus: Sequence[Optional[int]],
+    *, hard_deadline_s: Optional[float] = None, repeat_contaminated: bool = False,
+) -> List[Dict[str, Any]]:
+    """Run every job in ``jobs``, each in its own fresh, pinned subprocess, over
+    ``len(cpus)`` workers (1 for a serial run, more for a parallel one).
+    """
+    identity = runner.solver_identity()
+    to_run, records = _jobs_needing_a_run(
+        jobs, bundles_root, out_dir, identity, hard_deadline_s=hard_deadline_s,
+        repeat_contaminated=repeat_contaminated,
+    )
+    if len(cpus) <= 1:
+        cpu = cpus[0] if cpus else None
+        records.extend(_run_jobs_serial(to_run, bundles_root, out_dir, cpu, identity, hard_deadline_s))
+    else:
+        concrete_cpus = [cpu for cpu in cpus if cpu is not None]
+        if len(concrete_cpus) != len(cpus):
+            raise ValueError("a parallel run (workers > 1) needs a real CPU for every worker, not None")
+        records.extend(_run_jobs_parallel(to_run, bundles_root, out_dir, concrete_cpus, identity, hard_deadline_s))
     return records
 
 
@@ -395,8 +545,9 @@ def cmd_pilot(args: argparse.Namespace) -> int:
     out_dir = Path(args.out_root) / "pilot"
     index = _load_index(bundles_root)
     jobs = runner.build_pilot_jobs(index, args.cells)
+    cpus = runner.select_worker_cpus(args.workers, cpus=args.cpus)
     records = _run_jobs(
-        jobs, bundles_root, out_dir, args.cpu,
+        jobs, bundles_root, out_dir, cpus,
         hard_deadline_s=args.hard_deadline_s, repeat_contaminated=args.repeat_contaminated,
     )
     _summarize(records)
@@ -405,11 +556,20 @@ def cmd_pilot(args: argparse.Namespace) -> int:
 
 def cmd_campaign(args: argparse.Namespace) -> int:
     bundles_root = Path(args.bundles_root)
-    out_dir = Path(args.out_root) / "campaign"
     index = _load_index(bundles_root)
-    jobs = runner.build_campaign_jobs(index, args.cells)
+    if args.timing_subset:
+        # Requirement 3: always exactly one worker, serial, pinned, in its own
+        # output directory -- never the quality campaign's own attempt stream.
+        out_dir = Path(args.out_root) / "timing-subset"
+        jobs = runner.build_timing_subset_jobs(index, args.cells)
+        subset_cpus = args.cpus[:1] if args.cpus else None
+        cpus = runner.select_worker_cpus(1, cpus=subset_cpus)
+    else:
+        out_dir = Path(args.out_root) / "campaign"
+        jobs = runner.build_campaign_jobs(index, args.cells)
+        cpus = runner.select_worker_cpus(args.workers, cpus=args.cpus)
     records = _run_jobs(
-        jobs, bundles_root, out_dir, args.cpu,
+        jobs, bundles_root, out_dir, cpus,
         hard_deadline_s=args.hard_deadline_s, repeat_contaminated=args.repeat_contaminated,
     )
     _summarize(records)
@@ -577,13 +737,19 @@ def build_parser() -> argparse.ArgumentParser:
         "--hard-deadline-s", type=float, default=None,
         help="Override the size-scaled default (crash protection only; enforced by the parent, not here).",
     )
+    run_one.add_argument("--timing-mode", choices=("serial", "parallel"), default="serial")
+    run_one.add_argument("--concurrent-workers", type=int, default=1)
     run_one.set_defaults(func=cmd_run_one)
 
     pilot = sub.add_parser("pilot", help="The five-model pilot.")
     pilot.add_argument("--bundles-root", default=str(DEFAULT_BUNDLES_ROOT))
     pilot.add_argument("--out-root", default=str(DEFAULT_CPU_ROOT))
     pilot.add_argument("--cells", nargs="+", default=list(DEFAULT_CELLS))
-    pilot.add_argument("--cpu", type=int, default=DEFAULT_CPU)
+    pilot.add_argument("--workers", type=int, default=1, help="Concurrent workers, one physical core each.")
+    pilot.add_argument(
+        "--cpus", type=_parse_cpu_list, default=None,
+        help="Comma-separated logical CPUs, one per physical core (overrides --workers's count).",
+    )
     pilot.add_argument("--hard-deadline-s", type=float, default=None, help="Override the size-scaled default.")
     pilot.add_argument(
         "--repeat-contaminated", action="store_true",
@@ -595,11 +761,20 @@ def build_parser() -> argparse.ArgumentParser:
     campaign.add_argument("--bundles-root", default=str(DEFAULT_BUNDLES_ROOT))
     campaign.add_argument("--out-root", default=str(DEFAULT_CPU_ROOT))
     campaign.add_argument("--cells", nargs="+", default=list(DEFAULT_CELLS))
-    campaign.add_argument("--cpu", type=int, default=DEFAULT_CPU)
+    campaign.add_argument("--workers", type=int, default=1, help="Concurrent workers, one physical core each.")
+    campaign.add_argument(
+        "--cpus", type=_parse_cpu_list, default=None,
+        help="Comma-separated logical CPUs, one per physical core (overrides --workers's count).",
+    )
     campaign.add_argument("--hard-deadline-s", type=float, default=None, help="Override the size-scaled default.")
     campaign.add_argument(
         "--repeat-contaminated", action="store_true",
         help="Only add one new attempt for jobs whose latest attempt was contaminated.",
+    )
+    campaign.add_argument(
+        "--timing-subset", action="store_true",
+        help="Run the clean serial timing subset instead of the full campaign: one model per "
+        "cell, every depth, every eligible kernel, one pinned worker, in its own output directory.",
     )
     campaign.set_defaults(func=cmd_campaign)
 

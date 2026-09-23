@@ -37,10 +37,11 @@ import resource
 import signal
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -85,6 +86,10 @@ CAMPAIGN_ORDER_SEED = 20260923
 
 REPETITION_TIMING = "timing"
 REPETITION_QUALITY = "quality"
+#: The clean serial timing subset's own repetition kind (change: parallel workers,
+#: requirement 3) -- distinct from REPETITION_TIMING so its output never collides
+#: with, or is mistaken for, a quality-campaign record of the same arm.
+REPETITION_TIMING_SUBSET = "timing-subset"
 
 # ------------------------------------------------------------- the one rule
 
@@ -145,6 +150,54 @@ def cpu_sibling(cpu: int) -> Optional[int]:
     ids = [int(x) for x in path.read_text(encoding="utf-8").strip().split(",")]
     others = [i for i in ids if i != cpu]
     return others[0] if others else None
+
+
+def select_worker_cpus(
+    n: int, *, cpus: Optional[Sequence[int]] = None,
+    allowed: Optional[Sequence[int]] = None, sibling_of: Callable[[int], Optional[int]] = cpu_sibling,
+) -> List[int]:
+    """``n`` logical CPUs, one per physical core, with no SMT sibling among them.
+
+    If ``cpus`` is given explicitly, validates it names no two logical CPUs on
+    the same physical core (task brief: "never pin two workers to the same
+    physical core") and returns it as given -- its length decides the worker
+    count. Otherwise chooses ``n`` cores automatically from ``allowed`` (this
+    process's own allowed affinity set, ``os.sched_getaffinity(0)``, by
+    default), taking cores in ascending order and skipping any logical CPU
+    whose SMT sibling was already chosen. ``sibling_of`` is :func:`cpu_sibling`
+    by default; injectable for testing against a synthetic topology.
+    """
+    def _physical(cpu: int) -> "frozenset[int]":
+        sibling = sibling_of(cpu)
+        return frozenset({cpu} if sibling is None else {cpu, sibling})
+
+    if cpus is not None:
+        cpus = list(cpus)
+        seen: set = set()
+        for cpu in cpus:
+            physical = _physical(cpu)
+            if physical in seen:
+                raise ValueError(f"--cpus names two logical CPUs on the same physical core: {cpus}")
+            seen.add(physical)
+        return cpus
+
+    pool = sorted(allowed) if allowed is not None else sorted(os.sched_getaffinity(0))
+    chosen: List[int] = []
+    used: set = set()
+    for cpu in pool:
+        physical = _physical(cpu)
+        if physical in used:
+            continue
+        chosen.append(cpu)
+        used.add(physical)
+        if len(chosen) == n:
+            break
+    if len(chosen) < n:
+        raise ValueError(
+            f"only {len(chosen)} distinct physical core(s) available in the allowed affinity set "
+            f"{pool}; need {n}"
+        )
+    return chosen
 
 
 def cpufreq_governor(cpu: int) -> Optional[str]:
@@ -385,6 +438,38 @@ def build_campaign_jobs(index: Dict[str, Any], cells: Sequence[str]) -> List[Cpu
                         )
                     )
     return _seeded_shuffle(jobs, CAMPAIGN_ORDER_SEED)
+
+
+def build_timing_subset_jobs(index: Dict[str, Any], cells: Sequence[str]) -> List[CpuJob]:
+    """A clean serial timing subset: one model per cell (the first by sorted nonce),
+    every sweep depth, every controlled kernel (change: parallel workers,
+    requirement 3).
+
+    Reuses the campaign's own seed for each arm (``variant="timing"``, the same as
+    :func:`build_campaign_jobs`): this measures the exact same arm the campaign
+    does, under controlled serial/pinned conditions, not a different one.
+    ``repetition_kind`` is :data:`REPETITION_TIMING_SUBSET`, distinct from the
+    campaign's own :data:`REPETITION_TIMING`, so the two never collide on the same
+    output path even before the orchestrator's separate output directory is
+    considered. Not shuffled: the timing subset is small enough, and run serially
+    enough, that job order carries no confound worth randomizing away.
+    """
+    jobs: List[CpuJob] = []
+    for cell in cells:
+        rows = _sorted_bundle_rows(index, cell)[:1]
+        for row in rows:
+            for sweeps in SWEEP_DEPTHS:
+                for kernel in CONTROLLED_KERNELS:
+                    variant = "timing"
+                    seed, seed_input_hash = seed_for(row["model_hash"], kernel, sweeps, CAMPAIGN_READS, variant)
+                    jobs.append(
+                        CpuJob(
+                            cell=cell, nonce=row["nonce"], kernel=kernel, sweeps=sweeps,
+                            reads=CAMPAIGN_READS, repetition_id=0, repetition_kind=REPETITION_TIMING_SUBSET,
+                            variant=variant, seed=seed, seed_input_hash=seed_input_hash,
+                        )
+                    )
+    return jobs
 
 
 # -------------------------------------------------------------- job execution
@@ -777,6 +862,22 @@ def _kill_process_group(proc: "subprocess.Popen[bytes]") -> None:
         pass
 
 
+def _spawn(cmd: Sequence[str], env: Optional[Mapping[str, str]]) -> "subprocess.Popen[bytes]":
+    return subprocess.Popen(cmd, start_new_session=True, env=dict(env) if env is not None else None)
+
+
+def _wait_with_timeout(proc: "subprocess.Popen[bytes]", hard_deadline_s: float) -> Tuple[bool, float]:
+    """Wait for ``proc``, killing its whole process group if ``hard_deadline_s`` elapses first."""
+    start = time.perf_counter()
+    try:
+        returncode = proc.wait(timeout=hard_deadline_s)
+        return returncode == 0, time.perf_counter() - start
+    except subprocess.TimeoutExpired:
+        _kill_process_group(proc)
+        proc.wait()
+        return False, time.perf_counter() - start
+
+
 def run_subprocess_with_hard_deadline(
     cmd: Sequence[str], hard_deadline_s: float,
     *, env: Optional[Mapping[str, str]] = None, on_spawn: Optional[Any] = None,
@@ -795,6 +896,10 @@ def run_subprocess_with_hard_deadline(
     which the caller must not catch -- letting it propagate means no record is ever
     written for a job the parent was told to abandon mid-run.
 
+    Serial use only: ``signal.signal`` only works on the main thread, so this must
+    never be called from a worker thread of a parallel run -- see
+    :func:`run_subprocess_tracked` for that case.
+
     ``env``, if given, replaces the child's environment outright (the caller is
     responsible for including anything the child needs, e.g. this parent's own
     ``PYTHONPATH`` when the child runs under a different interpreter, such as P's
@@ -802,8 +907,7 @@ def run_subprocess_with_hard_deadline(
     called once with the child's pid right after it starts -- a testing hook,
     never used by production callers.
     """
-    start = time.perf_counter()
-    proc = subprocess.Popen(cmd, start_new_session=True, env=dict(env) if env is not None else None)
+    proc = _spawn(cmd, env)
     if on_spawn is not None:
         on_spawn(proc.pid)
 
@@ -814,12 +918,7 @@ def run_subprocess_with_hard_deadline(
     previous_int = signal.signal(signal.SIGINT, _cancel)
     try:
         try:
-            returncode = proc.wait(timeout=hard_deadline_s)
-            return returncode == 0, time.perf_counter() - start
-        except subprocess.TimeoutExpired:
-            _kill_process_group(proc)
-            proc.wait()
-            return False, time.perf_counter() - start
+            return _wait_with_timeout(proc, hard_deadline_s)
         except Cancelled:
             _kill_process_group(proc)
             proc.wait()
@@ -827,6 +926,95 @@ def run_subprocess_with_hard_deadline(
     finally:
         signal.signal(signal.SIGTERM, previous_term)
         signal.signal(signal.SIGINT, previous_int)
+
+
+class ActiveProcesses:
+    """A thread-safe registry of currently-running child processes.
+
+    Exists because ``signal.signal()`` only works on the main thread: a parallel
+    run cannot have each worker thread install its own SIGTERM/SIGINT handler the
+    way :func:`run_subprocess_with_hard_deadline` does for a single-threaded
+    caller. Instead the orchestrator installs ONE handler, in the main thread,
+    that calls :meth:`kill_all` here to reach every worker's child at once.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._procs: "set[subprocess.Popen[bytes]]" = set()
+
+    def add(self, proc: "subprocess.Popen[bytes]") -> None:
+        with self._lock:
+            self._procs.add(proc)
+
+    def discard(self, proc: "subprocess.Popen[bytes]") -> None:
+        with self._lock:
+            self._procs.discard(proc)
+
+    def is_empty(self) -> bool:
+        with self._lock:
+            return not self._procs
+
+    def kill_all(self) -> None:
+        with self._lock:
+            procs = list(self._procs)
+        for proc in procs:
+            _kill_process_group(proc)
+
+
+def run_subprocess_tracked(
+    cmd: Sequence[str], hard_deadline_s: float, *, registry: ActiveProcesses, cancelled_event: threading.Event,
+    env: Optional[Mapping[str, str]] = None, on_spawn: Optional[Any] = None,
+) -> Tuple[bool, float]:
+    """Like :func:`run_subprocess_with_hard_deadline`, but safe to call from a
+    worker thread of a parallel run.
+
+    Installs no signal handler -- instead registers the child with ``registry``
+    so the orchestrator's single, main-thread handler can kill it alongside
+    every other worker's child, and checks ``cancelled_event`` before spawning
+    and again once the wait ends, raising :class:`Cancelled` either way. The
+    caller must not catch it: a job cancelled this way gets no record, exactly
+    as the serial path never records a job the parent was told to abandon.
+    Re-checking immediately after registering (not just before spawning) closes
+    the gap where a cancel arrives between the two: a process that was about to
+    be missed by a ``kill_all()`` sweep is killed directly instead.
+    """
+    if cancelled_event.is_set():
+        raise Cancelled("cancelled before this job's subprocess was spawned")
+    proc = _spawn(cmd, env)
+    if on_spawn is not None:
+        on_spawn(proc.pid)
+    registry.add(proc)
+    if cancelled_event.is_set():
+        _kill_process_group(proc)
+    try:
+        exit_ok, wall_s = _wait_with_timeout(proc, hard_deadline_s)
+    finally:
+        registry.discard(proc)
+    if cancelled_event.is_set():
+        raise Cancelled("cancelled while this job's subprocess was running")
+    return exit_ok, wall_s
+
+
+def _run_one_cmd(
+    job: CpuJob, *, bundles_root: PathLike, out_dir: PathLike, cpu: Optional[int], script_path: PathLike,
+    attempt: int, python_exe: Optional[str], hard_deadline_s_override: Optional[float],
+    timing_mode: str, concurrent_workers: int,
+) -> List[str]:
+    python_exe = python_exe or sys.executable
+    cmd = [
+        python_exe, str(script_path), "run-one",
+        "--job-json", json.dumps(job.to_dict()),
+        "--bundles-root", str(bundles_root),
+        "--attempt", str(attempt),
+        "--out-dir", str(out_dir),
+        "--timing-mode", timing_mode,
+        "--concurrent-workers", str(concurrent_workers),
+    ]
+    if cpu is not None:
+        cmd += ["--cpu", str(cpu)]
+    if hard_deadline_s_override is not None:
+        cmd += ["--hard-deadline-s", str(hard_deadline_s_override)]
+    return cmd
 
 
 def run_one_subprocess(
@@ -840,8 +1028,14 @@ def run_one_subprocess(
     python_exe: Optional[str] = None,
     hard_deadline_s: float = DEFAULT_HARD_DEADLINE_S,
     hard_deadline_s_override: Optional[float] = None,
+    timing_mode: str = "serial",
+    concurrent_workers: int = 1,
 ) -> Tuple[bool, float]:
     """Run one job in a fresh ``run-one`` subprocess, pinned to ``cpu``. Returns ``(exit_ok, wall_s)``.
+
+    Serial use only (a single worker) -- see :func:`run_one_subprocess_tracked` for
+    a parallel run's worker threads, which cannot each install their own signal
+    handler.
 
     ``attempt`` is the EXACT attempt number the orchestrator already decided on (via
     its own resolve/repeat-contaminated logic) and is always passed down explicitly:
@@ -858,19 +1052,40 @@ def run_one_subprocess(
     :func:`run_subprocess_with_hard_deadline` for the crash-protection and
     cancellation semantics.
     """
-    python_exe = python_exe or sys.executable
-    cmd = [
-        python_exe, str(script_path), "run-one",
-        "--job-json", json.dumps(job.to_dict()),
-        "--bundles-root", str(bundles_root),
-        "--attempt", str(attempt),
-        "--out-dir", str(out_dir),
-    ]
-    if cpu is not None:
-        cmd += ["--cpu", str(cpu)]
-    if hard_deadline_s_override is not None:
-        cmd += ["--hard-deadline-s", str(hard_deadline_s_override)]
+    cmd = _run_one_cmd(
+        job, bundles_root=bundles_root, out_dir=out_dir, cpu=cpu, script_path=script_path, attempt=attempt,
+        python_exe=python_exe, hard_deadline_s_override=hard_deadline_s_override,
+        timing_mode=timing_mode, concurrent_workers=concurrent_workers,
+    )
     return run_subprocess_with_hard_deadline(cmd, hard_deadline_s)
+
+
+def run_one_subprocess_tracked(
+    job: CpuJob,
+    *,
+    bundles_root: PathLike,
+    out_dir: PathLike,
+    cpu: Optional[int],
+    script_path: PathLike,
+    attempt: int,
+    registry: ActiveProcesses,
+    cancelled_event: threading.Event,
+    python_exe: Optional[str] = None,
+    hard_deadline_s: float = DEFAULT_HARD_DEADLINE_S,
+    hard_deadline_s_override: Optional[float] = None,
+    concurrent_workers: int = 2,
+) -> Tuple[bool, float]:
+    """Like :func:`run_one_subprocess`, but for one worker thread of a parallel run
+    (``timing_mode`` is always ``"parallel"`` here -- a single-worker run uses
+    :func:`run_one_subprocess` instead). See :func:`run_subprocess_tracked` for the
+    cross-thread cancellation semantics.
+    """
+    cmd = _run_one_cmd(
+        job, bundles_root=bundles_root, out_dir=out_dir, cpu=cpu, script_path=script_path, attempt=attempt,
+        python_exe=python_exe, hard_deadline_s_override=hard_deadline_s_override,
+        timing_mode="parallel", concurrent_workers=concurrent_workers,
+    )
+    return run_subprocess_tracked(cmd, hard_deadline_s, registry=registry, cancelled_event=cancelled_event)
 
 
 # ------------------------------------------------------- QPU deadline record

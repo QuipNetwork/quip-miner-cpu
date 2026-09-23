@@ -9,6 +9,9 @@ and the record, and a repeat of a contaminated run.
 from __future__ import annotations
 
 import json
+import os
+import signal
+import threading
 from pathlib import Path
 from typing import Any, Dict
 
@@ -202,7 +205,7 @@ def test_repeat_contaminated_only_touches_contaminated_jobs(tmp_path, monkeypatc
 
     spawned = []
 
-    def fake_run_one_job(job, bundles_root, out_dir, cpu_, attempt, identity, hard_deadline_s_override):
+    def fake_run_one_job(job, bundles_root, out_dir, cpu_, attempt, identity, hard_deadline_s_override, **_kwargs):
         spawned.append((job.nonce, job.kernel, attempt))
         return {"exit_ok": True, "unsupported": True, "cell": job.cell, "host": None}
 
@@ -210,7 +213,7 @@ def test_repeat_contaminated_only_touches_contaminated_jobs(tmp_path, monkeypatc
     monkeypatch.setattr(runner, "solver_identity", lambda: IDENTITY)
 
     cpu._run_jobs(
-        [clean_job, contaminated_job, never_run_job], bundles_root, out_dir, cpu=4, repeat_contaminated=True,
+        [clean_job, contaminated_job, never_run_job], bundles_root, out_dir, cpus=[4], repeat_contaminated=True,
     )
 
     assert spawned == [(contaminated_job.nonce, contaminated_job.kernel, 1)]
@@ -276,6 +279,7 @@ def test_cmd_run_one_writes_samples_before_the_record(tmp_path, monkeypatch):
     args = argparse.Namespace(
         job_json=json.dumps(job.to_dict()), bundles_root=str(bundles_root),
         out_dir=str(out_dir), cpu=None, attempt=None, hard_deadline_s=None,
+        timing_mode="serial", concurrent_workers=1,
     )
     cpu.cmd_run_one(args)
 
@@ -313,7 +317,7 @@ def test_repeat_contaminated_end_to_end_with_a_real_subprocess(tmp_path):
         "host": {"contaminated": True, "reasons": ["loadavg_1m before (99) exceeds 8.0"]},
     }), encoding="utf-8")
 
-    records = cpu._run_jobs([job], bundles_root, out_dir, cpu=None, repeat_contaminated=True)
+    records = cpu._run_jobs([job], bundles_root, out_dir, cpus=[None], repeat_contaminated=True)
 
     assert len(records) == 1
     record = records[0]
@@ -326,3 +330,122 @@ def test_repeat_contaminated_end_to_end_with_a_real_subprocess(tmp_path):
     assert attempt0_path.exists()  # untouched
     assert attempt1_path.exists()
     assert json.loads(attempt1_path.read_text())["attempt"] == 1
+
+
+# ------------------------------------------------- change: parallel workers
+
+
+def test_cmd_run_one_records_timing_mode_and_concurrent_workers(tmp_path):
+    import argparse
+
+    bundles_root = tmp_path / "bundles"
+    _write_bundle(bundles_root, "native-pm1", _nonce(0))
+    job = _job()
+    out_dir = tmp_path / "out"
+
+    args = argparse.Namespace(
+        job_json=json.dumps(job.to_dict()), bundles_root=str(bundles_root),
+        out_dir=str(out_dir), cpu=None, attempt=None, hard_deadline_s=None,
+        timing_mode="parallel", concurrent_workers=4,
+    )
+    cpu.cmd_run_one(args)
+
+    record_path, _ = cpu._attempt_paths(out_dir, job, 0)
+    record = json.loads(record_path.read_text())
+    assert record["timing_mode"] == "parallel"
+    assert record["concurrent_workers"] == 4
+
+
+def test_cmd_run_one_defaults_to_serial_with_one_worker(tmp_path):
+    import argparse
+
+    bundles_root = tmp_path / "bundles"
+    _write_bundle(bundles_root, "native-pm1", _nonce(0))
+    job = _job()
+    out_dir = tmp_path / "out"
+
+    args = argparse.Namespace(
+        job_json=json.dumps(job.to_dict()), bundles_root=str(bundles_root),
+        out_dir=str(out_dir), cpu=None, attempt=None, hard_deadline_s=None,
+        timing_mode="serial", concurrent_workers=1,
+    )
+    cpu.cmd_run_one(args)
+
+    record_path, _ = cpu._attempt_paths(out_dir, job, 0)
+    record = json.loads(record_path.read_text())
+    assert record["timing_mode"] == "serial"
+    assert record["concurrent_workers"] == 1
+
+
+# ------------------------------------------------- change: parallel workers, real runs
+
+
+def test_parallel_run_end_to_end_with_real_subprocesses(tmp_path):
+    bundles_root = tmp_path / "bundles"
+    jobs = []
+    for i in range(4):
+        nonce = _nonce(i)
+        _write_bundle(bundles_root, "native-pm1", nonce)
+        jobs.append(_job(nonce=nonce, kernel="cpu-msa-unit", sweeps=512))
+    out_dir = tmp_path / "out"
+
+    records = cpu._run_jobs(jobs, bundles_root, out_dir, cpus=[0, 1])
+
+    assert len(records) == 4
+    assert all(r["exit_ok"] for r in records)
+    assert all(r["timing_mode"] == "parallel" for r in records)
+    assert all(r["concurrent_workers"] == 2 for r in records)
+    # every job actually ran exactly once, at attempt 0
+    for job in jobs:
+        record_path, _ = cpu._attempt_paths(out_dir, job, 0)
+        assert record_path.exists()
+        assert not cpu._attempt_paths(out_dir, job, 1)[0].exists()
+
+
+def test_parallel_run_is_resumable_like_the_serial_path(tmp_path):
+    bundles_root = tmp_path / "bundles"
+    jobs = []
+    for i in range(2):
+        nonce = _nonce(i)
+        _write_bundle(bundles_root, "native-pm1", nonce)
+        jobs.append(_job(nonce=nonce, kernel="cpu-msa-unit", sweeps=512))
+    out_dir = tmp_path / "out"
+
+    cpu._run_jobs(jobs, bundles_root, out_dir, cpus=[0, 1])
+    # a second parallel pass over the same jobs must resume, not re-run
+    second = cpu._run_jobs(jobs, bundles_root, out_dir, cpus=[0, 1])
+    assert len(second) == 2
+    for job in jobs:
+        assert not cpu._attempt_paths(out_dir, job, 1)[0].exists()
+
+
+def test_parallel_run_killed_by_sigterm_leaves_no_false_completed_record(tmp_path):
+    bundles_root = tmp_path / "bundles"
+    jobs = []
+    for i in range(16):
+        nonce = _nonce(i)
+        _write_bundle(bundles_root, "native-pm1", nonce)
+        jobs.append(_job(nonce=nonce, kernel="cpu-msa-unit", sweeps=512))
+    out_dir = tmp_path / "out"
+
+    timer = threading.Timer(0.05, lambda: os.kill(os.getpid(), signal.SIGTERM))
+    timer.start()
+    try:
+        with pytest.raises(runner.Cancelled):
+            cpu._run_jobs(jobs, bundles_root, out_dir, cpus=[0, 1])
+    finally:
+        timer.cancel()
+
+    completed = []
+    for job in jobs:
+        record_path, _ = cpu._attempt_paths(out_dir, job, 0)
+        if record_path.exists():
+            record = json.loads(record_path.read_text())
+            # every record that exists is a real, honest completion -- never a
+            # false "completed" fabricated for a job the parent abandoned.
+            assert record["exit_ok"] is True
+            assert record.get("killed_reason") is None
+            completed.append(record)
+    # the cancel must have actually interrupted something, or this test proves
+    # nothing about the cancellation path
+    assert len(completed) < len(jobs)
