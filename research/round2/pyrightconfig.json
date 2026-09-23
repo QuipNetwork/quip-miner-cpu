@@ -1,0 +1,9 @@
+{
+  "venvPath": "/home/carback1/quip-miner-dwave",
+  "venv": ".venv",
+  "stubPath": "/home/carback1/quip-miner-dwave/typings",
+  "extraPaths": [
+    "/home/carback1/quip-miner-dwave",
+    "/home/carback1/quip-miner-cpu/research/round2"
+  ]
+}
