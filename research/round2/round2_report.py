@@ -124,9 +124,11 @@ def load_cpu_records(run_dir: Path, cell: str) -> List[Dict[str, Any]]:
         if clean_attempts:
             clean_record = clean_attempts[max(clean_attempts)][0]
             if clean_record is not quality_record:
-                for field in ("wall_s", "host", "timing_mode", "concurrent_workers"):
-                    if field in clean_record:
-                        record[field] = clean_record[field]
+                for field in (
+                    "wall_s", "elapsed_sampling_s", "setup_s", "graph_setup_s",
+                    "host", "timing_mode", "concurrent_workers",
+                ):
+                    record[field] = clean_record.get(field)
         records.append(record)
     return records
 
@@ -831,15 +833,25 @@ def next_test_section(
         )
         if cell in captured:
             established += " Real, manifest-verified physical-scale QPU captures also exist for this cell."
-            unresolved = (
-                "The 12-model physical-scale pilot pairs against only this cell's own CPU pilot models so "
-                "far (see the QPU wins/ties/losses and paired-gaps tables). It earns no regime verdict on "
-                "its own."
-            )
-            next_control = (
-                "Extend the paired QPU/CPU comparison to the full CPU campaign once it finishes, and decide "
-                "whether this regime's next round needs a wider physical-scale capture."
-            )
+            if run == "campaign":
+                unresolved = (
+                    "The 12-model physical-scale pilot pairs against this cell's loaded CPU campaign models "
+                    "(see the QPU wins/ties/losses and paired-gaps tables). It earns no regime verdict on its own."
+                )
+                next_control = (
+                    "Review the paired results against the loaded CPU campaign, then decide whether this "
+                    "regime's next round needs a wider physical-scale capture."
+                )
+            else:
+                unresolved = (
+                    "The 12-model physical-scale pilot pairs against only this cell's own CPU pilot models so "
+                    "far (see the QPU wins/ties/losses and paired-gaps tables). It earns no regime verdict on "
+                    "its own."
+                )
+                next_control = (
+                    "Extend the paired QPU/CPU comparison to the full CPU campaign once it finishes, and decide "
+                    "whether this regime's next round needs a wider physical-scale capture."
+                )
         elif cell in arms_by_cell:
             unresolved = (
                 "No Round 2 QPU capture exists yet for this cell. The physical-scale pilot (12 sorted "
@@ -1430,7 +1442,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Optional[List[str]] = None) -> int:
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if (args.qpu_root is not None) != (args.physical_capture_manifest is not None):
+        parser.error("--qpu-root and --physical-capture-manifest must be supplied together")
     cpu_root = Path(args.cpu_root)
     run_dir = cpu_root / args.run
     depths = args.depths or (list(PILOT_DEPTHS) if args.run == "pilot" else list(FULL_DEPTHS))

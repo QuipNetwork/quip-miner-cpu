@@ -714,6 +714,10 @@ def test_seeded_sweep_record_carries_start_betas_solver_identity_and_run_key(tmp
     hot, cold = record["beta_range"]
     assert record["seeded_start_beta"] == pytest.approx((hot * cold) ** 0.5)
     assert record["cold_start_beta"] == pytest.approx(hot)
+    np.testing.assert_allclose(
+        record["seeded_beta_ladder"], np.geomspace((hot * cold) ** 0.5, cold, runner.SEEDED_SWEEPS),
+    )
+    np.testing.assert_allclose(record["cold_beta_ladder"], np.geomspace(hot, cold, runner.SEEDED_SWEEPS))
     assert record["solver_identity"]["package"] == "quip_msa"
     assert record["cold_seed"] != record["seed"]
     assert isinstance(record["run_key"], str) and record["run_key"]

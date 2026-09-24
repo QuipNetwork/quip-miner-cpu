@@ -348,6 +348,54 @@ def test_load_cpu_records_keeps_an_earlier_clean_timing_when_the_latest_success_
     assert records[0]["host"]["contaminated"] is False  # the clean attempt's own host sample
 
 
+def test_load_cpu_records_keeps_sampling_time_from_the_same_clean_attempt(tmp_path):
+    cell_dir = tmp_path / "native-pm1"
+    clean = _cpu_record("native-pm1", "aa", "cpu-sa", 512, best_energy=-5.0, wall_s=1.0)
+    clean.update(host={"contaminated": False}, elapsed_sampling_s=1.0)
+    _write_attempt(cell_dir, "aa", "cpu-sa", 512, 0, clean)
+    contaminated = _cpu_record("native-pm1", "aa", "cpu-sa", 512, best_energy=-5.5, wall_s=20.0)
+    contaminated.update(host={"contaminated": True}, elapsed_sampling_s=20.0)
+    _write_attempt(cell_dir, "aa", "cpu-sa", 512, 1, contaminated)
+
+    records = report.load_cpu_records(tmp_path, "native-pm1")
+
+    assert records[0]["best_energy"] == -5.5
+    assert records[0]["wall_s"] == 1.0
+    assert records[0]["elapsed_sampling_s"] == 1.0
+
+
+@pytest.mark.parametrize("option", ["--qpu-root", "--physical-capture-manifest"])
+def test_main_rejects_an_incomplete_qpu_capture_option_pair(tmp_path, monkeypatch, option):
+    cpu_root = tmp_path / "cpu"
+    out_dir = tmp_path / "report"
+    argv = ["round2_report.py", "--cpu-root", str(cpu_root), "--out-dir", str(out_dir)]
+    argv.extend([option, str(tmp_path / "capture-input")])
+    monkeypatch.setattr("sys.argv", argv)
+
+    with pytest.raises(SystemExit) as exc:
+        report.main()
+
+    assert exc.value.code == 2
+
+
+@pytest.mark.parametrize(
+    ("run", "expected_text", "unexpected_text"),
+    [
+        ("pilot", "CPU pilot models", "full CPU campaign once it finishes"),
+        ("campaign", "CPU campaign models", "full CPU campaign once it finishes"),
+    ],
+)
+def test_captured_cell_status_matches_the_loaded_run(run, expected_text, unexpected_text):
+    lines = report.next_test_section(
+        ["native-pm1"], {"native-pm1": []}, None, run, captured_regimes={"native-pm1"},
+    )
+    status = "\n".join(lines)
+
+    assert expected_text in status
+    if run == "campaign":
+        assert unexpected_text not in status
+
+
 def test_depth_quality_time_table_handles_an_empty_arm(tmp_path):
     records_by_cell = {"native-pm1": []}
     lines = report.depth_quality_time_table(records_by_cell, kernels=("cpu-sa",), depths=(512,))

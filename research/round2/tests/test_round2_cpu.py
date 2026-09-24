@@ -197,6 +197,34 @@ def test_fallback_record_is_crashed_no_record_when_the_child_exits_before_the_de
     assert record["killed_reason"] == "crashed_no_record"
 
 
+def test_portfolio_deadline_fallback_classifies_an_early_child_exit_as_failed_and_records_provenance(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setattr(
+        cpu.runner, "run_subprocess_with_hard_deadline",
+        lambda cmd, hard_deadline_s, **kwargs: (False, 0.01),
+    )
+    monkeypatch.setattr(
+        cpu.runner, "_portfolio_deadline_provenance",
+        lambda: {"p_head": None, "package_versions": {"qpo": None}},
+    )
+    import argparse
+
+    args = argparse.Namespace(
+        out_root=str(tmp_path / "cpu"), p_python="fake-python", pythonpath="", hard_deadline_s=5.0,
+    )
+    assert cpu.cmd_portfolio_deadline(args) == 0
+    records = [
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in sorted((Path(args.out_root) / "portfolio-deadline").glob("n*-k*-*.json"))
+    ]
+    assert records
+    assert all(record["status"] == "failed" for record in records)
+    assert all(record["p_head"] is None for record in records)
+    assert all(record["package_versions"] == {"qpo": None} for record in records)
+    assert all(record["provenance_error"] for record in records)
+
+
 def test_crashed_no_record_fallback_is_never_terminal(tmp_path):
     bundles_root = tmp_path / "bundles"
     _write_bundle(bundles_root, "native-pm1", _nonce(0))
@@ -630,3 +658,5 @@ def test_portfolio_deadline_hard_kill_in_the_parent_is_a_timeout_not_a_failure(t
         record = json.loads(record_path.read_text(encoding="utf-8"))
         assert record["status"] == "timeout"
         assert record["exit_ok"] is False
+        assert "p_head" in record
+        assert "package_versions" in record

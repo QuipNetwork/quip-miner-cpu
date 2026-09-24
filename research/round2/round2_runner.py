@@ -1614,6 +1614,8 @@ def execute_seeded_sweep_job(
     hot, cold = beta_range
     seeded_start_beta = math.sqrt(hot * cold)
     cold_start_beta = hot  # the unseeded call's own default: the full ladder starts hot.
+    seeded_beta_ladder = np.geomspace(seeded_start_beta, cold, sweeps)
+    cold_beta_ladder = np.geomspace(cold_start_beta, cold, sweeps)
     record: Dict[str, Any] = {
         "schema": "round2-seeded-sweep-v2",
         "cell": cell, "nonce": nonce, "model_hash": manifest["hash"], "seed_source": seed_source,
@@ -1623,6 +1625,7 @@ def execute_seeded_sweep_job(
         "unique_seed_lanes": lanes["unique_lanes"], "duplicate_seed_lanes": lanes["duplicate_lanes"],
         "beta_range": [float(hot), float(cold)],
         "seeded_start_beta": float(seeded_start_beta), "cold_start_beta": float(cold_start_beta),
+        "seeded_beta_ladder": seeded_beta_ladder.tolist(), "cold_beta_ladder": cold_beta_ladder.tolist(),
         "solver_identity": identity, "run_key": run_key,
     }
 

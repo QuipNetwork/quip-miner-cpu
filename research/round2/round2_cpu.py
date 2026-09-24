@@ -754,17 +754,23 @@ def cmd_portfolio_deadline(args: argparse.Namespace) -> int:
             if out_path.exists():
                 record = json.loads(out_path.read_text(encoding="utf-8"))
             else:
-                # A hard kill in the parent is "timeout", not "failed" (review finding
-                # I5): the hard deadline is always well above the application deadline
-                # (PORTFOLIO_HARD_DEADLINE_S > PORTFOLIO_DEADLINE_S), so by the time the
-                # parent gives up on the child, the run was certainly already late --
-                # exit_ok stays False (the child never actually returned), but the
-                # classification reflects what is actually known.
+                timed_out = wall_s >= args.hard_deadline_s
+                provenance = runner._portfolio_deadline_provenance()
+                unavailable = provenance["p_head"] is None or any(
+                    provenance["package_versions"].get(name) is None
+                    for name in ("qpo", "dimod", "dwave-samplers")
+                )
                 record = {
                     "schema": "round2-portfolio-deadline-v1", "n_assets": n, "cardinality_k": k,
                     "beta_label": beta_label, "provenance": runner.PORTFOLIO_PROVENANCE, "exit_ok": False,
-                    "error": f"hard subprocess deadline exceeded ({args.hard_deadline_s:.1f}s); exit_ok={exit_ok}",
-                    "elapsed_s": wall_s, "repair_s": None, "end_to_end_s": wall_s, "status": "timeout",
+                    "error": (
+                        f"hard subprocess deadline exceeded ({args.hard_deadline_s:.1f}s); exit_ok={exit_ok}"
+                        if timed_out else f"child exited without writing a record; exit_ok={exit_ok}"
+                    ),
+                    "elapsed_s": wall_s, "repair_s": None, "end_to_end_s": wall_s,
+                    "status": "timeout" if timed_out else "failed",
+                    "p_head": provenance["p_head"], "package_versions": provenance["package_versions"],
+                    "provenance_error": "parent could not resolve all P provenance fields" if unavailable else None,
                 }
                 regime_io.atomic_write_json(out_path, record)
             records.append(record)
