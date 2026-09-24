@@ -511,6 +511,47 @@ def _pad_range(low: float, high: float, fraction: float = 0.12) -> Tuple[float, 
     return low - pad, high + pad
 
 
+def _axis_ticks(low: float, high: float, count: int = 5) -> List[float]:
+    """``count`` evenly spaced values from ``low`` to ``high``, inclusive of both
+    endpoints (fix round 2: "the y axis shows only two end ticks" -- a chart
+    with only its extremes labeled cannot show a reader anything about the
+    values between them).
+    """
+    if count < 2 or high <= low:
+        return [low, high]
+    step = (high - low) / (count - 1)
+    return [low + i * step for i in range(count)]
+
+
+def _tick_text(value: float) -> str:
+    """An axis tick's own label: more precision than a table cell's :func:`fmt`,
+    so adjacent ticks read as distinct numbers rather than both rounding to
+    the same 3-significant-figure text (fix round 2: "-1.43e+04 and
+    -1.44e+04" read as barely different at the old precision).
+    """
+    return f"{value:.6g}"
+
+
+def _chart_header(title: str, subtitle: str, width: int, left_margin: int = 10) -> Tuple[str, int]:
+    """The title and word-wrapped subtitle of a bar chart, plus the y coordinate
+    the chart's own content should start at.
+
+    A bar chart's canvas width comes from its bars and value labels, never
+    from its subtitle's length, so an unwrapped subtitle can run well past
+    the right edge (fix round 2: "the subtitle is clipped at the right
+    edge"). Wrapping it against the ALREADY-DECIDED canvas width, and
+    returning where the subtitle ends, lets every bar-chart function grow
+    its own height to fit rather than guessing a fixed offset.
+    """
+    parts = [f'<text x="{left_margin}" y="20" font-size="16" font-weight="bold">{title}</text>']
+    max_chars = max(20, int((width - 2 * left_margin) / (12 * 0.6)))
+    y = 38
+    for line in _wrap_lines(subtitle, max_chars):
+        parts.append(f'<text x="{left_margin}" y="{y}" font-size="12">{line}</text>')
+        y += 15
+    return "".join(parts), y + 12
+
+
 def quality_time_figure(
     cell: str, records: Sequence[Dict[str, Any]], kernels: Sequence[str], depths: Sequence[int],
 ) -> str:
@@ -594,26 +635,31 @@ def quality_time_figure(
                 f'<circle cx="{x:.1f}" cy="{y:.1f}" r="6" fill="{colors[kernel]}" fill-opacity="0.85">'
                 f'<title>{kernel} @ {sweeps} sweeps: median wall {wall_s:.3g} s, '
                 f'median best energy {energy:.6g}, n={n}</title></circle>'
-                f'<text x="{x + 9:.1f}" y="{y - 8:.1f}" font-size="9" fill="#333333">n={n}</text>'
+                # The sweep count is part of the visible label, not only the kernel's
+                # count (fix round 2: "nothing says which depth is which" when a
+                # kernel has one point per depth and both only ever said "n=15").
+                f'<text x="{x + 9:.1f}" y="{y - 8:.1f}" font-size="9" fill="#333333">{sweeps} sw, n={n}</text>'
             )
 
-        # Tick values (the raw wall-time and energy extremes) and axis titles,
-        # both visible directly on the image, not only in the caption's prose.
-        body_parts.append(f'<text x="{margin}" y="{height - margin + 16}" font-size="10">{fmt(min(raw_wall))}</text>')
-        body_parts.append(
-            f'<text x="{width - margin}" y="{height - margin + 16}" font-size="10" text-anchor="end">'
-            f'{fmt(max(raw_wall))}</text>'
-        )
+        # At least 5 tick values on each axis, not only the two extremes (fix
+        # round 2: "the y axis shows only two end ticks ... show at least 3-5
+        # ticks, at a precision that separates them"; "the x axis shows only
+        # its end values"), plus the axis titles.
+        for tick in _axis_ticks(x_min, x_max, count=5):
+            tick_x = margin + (tick - x_min) / x_span * (width - 2 * margin)
+            body_parts.append(
+                f'<text x="{tick_x:.1f}" y="{height - margin + 16}" font-size="10" text-anchor="middle">'
+                f'{_tick_text(10 ** tick)}</text>'
+            )
         body_parts.append(
             f'<text x="{(margin + width - margin) / 2:.0f}" y="{height - margin + 32}" font-size="11" '
             'text-anchor="middle">Median wall time (s), log scale</text>'
         )
-        body_parts.append(
-            f'<text x="{margin - 6}" y="{plot_top + 4}" font-size="10" text-anchor="end">{fmt(max(raw_energy))}</text>'
-        )
-        body_parts.append(
-            f'<text x="{margin - 6}" y="{height - margin}" font-size="10" text-anchor="end">{fmt(min(raw_energy))}</text>'
-        )
+        for tick in _axis_ticks(y_min, y_max, count=5):
+            tick_y = height - margin - (tick - y_min) / y_span * plot_height
+            body_parts.append(
+                f'<text x="{margin - 6}" y="{tick_y + 3:.1f}" font-size="10" text-anchor="end">{_tick_text(tick)}</text>'
+            )
         y_title_pos = (plot_top + height - margin) / 2
         body_parts.append(
             f'<text x="{margin - 55}" y="{y_title_pos:.0f}" font-size="11" text-anchor="middle" '
@@ -626,19 +672,23 @@ def quality_time_figure(
 
 def _bar_chart(title: str, subtitle: str, bars: Sequence[Tuple[str, float]], value_label: str) -> str:
     bar_area = 260
-    margin_left = 240
-    top = 70
-    height = 90 + 34 * max(len(bars), 1)
-    header = (
-        f'<text x="10" y="20" font-size="16" font-weight="bold">{title}</text>'
-        f'<text x="10" y="40" font-size="12">{subtitle}</text>'
-    )
     if not bars:
         width = 640
-        return _svg_document(width, height, header + f'<text x="10" y="{top + 20}" font-size="14">No data available.</text>')
+        header, top = _chart_header(title, subtitle, width)
+        height = top + 30
+        return _svg_document(width, height, header + f'<text x="10" y="{top + 10}" font-size="14">No data available.</text>')
     value_texts = [f"{value:.4g} {value_label}" for _, value in bars]
+    # Wide enough that even a zero-width bar's value label -- which starts right
+    # after the bar, at ``margin_left`` -- can never land on top of the longest
+    # category label (fix round 2: a real render showed "feasible)0 raw
+    # feasible reads" fused together when a long category label met a
+    # zero-width bar).
+    category_width = int(max(_text_width_estimate(label) for label, _ in bars))
+    margin_left = max(240, 30 + category_width)
     margin_right = int(max(_text_width_estimate(text) for text in value_texts)) + 20
     width = margin_left + bar_area + margin_right
+    header, top = _chart_header(title, subtitle, width)
+    height = top + 34 * len(bars) + 20
     max_value = max(abs(value) for _, value in bars) or 1.0
     body_parts = []
     for i, ((label, value), value_text) in enumerate(zip(bars, value_texts)):
@@ -662,21 +712,34 @@ def _signed_bar_chart(title: str, subtitle: str, bars: Sequence[Tuple[str, float
     the baseline in :data:`_NEGATIVE_COLOR`, a positive one to the right in
     :data:`_POSITIVE_COLOR`, and the printed value always carries an explicit
     sign (``+`` or ``-``). Never draws ``abs(value)`` as an unsigned magnitude.
+
+    ``margin_left`` is sized from the WIDEST category label plus the WIDEST
+    negative value label, not a fixed constant: a negative bar's own value
+    label sits at its tip, to the left of the zero baseline, and at a large
+    enough bar width that label's left edge can reach back past a fixed
+    margin into the category column (fix round 2: "a negative-value label
+    collides with the category label"). Sizing the margin from both widths
+    together guarantees the two can never overlap, at any bar width.
     """
     half_width = 200
-    margin_left = 260
-    top = 70
-    height = 90 + 34 * max(len(bars), 1)
-    header = (
-        f'<text x="10" y="20" font-size="16" font-weight="bold">{title}</text>'
-        f'<text x="10" y="40" font-size="12">{subtitle}</text>'
-    )
     if not bars:
-        width = margin_left + 2 * half_width + 100
-        return _svg_document(width, height, header + f'<text x="10" y="{top + 20}" font-size="14">No data available.</text>')
+        width = 260 + 2 * half_width + 100
+        header, top = _chart_header(title, subtitle, width)
+        height = top + 30
+        return _svg_document(width, height, header + f'<text x="10" y="{top + 10}" font-size="14">No data available.</text>')
     value_texts = [f"{value:+.4g} {value_label}" for _, value in bars]
-    label_margin = int(max(_text_width_estimate(text) for text in value_texts)) + 20
+    category_width = int(max(_text_width_estimate(label) for label, _ in bars))
+    negative_value_width = int(max(
+        (_text_width_estimate(text) for (_, value), text in zip(bars, value_texts) if value < 0), default=0,
+    ))
+    margin_left = max(120, 40 + category_width + negative_value_width)
+    positive_value_width = int(max(
+        (_text_width_estimate(text) for (_, value), text in zip(bars, value_texts) if value >= 0), default=0,
+    ))
+    label_margin = positive_value_width + 20
     width = margin_left + 2 * half_width + label_margin
+    header, top = _chart_header(title, subtitle, width)
+    height = top + 34 * len(bars) + 20
     max_abs = max(abs(value) for _, value in bars) or 1.0
     baseline_x = margin_left + half_width
     body_parts = [

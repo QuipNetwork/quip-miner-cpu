@@ -642,9 +642,11 @@ def test_quality_time_figure_prints_visible_axis_titles_and_tick_values():
     joined = " ".join(texts)
     assert "wall time" in joined.lower()
     assert "best energy" in joined.lower()
-    # The raw tick values (not just normalized positions) are visible.
-    assert any("100" in t or "-100" in t for t in texts)
-    assert any("110" in t or "-110" in t for t in texts)
+    # The (padded) tick values are visible, printed at axis precision, not just
+    # implied by point position (see the dedicated intermediate-tick tests for
+    # the exact set fix round 2 requires).
+    y_low, y_high = report._pad_range(-110.0, -100.0)
+    assert any(report._tick_text(t) in texts for t in report._axis_ticks(y_low, y_high, count=5))
 
 
 def test_quality_time_figure_prints_the_sample_count_outside_any_tooltip():
@@ -687,3 +689,119 @@ def test_quality_time_figure_wraps_a_long_caption_within_the_canvas():
 def test_quality_time_figure_handles_no_completed_points():
     svg = report.quality_time_figure("native-pm1", [], ["cpu-sa"], [512])
     assert "No completed arms to plot" in svg
+
+
+# ============================================== fix round 2: figure defects
+
+
+def test_quality_time_figure_labels_each_point_with_its_sweep_count():
+    records = _energy_points("native-pm1", "cpu-sa", [(512, -100.0, 1.0), (2048, -110.0, 4.0)])
+    svg = report.quality_time_figure("native-pm1", records, ["cpu-sa"], [512, 2048])
+    texts = [t for _, _, t in _svg_text_elements(svg)]
+    assert any("512 sw" in t for t in texts)
+    assert any("2048 sw" in t for t in texts)
+
+
+def test_quality_time_figure_prints_intermediate_y_axis_ticks():
+    records = _energy_points("native-pm1", "cpu-sa", [(512, -14270.0, 0.136), (2048, -14364.0, 7.05)])
+    svg = report.quality_time_figure("native-pm1", records, ["cpu-sa"], [512, 2048])
+    texts = [t for _, _, t in _svg_text_elements(svg)]
+    y_low, y_high = report._pad_range(-14364.0, -14270.0)
+    y_ticks = report._axis_ticks(y_low, y_high, count=5)
+    y_texts = {report._tick_text(t) for t in y_ticks}
+    assert len(y_texts) >= 4  # distinct at this precision, not just the two extremes
+    for text in y_texts:
+        assert text in texts
+
+
+def test_quality_time_figure_prints_intermediate_x_axis_ticks():
+    records = _energy_points("native-pm1", "cpu-sa", [(512, -100.0, 0.1), (2048, -110.0, 10.0)])
+    svg = report.quality_time_figure("native-pm1", records, ["cpu-sa"], [512, 2048])
+    texts = [t for _, _, t in _svg_text_elements(svg)]
+    log_low, log_high = report._pad_range(math.log10(0.1), math.log10(10.0))
+    x_ticks = [10 ** t for t in report._axis_ticks(log_low, log_high, count=5)]
+    x_texts = {report._tick_text(t) for t in x_ticks}
+    assert len(x_texts) >= 4
+    for text in x_texts:
+        assert text in texts
+
+
+def test_axis_ticks_always_includes_both_endpoints():
+    ticks = report._axis_ticks(0.0, 8.0, count=5)
+    assert ticks[0] == 0.0
+    assert ticks[-1] == 8.0
+    assert len(ticks) == 5
+
+
+def test_portfolio_figure_negative_label_never_overlaps_the_category_column():
+    # The controller's rendered defect: "beta-zero-0.0002212 objective" reads as
+    # one run of text because the negative label's anchor="end" left edge, at a
+    # near-max bar width, extended back into the category column.
+    records = [
+        {"n_assets": 18, "cardinality_k": 6, "beta_label": "beta-zero", "objective": 0.0001127},
+        {"n_assets": 28, "cardinality_k": 9, "beta_label": "beta-zero", "objective": -0.0002212},
+    ]
+    svg = report.portfolio_figure(records)
+    elements = _svg_text_elements(svg)
+    category_x, _, category_text = next(e for e in elements if e[2] == "n=28 k=9 beta-zero")
+    neg_x, _, neg_text = next(e for e in elements if e[2].startswith("-0.0002212"))
+    category_right_edge = category_x + report._text_width_estimate(category_text)
+    negative_left_edge = neg_x - report._text_width_estimate(neg_text)  # anchor="end": x is the right edge
+    assert negative_left_edge > category_right_edge
+
+
+def test_physical_scale_figure_subtitle_wraps_within_the_canvas():
+    proposal = {
+        "arms": [{"regime": "diamond-pm1", "anneal_us": 80, "captures": 36, "reads_per_capture": 64}],
+        "approval": "pending",
+        "physical_scales": "50%,75%,100% of audited legal scale ceiling; logical coefficients preserved",
+    }
+    svg = report.physical_scale_figure(proposal)
+    width, _ = _canvas_size(svg)
+    for x, _, text in _svg_text_elements(svg):
+        if not text:
+            continue
+        assert x + len(text) * 12 * 0.6 <= width, f"text {text!r} at x={x} overflows a {width}px canvas"
+
+
+def test_portfolio_repair_figure_subtitle_wraps_within_the_canvas():
+    records = [
+        {
+            "n_assets": 18, "cardinality_k": 6, "beta_label": "beta-zero",
+            "raw_feasible_count": 3, "returned_reads": 500, "feasible": True,
+        },
+    ]
+    svg = report.portfolio_repair_figure(records)
+    width, _ = _canvas_size(svg)
+    for x, _, text in _svg_text_elements(svg):
+        if not text:
+            continue
+        assert x + len(text) * 12 * 0.6 <= width, f"text {text!r} at x={x} overflows a {width}px canvas"
+
+
+def test_portfolio_figure_header_wraps_within_the_canvas():
+    records = [{"n_assets": 18, "cardinality_k": 6, "beta_label": "beta-zero", "objective": 0.0001}]
+    svg = report.portfolio_figure(records)
+    width, _ = _canvas_size(svg)
+    for x, _, text in _svg_text_elements(svg):
+        if x != 10.0 or not text:
+            continue
+        assert x + len(text) * 12 * 0.6 <= width, f"text {text!r} at x={x} overflows a {width}px canvas"
+
+
+def test_bar_chart_value_label_never_overlaps_a_long_category_label():
+    # A real defect found by rendering portfolio-repair.svg: a long category
+    # label (the repair-outcome suffix) plus a zero-width bar (raw_feasible_count
+    # 0) put the value label's start right on top of the category text's tail.
+    records = [
+        {
+            "n_assets": 18, "cardinality_k": 6, "beta_label": "beta-zero",
+            "raw_feasible_count": 0, "returned_reads": 500, "feasible": True,
+        },
+    ]
+    svg = report.portfolio_repair_figure(records)
+    elements = _svg_text_elements(svg)
+    category_x, _, category_text = next(e for e in elements if e[2].startswith("n=18 k=6 beta-zero"))
+    value_x, _, value_text = next(e for e in elements if e[2] == "0 raw feasible reads")
+    category_right_edge = category_x + report._text_width_estimate(category_text)
+    assert value_x >= category_right_edge
