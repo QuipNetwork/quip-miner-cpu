@@ -31,15 +31,28 @@ import math
 import re
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from quip_miner_dwave import regimes
 
 import round2_metrics as metrics
+import round2_runner as runner
 
 DEFAULT_KERNELS: Tuple[str, ...] = ("cpu-sa", "cpu-msa-f64", "cpu-msa-unit")
 FULL_DEPTHS: Tuple[int, ...] = (512, 2048, 8192, 32768, 131072)
 PILOT_DEPTHS: Tuple[int, ...] = (512, 2048)
+
+
+def expected_per_arm_for(run: str) -> int:
+    """The job count one (cell, kernel, sweeps) arm should have, from the SAME
+    constants ``round2_cpu.py`` uses to build the job list (review, Important
+    item 2): the pilot's 5 models x 3 timing repetitions, or the campaign's
+    100 models x 1 repetition. Read from ``round2_runner`` rather than
+    duplicated here, so the two can never silently drift apart.
+    """
+    if run == "pilot":
+        return runner.PILOT_MODELS_PER_CELL * runner.PILOT_TIMING_REPS
+    return runner.CAMPAIGN_MODELS_PER_CELL
 
 _ATTEMPT_RE = re.compile(r"^(?P<base>.+)__attempt(?P<attempt>\d+)\.json$")
 
@@ -137,6 +150,17 @@ def solver_settings_table(records_by_cell: Dict[str, List[Dict[str, Any]]]) -> L
     return lines
 
 
+def _timing_cell(summary: Dict[str, Any], label: str) -> str:
+    """``"median (n)"`` for one timing label, or ``"n/a (0)"`` with none observed
+    (review, Important item 1: every timing label prints its own count, so a
+    zero-sample label can never be mistaken for a real zero-second median).
+    """
+    info = summary["timing_by_label"].get(label)
+    if not info or info["n"] == 0:
+        return "n/a (0)"
+    return f"{fmt(info['median_wall_s'])} ({info['n']})"
+
+
 def depth_quality_time_table(
     records_by_cell: Dict[str, List[Dict[str, Any]]],
     *, kernels: Sequence[str], depths: Sequence[int], expected_per_arm: Optional[int] = None,
@@ -144,11 +168,15 @@ def depth_quality_time_table(
     lines = [
         "## Depth, quality, and time", "",
         "Every row is one (cell, kernel, sweep depth) arm. Missing, failed, unsupported, and nonfinite "
-        "observations stay outside the comparable denominator (task brief, step 5): only the completed, "
-        "finite subset feeds the two median columns.", "",
+        "observations stay outside the comparable denominator (task brief, step 5). Only the completed, "
+        "finite subset feeds Median best energy, which counts every `exit_ok` record no matter the host "
+        "condition. A completed energy result is equally valid on a clean host or a busy one. Wall time "
+        "gets separate treatment. A contaminated run or a parallel-worker run measures a different host "
+        "condition than a clean serial run, so this table always reports their medians apart, as "
+        "`median (n)` for each label, and never pools them into one number (review, Important item 1).", "",
         "| Cell | Kernel | Sweeps | Observed | Missing | Completed | Failed | Unsupported | Nonfinite "
-        "| Median best energy | Median wall s |",
-        "| -- | -- | -- | -- | -- | -- | -- | -- | -- | -- | -- |",
+        "| Median best energy | Wall s, clean serial (n) | Wall s, contaminated (n) | Wall s, parallel (n) |",
+        "| -- | -- | -- | -- | -- | -- | -- | -- | -- | -- | -- | -- | -- |",
     ]
     for cell, records in records_by_cell.items():
         for kernel in kernels:
@@ -159,7 +187,9 @@ def depth_quality_time_table(
                     f"| `{cell}` | `{kernel}` | {sweeps} | {summary['observed']} | {fmt(summary['missing'])} | "
                     f"{summary['completed']} | {summary['failed']} | {summary['unsupported']} | "
                     f"{summary['nonfinite']} | {fmt(summary['median_best_energy'])} | "
-                    f"{fmt(summary['median_wall_s'])} |"
+                    f"{_timing_cell(summary, metrics.CLEAN_SERIAL)} | "
+                    f"{_timing_cell(summary, metrics.CONTAMINATED)} | "
+                    f"{_timing_cell(summary, metrics.PARALLEL)} |"
                 )
     return lines
 
@@ -190,29 +220,80 @@ def paired_gaps_table(cells: Sequence[str]) -> List[str]:
     return lines
 
 
+def _finite_float(value: Any) -> Optional[float]:
+    """``value`` as a finite float, or ``None`` when it is not one -- a narrowing
+    helper so a caller can branch on ``is None`` and have the non-None case
+    typed as ``float``, not ``Any | None``.
+    """
+    if isinstance(value, (int, float)) and math.isfinite(value):
+        return float(value)
+    return None
+
+
+def _outcome_triple(tally: Dict[str, int]) -> str:
+    return f"{tally['qpu']}/{tally['cpu']}/{tally['tie']}"
+
+
 def seed_lane_table(records_by_cell: Dict[str, List[Dict[str, Any]]]) -> List[str]:
     lines = [
         "## Seed lanes", "",
         "Seed lanes from qpu/cpu-lite against cold lanes, both on cpu-msa-f64 at the same sweep depth (Task 8 "
-        "brief, step 9). This compares seeding strategies on the CPU kernel, not QPU quality.",
-        "", "| Cell | Seed source | Models | Seeded wins | Cold wins | Ties |",
-        "| -- | -- | -- | -- | -- | -- |",
+        "brief, step 9). This compares seeding strategies on the CPU kernel, not QPU quality. Every comparison "
+        "uses the three separate quality columns (strict, numeric-tolerance, and 0.5% material -- task brief, "
+        "step 2), never a bare zero-tolerance count. Failed, unsupported, or nonfinite seeded or cold records "
+        "are excluded from Compared and counted under Excluded (task brief, step 5).", "",
+        "| Cell | Seed source | Compared | Excluded | Strict seeded/cold/tie | Numeric seeded/cold/tie "
+        "| Material seeded/cold/tie |",
+        "| -- | -- | -- | -- | -- | -- | -- |",
     ]
     for cell, records in records_by_cell.items():
         by_source: Dict[str, List[Dict[str, Any]]] = {}
         for record in records:
             by_source.setdefault(record["seed_source"], []).append(record)
         for source, rows in sorted(by_source.items()):
-            outcomes = [
-                metrics.quality_outcome(row["best_seeded_energy"], row["best_cold_energy"], metrics.STRICT_TOLERANCE)
-                for row in rows
-            ]
-            tally = metrics.tally_quality_outcomes(outcomes)
-            lines.append(f"| `{cell}` | `{source}` | {len(rows)} | {tally['qpu']} | {tally['cpu']} | {tally['tie']} |")
+            compared: List[Dict[str, str]] = []
+            excluded = 0
+            for row in rows:
+                seeded = _finite_float(row.get("best_seeded_energy"))
+                cold = _finite_float(row.get("best_cold_energy"))
+                if not row.get("exit_ok") or row.get("unsupported") or seeded is None or cold is None:
+                    excluded += 1
+                    continue
+                compared.append(metrics.quality_columns(seeded, cold))
+            strict = metrics.tally_quality_outcomes([c["strict"] for c in compared])
+            numeric = metrics.tally_quality_outcomes([c["numeric_tolerance"] for c in compared])
+            material = metrics.tally_quality_outcomes([c["material"] for c in compared])
+            lines.append(
+                f"| `{cell}` | `{source}` | {len(compared)} of {len(rows)} | {excluded} | "
+                f"{_outcome_triple(strict)} | {_outcome_triple(numeric)} | {_outcome_triple(material)} |"
+            )
     return lines
 
 
-def physical_scale_table(capture_proposal: Optional[Dict[str, Any]], cells: Sequence[str]) -> List[str]:
+def _capitalize_sentences(text: str, separator: str = "; ") -> str:
+    """Rejoin ``text``'s ``separator``-joined fragments as separate sentences, each
+    capitalized (house style forbids semicolons in prose, STE Rule 8.1). Used
+    only to transcribe a quoted upstream field into prose; the source file
+    itself (e.g. ``capture-proposal.json``) is never rewritten.
+    """
+    parts = text.split(separator)
+    sentences = [parts[0]] + [part[:1].upper() + part[1:] if part else part for part in parts[1:]]
+    return ". ".join(sentences)
+
+
+def physical_scale_table(
+    capture_proposal: Optional[Dict[str, Any]], cells: Sequence[str],
+    captured_regimes: Optional[Iterable[str]] = None,
+) -> List[str]:
+    """The physical-scale pilot's plan, and its status, for every cell.
+
+    ``captured_regimes`` names cells with real capture output on disk (none,
+    today: no Round 2 physical capture has run). Approval is not capture
+    (review, Important item 8): a cell is never reported "captured" from
+    ``capture_proposal["approval"]`` alone, only from ``captured_regimes``
+    actually naming it.
+    """
+    captured = set(captured_regimes or ())
     lines = [
         "## Physical scale", "",
         "The physical-range pilot (12 sorted nonces, 3 scales, 2 anneal times -- the design doc's initial "
@@ -222,11 +303,7 @@ def physical_scale_table(capture_proposal: Optional[Dict[str, Any]], cells: Sequ
     approval = capture_proposal.get("approval") if capture_proposal else None
     scales_note = capture_proposal.get("physical_scales") if capture_proposal else None
     if capture_proposal is not None:
-        # The proposal's own text is quoted, not re-authored, but its semicolon is
-        # replaced with a period here so a transcribed prose sentence still reads as
-        # two sentences rather than one spliced by a semicolon (house style, STE
-        # Rule 8.1) -- the underlying capture-proposal.json file is never rewritten.
-        scales_text = (scales_note or "n/a").replace("; ", ". ")
+        scales_text = _capitalize_sentences(scales_note or "n/a")
         lines.append(f"Capture proposal approval status: `{approval}`. Planned scales: {scales_text}")
         lines.append("")
     lines += [
@@ -244,7 +321,12 @@ def physical_scale_table(capture_proposal: Optional[Dict[str, Any]], cells: Sequ
         anneals = ", ".join(str(arm["anneal_us"]) for arm in sorted(arms, key=lambda a: a["anneal_us"]))
         captures = sum(arm["captures"] for arm in arms)
         reads = arms[0].get("reads_per_capture", "n/a")
-        status = "captured" if approval == "approved" else f"planned, not yet captured (approval: {approval})"
+        if cell in captured:
+            status = "captured"
+        elif approval == "approved":
+            status = "approved, not yet captured"
+        else:
+            status = f"planned, not yet captured (approval: {approval})"
         lines.append(f"| `{cell}` | {anneals} | {captures} | {reads} | {status} |")
     return lines
 
@@ -281,19 +363,24 @@ def portfolio_pipeline_table(portfolio_records: Sequence[Dict[str, Any]]) -> Lis
     lines = [
         "## Portfolio pipeline", "",
         "The historical-deadline arm (dwave-neal, 500 reads / 500 sweeps, the design's portfolio-replication "
-        "contract) ran to completion. This report classifies each run from its measured elapsed time and "
-        "never kills a run at 10 seconds: a late-but-good answer is a timeout, not a win. The strict-win, "
-        "material-win, speed-only, and joint quality/time columns each need a paired QPU portfolio result, "
-        "which Round 2 has not captured yet.", "",
-        "| Assets | K | Beta label | Status | Elapsed s | Deadline s | Objective | Strict/material win "
-        "| Speed-only outcome | Joint quality/time |",
-        "| -- | -- | -- | -- | -- | -- | -- | -- | -- | -- |",
+        "contract) ran to completion. This report classifies each run from its measured elapsed time. It "
+        "never kills a run at 10 seconds, so a late-but-good answer shows as a timeout, not a win. "
+        "Repaired feasible and Selected raw cardinality report P's own repair and weighting outcome for the "
+        "one selected, winning read. That differs from the feasibility table's raw feasible reads, which "
+        "count over every returned read. The strict-win, material-win, speed-only, and joint quality/time "
+        "columns each need a paired QPU portfolio result, which Round 2 has not captured yet.", "",
+        "| Assets | K | Beta label | Status | Elapsed s | Deadline s | Objective | Repaired feasible "
+        "| Selected raw cardinality | Strict/material win | Speed-only outcome | Joint quality/time |",
+        "| -- | -- | -- | -- | -- | -- | -- | -- | -- | -- | -- | -- |",
     ]
     for record in portfolio_records:
+        feasible = record.get("feasible")
+        feasible_text = "yes" if feasible is True else "no" if feasible is False else "n/a"
         lines.append(
             f"| {record.get('n_assets')} | {record.get('cardinality_k')} | `{record.get('beta_label')}` | "
             f"{record.get('status')} | {fmt(record.get('elapsed_s'))} | {fmt(record.get('deadline_s'))} | "
-            f"{fmt(record.get('objective'), 6)} | unavailable | unavailable | unavailable |"
+            f"{fmt(record.get('objective'), 6)} | {feasible_text} | {fmt(record.get('selected_raw_cardinality'))} | "
+            "unavailable | unavailable | unavailable |"
         )
     return lines
 
@@ -392,21 +479,58 @@ def _text_width_estimate(text: str, font_size: int = 12) -> float:
     return len(text) * font_size * 0.6
 
 
+def _wrap_lines(text: str, max_chars: int) -> List[str]:
+    """Word-wrap ``text`` to at most ``max_chars`` per line (task brief, step 9:
+    "the caption wraps inside the canvas" -- a review-found defect where one
+    long caption line ran past the canvas's right edge).
+    """
+    words = text.split()
+    lines: List[str] = []
+    current = ""
+    for word in words:
+        candidate = f"{current} {word}".strip()
+        if current and len(candidate) > max_chars:
+            lines.append(current)
+            current = word
+        else:
+            current = candidate
+    if current:
+        lines.append(current)
+    return lines
+
+
+def _pad_range(low: float, high: float, fraction: float = 0.12) -> Tuple[float, float]:
+    """Expand ``[low, high]`` by ``fraction`` on each side so an extreme point
+    never sits exactly on an axis line, including the zero-span case of a
+    single distinct value (task brief, step 9: "points sit clear of the axis
+    lines" -- a review-found defect where a data extreme landed at ``cx ==
+    margin``, the y axis itself).
+    """
+    span = high - low
+    pad = span * fraction if span > 0 else max(abs(high), 1.0) * fraction
+    return low - pad, high + pad
+
+
 def quality_time_figure(
     cell: str, records: Sequence[Dict[str, Any]], kernels: Sequence[str], depths: Sequence[int],
 ) -> str:
     """One quality/time panel per regime (task brief, step 7): median wall time
     (x, log-scaled) against median best energy (y) for every (kernel, depth) arm.
-    Labels energy units, solver identity, sample count, and any incomplete arm.
+
+    Readable as a static image, not only via hover tooltips (review, Important
+    item 7): the caption word-wraps inside the canvas, both axes carry visible
+    tick values and a title, each point's sample count is printed next to it
+    (not only in its ``<title>``), and the data range is padded so no point
+    sits exactly on an axis line.
 
     The plot box's own y range is ``[plot_top, height - margin]``. The title,
     caption, incomplete-arm warning, and legend all sit strictly above
-    ``plot_top``, so none of them can ever land on top of a plotted point
-    (task brief, step 9's label-collision check, satisfied by layout rather
-    than by inspecting pixels after the fact).
+    ``plot_top``, so none of them can ever land on top of a plotted point.
     """
-    width, height = 640, 420
-    margin = 70
+    width, height = 720, 460
+    margin = 90
+    max_chars = max(20, int((width - 2 * margin) / (12 * 0.6)))
+
     points: List[Tuple[str, int, float, float, int]] = []
     incomplete: List[str] = []
     for kernel in kernels:
@@ -418,48 +542,83 @@ def quality_time_figure(
                 continue
             points.append((kernel, sweeps, summary["median_wall_s"], summary["median_best_energy"], summary["completed"]))
 
-    body_parts: List[str] = [
-        f'<text x="{margin}" y="24" font-size="16" font-weight="bold">{cell}: quality vs. time (CPU)</text>',
-        f'<text x="{margin}" y="42" font-size="12">Energy units: canonical (rescored from the original model, '
-        f'lower is better). x: median wall time (s, log scale). y: median best energy. No application deadline '
-        f'applies to this arm.</text>',
-    ]
-    plot_top = 58
+    caption = (
+        "Energy units: canonical, rescored from the original model, lower is better. Wall time is the "
+        "clean-serial median only. Contaminated and parallel-worker runs are reported separately in the "
+        "depth table, never pooled here. No application deadline applies to this arm."
+    )
+    body_parts: List[str] = [f'<text x="{margin}" y="24" font-size="16" font-weight="bold">{cell}: quality vs. time (CPU)</text>']
+    y_cursor = 42
+    for line in _wrap_lines(caption, max_chars):
+        body_parts.append(f'<text x="{margin}" y="{y_cursor}" font-size="12">{line}</text>')
+        y_cursor += 15
+
+    plot_top = y_cursor + 2
     if incomplete:
-        body_parts.append(
-            f'<text x="{margin}" y="{plot_top}" font-size="12" fill="#a33a3a">Incomplete arms (no data): '
-            f'{", ".join(incomplete)}</text>'
-        )
-        plot_top += 16
+        for line in _wrap_lines(f"Incomplete arms (no data): {', '.join(incomplete)}", max_chars):
+            body_parts.append(f'<text x="{margin}" y="{plot_top}" font-size="12" fill="#a33a3a">{line}</text>')
+            plot_top += 15
+
     if not points:
-        body_parts.append(f'<text x="{margin}" y="{height / 2:.0f}" font-size="14">No completed arms to plot.</text>')
+        body_parts.append(
+            f'<text x="{margin}" y="{(plot_top + height - margin) / 2:.0f}" font-size="14">No completed arms to plot.</text>'
+        )
     else:
         colors = {kernel: _PALETTE[i % len(_PALETTE)] for i, kernel in enumerate(sorted({p[0] for p in points}))}
-        # The legend is a horizontal strip immediately below the caption/warning
-        # lines and strictly above plot_top's own line below it.
+        # The legend states each kernel's own sample count(s) directly (review,
+        # Important item 7: "the sample count is printed visibly" -- not only in
+        # a <title> tooltip, which a static render never shows).
         legend_x = margin
-        legend_y = plot_top
+        legend_y = plot_top + 4
         for kernel, color in colors.items():
+            n_values = sorted({p[4] for p in points if p[0] == kernel})
+            label = f"{kernel} (n={','.join(str(n) for n in n_values)})"
             body_parts.append(f'<rect x="{legend_x}" y="{legend_y}" width="12" height="12" fill="{color}"/>')
-            body_parts.append(f'<text x="{legend_x + 16}" y="{legend_y + 11}" font-size="12">{kernel}</text>')
-            legend_x += 20 + int(_text_width_estimate(kernel)) + 16
-        plot_top += 22
+            body_parts.append(f'<text x="{legend_x + 16}" y="{legend_y + 11}" font-size="12">{label}</text>')
+            legend_x += 20 + int(_text_width_estimate(label)) + 16
+        plot_top = legend_y + 26
 
-        xs = [math.log10(max(p[2], 1e-6)) for p in points]
-        ys = [p[3] for p in points]
-        x_min, x_max = min(xs), max(xs)
-        y_min, y_max = min(ys), max(ys)
-        x_span = (x_max - x_min) or 1.0
-        y_span = (y_max - y_min) or 1.0
+        raw_wall = [p[2] for p in points]
+        raw_energy = [p[3] for p in points]
+        log_wall = [math.log10(max(w, 1e-9)) for w in raw_wall]
+        x_min, x_max = _pad_range(min(log_wall), max(log_wall))
+        y_min, y_max = _pad_range(min(raw_energy), max(raw_energy))
+        x_span = x_max - x_min
+        y_span = y_max - y_min
         plot_height = height - margin - plot_top
+
         for kernel, sweeps, wall_s, energy, n in points:
-            x = margin + (math.log10(max(wall_s, 1e-6)) - x_min) / x_span * (width - 2 * margin)
+            x = margin + (math.log10(max(wall_s, 1e-9)) - x_min) / x_span * (width - 2 * margin)
             y = height - margin - (energy - y_min) / y_span * plot_height
             body_parts.append(
                 f'<circle cx="{x:.1f}" cy="{y:.1f}" r="6" fill="{colors[kernel]}" fill-opacity="0.85">'
                 f'<title>{kernel} @ {sweeps} sweeps: median wall {wall_s:.3g} s, '
                 f'median best energy {energy:.6g}, n={n}</title></circle>'
+                f'<text x="{x + 9:.1f}" y="{y - 8:.1f}" font-size="9" fill="#333333">n={n}</text>'
             )
+
+        # Tick values (the raw wall-time and energy extremes) and axis titles,
+        # both visible directly on the image, not only in the caption's prose.
+        body_parts.append(f'<text x="{margin}" y="{height - margin + 16}" font-size="10">{fmt(min(raw_wall))}</text>')
+        body_parts.append(
+            f'<text x="{width - margin}" y="{height - margin + 16}" font-size="10" text-anchor="end">'
+            f'{fmt(max(raw_wall))}</text>'
+        )
+        body_parts.append(
+            f'<text x="{(margin + width - margin) / 2:.0f}" y="{height - margin + 32}" font-size="11" '
+            'text-anchor="middle">Median wall time (s), log scale</text>'
+        )
+        body_parts.append(
+            f'<text x="{margin - 6}" y="{plot_top + 4}" font-size="10" text-anchor="end">{fmt(max(raw_energy))}</text>'
+        )
+        body_parts.append(
+            f'<text x="{margin - 6}" y="{height - margin}" font-size="10" text-anchor="end">{fmt(min(raw_energy))}</text>'
+        )
+        y_title_pos = (plot_top + height - margin) / 2
+        body_parts.append(
+            f'<text x="{margin - 55}" y="{y_title_pos:.0f}" font-size="11" text-anchor="middle" '
+            f'transform="rotate(-90 {margin - 55} {y_title_pos:.0f})">Median best energy (canonical units)</text>'
+        )
     body_parts.append(f'<line x1="{margin}" y1="{height - margin}" x2="{width - margin}" y2="{height - margin}" stroke="black"/>')
     body_parts.append(f'<line x1="{margin}" y1="{plot_top}" x2="{margin}" y2="{height - margin}" stroke="black"/>')
     return _svg_document(width, height, "".join(body_parts))
@@ -491,6 +650,55 @@ def _bar_chart(title: str, subtitle: str, bars: Sequence[Tuple[str, float]], val
     return _svg_document(width, height, header + "".join(body_parts))
 
 
+#: The signed-bar colors (task brief, step 9's graphical-integrity requirement;
+#: review, Important item 6: a negative objective must never draw like a
+#: positive one just because a magnitude-only bar chart lost its sign).
+_POSITIVE_COLOR = "#217a69"
+_NEGATIVE_COLOR = "#a33a3a"
+
+
+def _signed_bar_chart(title: str, subtitle: str, bars: Sequence[Tuple[str, float]], value_label: str) -> str:
+    """A bar chart around a zero baseline: a negative value draws to the LEFT of
+    the baseline in :data:`_NEGATIVE_COLOR`, a positive one to the right in
+    :data:`_POSITIVE_COLOR`, and the printed value always carries an explicit
+    sign (``+`` or ``-``). Never draws ``abs(value)`` as an unsigned magnitude.
+    """
+    half_width = 200
+    margin_left = 260
+    top = 70
+    height = 90 + 34 * max(len(bars), 1)
+    header = (
+        f'<text x="10" y="20" font-size="16" font-weight="bold">{title}</text>'
+        f'<text x="10" y="40" font-size="12">{subtitle}</text>'
+    )
+    if not bars:
+        width = margin_left + 2 * half_width + 100
+        return _svg_document(width, height, header + f'<text x="10" y="{top + 20}" font-size="14">No data available.</text>')
+    value_texts = [f"{value:+.4g} {value_label}" for _, value in bars]
+    label_margin = int(max(_text_width_estimate(text) for text in value_texts)) + 20
+    width = margin_left + 2 * half_width + label_margin
+    max_abs = max(abs(value) for _, value in bars) or 1.0
+    baseline_x = margin_left + half_width
+    body_parts = [
+        f'<line x1="{baseline_x}" y1="{top - 10}" x2="{baseline_x}" y2="{top + 34 * len(bars) - 4}" '
+        'stroke="#999999" stroke-dasharray="3,3"/>',
+        f'<text x="{baseline_x}" y="{top - 14}" font-size="10" text-anchor="middle">0</text>',
+    ]
+    for i, ((label, value), value_text) in enumerate(zip(bars, value_texts)):
+        y = top + i * 34
+        bar_width = abs(value) / max_abs * half_width
+        color = _POSITIVE_COLOR if value >= 0 else _NEGATIVE_COLOR
+        x = baseline_x if value >= 0 else baseline_x - bar_width
+        text_x = baseline_x + bar_width + 6 if value >= 0 else baseline_x - bar_width - 6
+        anchor = "start" if value >= 0 else "end"
+        body_parts.append(f'<text x="10" y="{y + 15}" font-size="12">{label}</text>')
+        body_parts.append(f'<rect x="{x:.1f}" y="{y}" width="{bar_width:.1f}" height="20" fill="{color}"/>')
+        body_parts.append(
+            f'<text x="{text_x:.1f}" y="{y + 15}" font-size="12" text-anchor="{anchor}">{value_text}</text>'
+        )
+    return _svg_document(width, height, header + "".join(body_parts))
+
+
 def physical_scale_figure(capture_proposal: Optional[Dict[str, Any]]) -> str:
     """The physical-scale panel for diamond and clique (task brief, step 7): the
     PLANNED capture counts, since no physical capture has run yet. Never plots
@@ -507,9 +715,10 @@ def physical_scale_figure(capture_proposal: Optional[Dict[str, Any]]) -> str:
 
 
 def portfolio_figure(portfolio_records: Sequence[Dict[str, Any]]) -> str:
-    """The portfolio repair/quality panel (task brief, step 7): the repaired final
+    """The portfolio quality panel (task brief, step 7): the repaired final
     objective per basket x beta-label arm, in the portfolio pipeline's own final
-    objective units -- not spin-model energy units.
+    objective units -- not spin-model energy units. Signed around zero (review,
+    Important item 6): a negative objective never draws as if it were positive.
     """
     bars = [
         (f"n={record.get('n_assets')} k={record.get('cardinality_k')} {record.get('beta_label')}", float(record["objective"]))
@@ -519,7 +728,30 @@ def portfolio_figure(portfolio_records: Sequence[Dict[str, Any]]) -> str:
         "Historical-deadline arm (dwave-neal, 500 reads / 500 sweeps), repaired final objective, original "
         "units. No paired QPU portfolio result yet."
     )
-    return _bar_chart("Portfolio pipeline: repaired objective per basket", subtitle, bars, "objective")
+    return _signed_bar_chart("Portfolio pipeline: repaired objective per basket", subtitle, bars, "objective")
+
+
+def portfolio_repair_figure(portfolio_records: Sequence[Dict[str, Any]]) -> str:
+    """The portfolio repair panel (task brief, step 7): raw feasible reads (exact
+    cardinality, before repair) per basket, labeled with whether P's repaired,
+    selected answer ended feasible (review, Important item 6: "add a repair
+    panel that shows raw feasible against repaired counts").
+    """
+    bars = []
+    for record in portfolio_records:
+        count = record.get("raw_feasible_count")
+        total = record.get("returned_reads")
+        if count is None or not total:
+            continue
+        repaired = "repaired: feasible" if record.get("feasible") else "repaired: infeasible"
+        label = f"n={record.get('n_assets')} k={record.get('cardinality_k')} {record.get('beta_label')} ({repaired})"
+        bars.append((label, float(count)))
+    subtitle = (
+        "Raw feasible reads (exact cardinality, before repair) per basket, out of returned_reads (see the "
+        "feasibility table for the denominator). The label states the repaired, selected answer's own "
+        "feasibility."
+    )
+    return _bar_chart("Portfolio repair: raw feasible reads vs. the repaired answer", subtitle, bars, "raw feasible reads")
 
 
 def write_figures(
@@ -538,6 +770,9 @@ def write_figures(
     portfolio_path = out_dir / "portfolio-objective.svg"
     portfolio_path.write_text(portfolio_figure(portfolio_records), encoding="utf-8")
     paths.append(portfolio_path)
+    repair_path = out_dir / "portfolio-repair.svg"
+    repair_path.write_text(portfolio_repair_figure(portfolio_records), encoding="utf-8")
+    paths.append(repair_path)
     return paths
 
 
@@ -574,10 +809,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
     portfolio_records = load_portfolio_deadline(Path(args.portfolio_results)) if args.portfolio_results else []
     capture_proposal = load_capture_proposal(Path(args.capture_proposal)) if args.capture_proposal else None
+    expected_per_arm = expected_per_arm_for(args.run)
 
     lines = [
         "# Round 2 regime search report", "",
-        f"Status: draft, pilot data, incomplete. This report draws on `{args.run}` CPU records under "
+        f"Status: draft, {args.run} data, incomplete. This report draws on `{args.run}` CPU records under "
         f"`{cpu_root}`. No Round 2 quantum processing unit (QPU) capture has run yet: the physical-scale and "
         "portfolio pilots are still pending approval. This draft proves the reporting pipeline end to end. "
         "It states no regime verdict.",
@@ -585,7 +821,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     ]
     lines += model_identity_table(records_by_cell) + [""]
     lines += solver_settings_table(records_by_cell) + [""]
-    lines += depth_quality_time_table(records_by_cell, kernels=args.kernels, depths=depths) + [""]
+    lines += depth_quality_time_table(
+        records_by_cell, kernels=args.kernels, depths=depths, expected_per_arm=expected_per_arm,
+    ) + [""]
     lines += qpu_outcome_table(args.cells) + [""]
     lines += paired_gaps_table(args.cells) + [""]
     if seeded_by_cell:

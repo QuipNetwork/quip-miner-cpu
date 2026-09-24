@@ -86,6 +86,12 @@ def format_feasibility(feasible_count: int, returned_reads: int) -> str:
         raise ValueError("feasible_count must be between 0 and returned_reads")
     percent = feasible_count / returned_reads * 100
     percent_text = f"{percent:.6f}".rstrip("0").rstrip(".")
+    if feasible_count < returned_reads and percent_text == "100":
+        # Six decimals run out of resolution once returned_reads is large enough
+        # (one bad read in 2e8 rounds to 99.9999995, which .6f rounds again to
+        # 100.000000): an explicit less-than marker holds at any scale, rather
+        # than chasing ever more decimal places.
+        percent_text = "<100"
     return f"{feasible_count} / {returned_reads} ({percent_text}%)"
 
 
@@ -120,17 +126,53 @@ def format_reconstructed_feasibility(k_share: float, total: int, decimals: int =
 # -------------------------------------------------------------------- arm summary
 
 
+#: A completed record with no ``timing_mode`` and no contaminated ``host`` is
+#: "clean serial" by definition -- a hand-built fixture with neither field
+#: (or a real run with no ``--cpu``, so no host sample exists) is treated the
+#: same way, never silently folded into "contaminated" or "parallel".
+CLEAN_SERIAL = "clean serial"
+CONTAMINATED = "contaminated"
+PARALLEL = "parallel"
+
+
+def _timing_label(record: Mapping[str, Any]) -> str:
+    """Which of :data:`CLEAN_SERIAL`, :data:`CONTAMINATED`, or :data:`PARALLEL`
+    one completed record's wall time belongs to (review, Important item 1:
+    "never pool serial and parallel timing without a label").
+    """
+    if record.get("timing_mode") == "parallel":
+        return PARALLEL
+    if bool((record.get("host") or {}).get("contaminated")):
+        return CONTAMINATED
+    return CLEAN_SERIAL
+
+
 def summarize_arm(records: Sequence[Mapping[str, Any]], expected: Optional[int] = None) -> Dict[str, Any]:
     """The depth/quality/time summary of one (cell, kernel, sweeps) arm.
 
     Every record lands in exactly one bucket -- completed, unsupported, failed,
-    or nonfinite -- and only the completed, finite subset feeds the median
-    columns (task brief, step 5: missing, failed, and nonfinite observations
-    stay outside the comparable denominator). ``expected`` is the job count
-    this arm should have if every job already has a record; the gap becomes
-    ``missing`` when given, and stays ``None`` (not zero) when the caller does
-    not know the intended count -- an empty arm (``records=()``) is handled
-    the same way as any other, with every count at zero rather than a crash.
+    or nonfinite -- and only the completed, finite subset feeds
+    ``median_best_energy`` (task brief, step 5: missing, failed, and nonfinite
+    observations stay outside the comparable denominator). Quality uses every
+    completed record regardless of host contamination or timing mode: an
+    ``exit_ok`` energy is exactly as valid whether the run was clean, shared
+    with another job, or run in parallel (review, Important item 1: "Quality
+    results may use every exit_ok record").
+
+    Wall time is different: a contaminated or parallel-mode run measures a
+    busier or differently-loaded host, and pooling it with a clean serial run
+    silently corrupts the timing comparison. ``median_wall_s`` and ``clean_n``
+    cover the clean-serial subset ONLY; ``timing_by_label`` reports the
+    ``{n, median_wall_s}`` of every label (:data:`CLEAN_SERIAL`,
+    :data:`CONTAMINATED`, :data:`PARALLEL`) that has at least one completed
+    record, so a contaminated or parallel timing is always visible, always
+    labeled, and never silently merged into the clean figure.
+
+    ``expected`` is the job count this arm should have if every job already
+    has a record; the gap becomes ``missing`` when given, and stays ``None``
+    (not zero) when the caller does not know the intended count -- an empty
+    arm (``records=()``) is handled the same way as any other, with every
+    count at zero rather than a crash.
     """
     completed: List[Mapping[str, Any]] = []
     unsupported = 0
@@ -151,7 +193,18 @@ def summarize_arm(records: Sequence[Mapping[str, Any]], expected: Optional[int] 
     observed = len(records)
     missing = max(0, expected - observed) if expected is not None else None
     best_energies = [float(r["best_energy"]) for r in completed]
-    wall_times = [float(r["wall_s"]) for r in completed if r.get("wall_s") is not None]
+
+    wall_by_label: Dict[str, List[float]] = {}
+    for record in completed:
+        wall = record.get("wall_s")
+        if wall is not None:
+            wall_by_label.setdefault(_timing_label(record), []).append(float(wall))
+    timing_by_label = {
+        label: {"n": len(values), "median_wall_s": float(np.median(values)) if values else None}
+        for label, values in sorted(wall_by_label.items())
+    }
+    clean_values = wall_by_label.get(CLEAN_SERIAL, [])
+
     return {
         "observed": observed,
         "expected": expected,
@@ -161,7 +214,9 @@ def summarize_arm(records: Sequence[Mapping[str, Any]], expected: Optional[int] 
         "failed": failed,
         "nonfinite": nonfinite,
         "median_best_energy": float(np.median(best_energies)) if best_energies else None,
-        "median_wall_s": float(np.median(wall_times)) if wall_times else None,
+        "median_wall_s": float(np.median(clean_values)) if clean_values else None,
+        "clean_n": len(clean_values),
+        "timing_by_label": timing_by_label,
     }
 
 
@@ -181,9 +236,15 @@ MIN_INDEPENDENT_GROUPS = 5
 #: The task brief's own fixed resample count (step 6).
 BOOTSTRAP_RESAMPLES = 10_000
 
+#: The task brief's "fixed recorded seed" (step 6). Named and recorded in
+#: every result (review, Also-fix item 1) rather than left to each caller to
+#: pick and remember its own value.
+BOOTSTRAP_SEED = 20260922
+
 
 def bootstrap_paired_gap(
-    gaps: Sequence[float], groups: Sequence[str], *, resamples: int = BOOTSTRAP_RESAMPLES, seed: int,
+    gaps: Sequence[float], groups: Sequence[str],
+    *, resamples: int = BOOTSTRAP_RESAMPLES, seed: int = BOOTSTRAP_SEED,
 ) -> Dict[str, Any]:
     """The bootstrap interval of the median paired gap, resampled by GROUP, not
     by point (task brief, step 6: "group correlated portfolio inputs by
@@ -192,12 +253,17 @@ def bootstrap_paired_gap(
     two independent draws. Reports the group count and marks the interval
     ``descriptive`` when there are too few independent groups
     (:data:`MIN_INDEPENDENT_GROUPS`) for a resample distribution to mean
-    anything close to a real confidence bound.
+    anything close to a real confidence bound. ``seed`` and ``resamples``
+    travel with the result on every return path, so a reader never has to
+    trust an out-of-band claim about what generated it.
     """
     if len(gaps) != len(groups):
         raise ValueError("gaps and groups must be the same length")
     if not gaps:
-        return {"point": float("nan"), "low": float("nan"), "high": float("nan"), "group_count": 0, "descriptive": True}
+        return {
+            "point": float("nan"), "low": float("nan"), "high": float("nan"),
+            "group_count": 0, "descriptive": True, "seed": seed, "resamples": resamples,
+        }
     by_group: Dict[str, List[float]] = {}
     for gap, group in zip(gaps, groups):
         by_group.setdefault(group, []).append(float(gap))
@@ -205,7 +271,10 @@ def bootstrap_paired_gap(
     group_count = len(unique_groups)
     point = float(np.median(list(gaps)))
     if group_count < 2:
-        return {"point": point, "low": float("nan"), "high": float("nan"), "group_count": group_count, "descriptive": True}
+        return {
+            "point": point, "low": float("nan"), "high": float("nan"),
+            "group_count": group_count, "descriptive": True, "seed": seed, "resamples": resamples,
+        }
     rng = np.random.default_rng(seed)
     resampled_medians = np.empty(resamples, dtype=np.float64)
     group_index = np.arange(group_count)
@@ -220,4 +289,6 @@ def bootstrap_paired_gap(
         "high": float(high),
         "group_count": group_count,
         "descriptive": group_count < MIN_INDEPENDENT_GROUPS,
+        "seed": seed,
+        "resamples": resamples,
     }
