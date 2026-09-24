@@ -328,7 +328,7 @@ def test_matched_runtime_comparison_selects_deepest_affordable_and_counts_over_b
         "end_to_end_s": 1.2,
     }, {
         "cell": "diamond-pm1", "requested_scale": 1.0, "anneal_us": 20,
-        "model_hash": "over", "best_energy": -3.0, "access_us": 1_000_000,
+        "model_hash": "over", "best_energy": -3.0, "access_us": 800_000,
         "end_to_end_s": 1.4,
     }]
     records = [
@@ -348,6 +348,70 @@ def test_matched_runtime_comparison_selects_deepest_affordable_and_counts_over_b
     assert row["reached_qpu_energy"] == 2
     assert row["not_reached"] == 0
     assert row["median_cpu_s_to_qpu_energy"] == pytest.approx(0.95)
+    assert row["median_ratio_to_qpu_access"] == pytest.approx(1.0875)
+
+
+def test_matched_runtime_qpu_medians_use_only_models_with_valid_cpu_pairs():
+    captures = [{
+        "cell": "diamond-pm1", "requested_scale": 1.0, "anneal_us": 20,
+        "model_hash": "matched", "best_energy": -2.0, "access_us": 1_000_000,
+        "end_to_end_s": 1.2,
+    }, {
+        "cell": "diamond-pm1", "requested_scale": 1.0, "anneal_us": 20,
+        "model_hash": "unmatched", "best_energy": -3.0, "access_us": 100_000_000,
+        "end_to_end_s": 120.0,
+    }]
+    records = [_cpu_record("diamond-pm1", "matched", "cpu-sa", 512, wall_s=0.5)]
+
+    row = report.matched_runtime_comparison(captures, records, kernels=("cpu-sa",))[
+        ("diamond-pm1", 1.0, 20, "cpu-sa")
+    ]
+
+    assert row["models"] == 1
+    assert row["median_qpu_access_s"] == pytest.approx(1.0)
+    assert row["median_qpu_end_to_end_s"] == pytest.approx(1.2)
+
+
+def test_matched_runtime_qpu_medians_are_empty_when_no_cpu_models_match():
+    captures = [{
+        "cell": "diamond-pm1", "requested_scale": 1.0, "anneal_us": 20,
+        "model_hash": "unmatched", "best_energy": -3.0, "access_us": 1_000_000,
+        "end_to_end_s": 1.2,
+    }]
+
+    row = report.matched_runtime_comparison(captures, [], kernels=("cpu-sa",))[
+        ("diamond-pm1", 1.0, 20, "cpu-sa")
+    ]
+
+    assert row["models"] == 0
+    assert row["median_qpu_access_s"] is None
+    assert row["median_qpu_end_to_end_s"] is None
+    text = "\n".join(report.matched_runtime_table(captures, [], kernels=("cpu-sa",)))
+    assert "| `diamond-pm1` | 1 | 20 | `cpu-sa` | 0 | n/a | n/a |" in text
+
+
+def test_matched_runtime_counts_a_numeric_tolerance_tie_as_reaching_qpu_energy():
+    qpu_energy = -2.0
+    captures = [{
+        "cell": "diamond-pm1", "requested_scale": 1.0, "anneal_us": 20,
+        "model_hash": "a", "best_energy": qpu_energy, "access_us": 1_000_000,
+        "end_to_end_s": 1.2,
+    }]
+    records = [_cpu_record(
+        "diamond-pm1", "a", "cpu-sa", 512,
+        best_energy=qpu_energy + metrics.NUMERIC_TOLERANCE / 2, wall_s=0.7,
+    )]
+
+    row = report.matched_runtime_comparison(captures, records, kernels=("cpu-sa",))[
+        ("diamond-pm1", 1.0, 20, "cpu-sa")
+    ]
+
+    assert metrics.quality_outcome(
+        qpu_energy, records[0]["best_energy"], metrics.NUMERIC_TOLERANCE,
+    ) == "tie"
+    assert row["reached_qpu_energy"] == 1
+    assert row["not_reached"] == 0
+    assert row["median_cpu_s_to_qpu_energy"] == pytest.approx(0.7)
 
 
 def test_matched_runtime_comparison_counts_models_that_never_reach_qpu_energy():
@@ -371,7 +435,13 @@ def test_matched_runtime_comparison_counts_models_that_never_reach_qpu_energy():
 
 
 def test_matched_runtime_section_renders_requested_columns():
-    lines = report.matched_runtime_table([], [], kernels=("cpu-sa",))
+    captures = [{
+        "cell": "diamond-pm1", "requested_scale": 1.0, "anneal_us": 20,
+        "model_hash": "a", "best_energy": -2.0, "access_us": 1_000_000,
+        "end_to_end_s": 1.2,
+    }]
+    records = [_cpu_record("diamond-pm1", "a", "cpu-sa", 512, wall_s=0.5)]
+    lines = report.matched_runtime_table(captures, records, kernels=("cpu-sa",))
     text = "\n".join(lines)
 
     assert "## QPU against CPU at matched run time" in text
@@ -379,6 +449,61 @@ def test_matched_runtime_section_renders_requested_columns():
     assert "Over budget" in text
     assert "Reached QPU energy" in text
     assert "Median ratio to QPU access" in text
+    assert "| `diamond-pm1` | 1 | 20 | `cpu-sa` | 1 | 1 | 1.2 |" in text
+
+
+def test_matched_runtime_route_ignores_failed_and_unsupported_cpu_records():
+    captures = [{
+        "cell": "diamond-pm1", "requested_scale": 1.0, "anneal_us": 20,
+        "model_hash": "a", "best_energy": -2.0, "access_us": 1_000_000,
+        "end_to_end_s": 1.2,
+    }]
+    unit = _cpu_record("diamond-pm1", "a", "cpu-msa", 512, wall_s=0.5)
+    unit["routed_kernel"] = "cpu-msa-unit"
+    failed_f64 = _cpu_record("diamond-pm1", "a", "cpu-msa", 1024, wall_s=0.5, exit_ok=False)
+    failed_f64["routed_kernel"] = "cpu-msa-f64"
+    unsupported_f64 = _cpu_record("diamond-pm1", "a", "cpu-msa", 2048, wall_s=0.5, unsupported=True)
+    unsupported_f64["routed_kernel"] = "cpu-msa-f64"
+    nonfinite_f64 = _cpu_record("diamond-pm1", "a", "cpu-msa", 4096, best_energy=float("nan"), wall_s=0.5)
+    nonfinite_f64["routed_kernel"] = "cpu-msa-f64"
+
+    lines = report.matched_runtime_table(
+        captures, [unit, failed_f64, unsupported_f64, nonfinite_f64], kernels=("cpu-msa",),
+    )
+
+    assert any("`cpu-msa (unit)`" in line for line in lines)
+    assert not any("`cpu-msa (mixed)`" in line for line in lines)
+
+
+def test_matched_runtime_route_is_mixed_when_matched_metrics_use_both_kernels():
+    captures = [{
+        "cell": "diamond-pm1", "requested_scale": 1.0, "anneal_us": 20,
+        "model_hash": "unit", "best_energy": -2.0, "access_us": 1_000_000,
+        "end_to_end_s": 1.2,
+    }, {
+        "cell": "diamond-pm1", "requested_scale": 1.0, "anneal_us": 20,
+        "model_hash": "f64", "best_energy": -2.0, "access_us": 1_000_000,
+        "end_to_end_s": 1.4,
+    }]
+    unit = _cpu_record("diamond-pm1", "unit", "cpu-msa", 512, wall_s=0.5)
+    unit["routed_kernel"] = "cpu-msa-unit"
+    f64 = _cpu_record("diamond-pm1", "f64", "cpu-msa", 512, wall_s=0.5)
+    f64["routed_kernel"] = "cpu-msa-f64"
+
+    lines = report.matched_runtime_table(captures, [unit, f64], kernels=("cpu-msa",))
+
+    assert any("`cpu-msa (mixed)`" in line for line in lines)
+
+
+def test_solver_settings_does_not_list_derived_cpu_msa_as_observed():
+    measured = _cpu_record("diamond-pm1", "a", "cpu-msa-f64", 512)
+    derived = {**measured, "requested_kernel": "cpu-msa", "routed_kernel": "cpu-msa-f64"}
+
+    lines = report.solver_settings_table({"diamond-pm1": [measured, derived]})
+    row = next(line for line in lines if line.startswith("| `diamond-pm1`"))
+
+    assert "`cpu-msa-f64`" in row
+    assert "`cpu-msa`" not in row
 
 
 def test_qpu_comparison_labels_the_source_kernel_for_routed_cpu_msa():

@@ -278,6 +278,7 @@ def matched_runtime_comparison(
         captures_by_model = {capture["model_hash"]: capture for capture in arm_captures}
         for kernel in kernels:
             cpu_by_model: Dict[str, List[Tuple[int, float, float]]] = {}
+            routes_by_model: Dict[str, set[str]] = {}
             for record in cpu_records:
                 if record.get("cell") != cell or record.get("requested_kernel") != kernel:
                     continue
@@ -293,6 +294,9 @@ def matched_runtime_comparison(
                     continue
                 if model_hash in captures_by_model:
                     cpu_by_model.setdefault(model_hash, []).append((sweeps, sampling_s, energy))
+                    route = record.get("routed_kernel")
+                    if isinstance(route, str):
+                        routes_by_model.setdefault(model_hash, set()).add(route)
 
             matched_models = sorted(set(captures_by_model) & set(cpu_by_model))
             strict_outcomes: List[str] = []
@@ -301,6 +305,7 @@ def matched_runtime_comparison(
             over_budget = 0
             time_to_energy: List[float] = []
             time_ratios: List[float] = []
+            routed_kernels: set[str] = set()
             for model_hash in matched_models:
                 capture = captures_by_model[model_hash]
                 qpu_energy = _finite_float(capture.get("best_energy"))
@@ -308,6 +313,7 @@ def matched_runtime_comparison(
                 if qpu_energy is None or access_us is None or access_us <= 0:
                     continue
                 model_records = cpu_by_model[model_hash]
+                routed_kernels.update(routes_by_model.get(model_hash, set()))
                 budget_s = access_us / 1_000_000
                 affordable = [row for row in model_records if row[1] <= budget_s]
                 shallowest = min(model_records, key=lambda row: row[0])
@@ -329,16 +335,18 @@ def matched_runtime_comparison(
                     time_to_energy.append(reached_s)
                     time_ratios.append(reached_s / budget_s)
 
+            matched_captures = [captures_by_model[model_hash] for model_hash in matched_models]
             access_seconds = [
-                value / 1_000_000 for capture in arm_captures
+                value / 1_000_000 for capture in matched_captures
                 if (value := _finite_float(capture.get("access_us"))) is not None
             ]
             end_to_end_seconds = [
-                value for capture in arm_captures
+                value for capture in matched_captures
                 if (value := _finite_float(capture.get("end_to_end_s"))) is not None
             ]
             results[(cell, scale, anneal, kernel)] = {
                 "models": len(matched_models),
+                "routed_kernels": sorted(routed_kernels),
                 "median_qpu_access_s": float(np.median(access_seconds)) if access_seconds else None,
                 "median_qpu_end_to_end_s": float(np.median(end_to_end_seconds)) if end_to_end_seconds else None,
                 "equal_budget_counts": {
@@ -419,7 +427,10 @@ def solver_settings_table(records_by_cell: Dict[str, List[Dict[str, Any]]]) -> L
         "| -- | -- | -- | -- |",
     ]
     for cell, records in records_by_cell.items():
-        kernels = sorted({str(k) for r in records if (k := r.get("requested_kernel")) is not None})
+        kernels = sorted({
+            str(k) for r in records
+            if (k := r.get("requested_kernel")) is not None and k != "cpu-msa"
+        })
         depths = sorted({int(d) for r in records if (d := r.get("sweeps")) is not None})
         reads = sorted({int(n) for r in records if (n := r.get("reads")) is not None})
         lines.append(
@@ -794,15 +805,10 @@ def matched_runtime_table(
         equal_budget = " / ".join(
             _outcome_triple(counts[name]) for name in ("strict", "numeric_tolerance", "material")
         )
-        arm_hashes = {
-            capture.get("model_hash") for capture in captures
-            if capture.get("cell") == cell and capture.get("requested_scale") == scale
-            and capture.get("anneal_us") == anneal
-        }
-        routed = _routed_kernels(
-            [record for record in cpu_records if record.get("requested_kernel") == kernel], arm_hashes,
+        kernel_label = (
+            f"cpu-msa ({_route_label(row['routed_kernels'])})"
+            if kernel == "cpu-msa" else kernel
         )
-        kernel_label = f"cpu-msa ({_route_label(routed)})" if kernel == "cpu-msa" else kernel
         lines.append(
             f"| `{cell}` | {scale:g} | {anneal} | `{kernel_label}` | {row['models']} | "
             f"{fmt(row['median_qpu_access_s'])} | {fmt(row['median_qpu_end_to_end_s'])} | {equal_budget} | "
