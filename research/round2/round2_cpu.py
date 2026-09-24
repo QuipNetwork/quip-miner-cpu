@@ -342,7 +342,19 @@ def _run_one_job(
     fallback["wall_s"] = wall_s
     fallback["attempt"] = attempt
     fallback["hard_deadline_s"] = hard_deadline_s
-    fallback["killed_reason"] = "hard_deadline" if not exit_ok else "no_record_written"
+    if wall_s >= hard_deadline_s:
+        # The parent's own TimeoutExpired path fired (review finding M1): it waited
+        # the full hard deadline before killing the child, so this really is the
+        # kill _is_terminal must never retry under the same deadline.
+        fallback["killed_reason"] = "hard_deadline"
+    elif exit_ok:
+        fallback["killed_reason"] = "no_record_written"
+    else:
+        # The child exited (crashed, or exited nonzero before ever reaching its own
+        # write) well before the parent's hard deadline ever fired: a plain crash,
+        # not a deadline kill, and must stay retryable (_is_terminal treats anything
+        # other than "hard_deadline" as non-terminal already).
+        fallback["killed_reason"] = "crashed_no_record"
     fallback["timing_mode"] = timing_mode
     fallback["concurrent_workers"] = concurrent_workers
     if host_before is not None and host_after is not None:
@@ -622,11 +634,18 @@ def cmd_estimate(args: argparse.Namespace) -> int:
 
 
 def cmd_seeded_sweep(args: argparse.Namespace) -> int:
-    """Task brief step 9: seeded/cold weighted MSA at 32,768 sweeps, 32 seed + 32 cold lanes."""
+    """Task brief step 9: seeded/cold weighted MSA at 32,768 sweeps, 32 seed + 32 cold lanes.
+
+    Writes to ``seeded-sweep-v2``, not the original ``seeded-sweep`` (review finding
+    I4): the cold lanes are now a genuinely separate full-ladder anneal rather than
+    the tail of the seeded call, which makes every prior seeded-sweep output
+    superseded. The old directory is never read or deleted here.
+    """
     bundles_root = Path(args.bundles_root)
     round1_root = Path(args.round1_root)
-    out_dir = Path(args.out_root) / "seeded-sweep"
+    out_dir = Path(args.out_root) / "seeded-sweep-v2"
     index = _load_index(bundles_root)
+    identity = runner.solver_identity()
 
     results = []
     for cell in args.cells:
@@ -635,8 +654,22 @@ def cmd_seeded_sweep(args: argparse.Namespace) -> int:
             for seed_source in runner.SEED_SOURCES:
                 record_path = out_dir / cell / f"{row['nonce']}__{seed_source}.json"
                 samples_path = out_dir / cell / f"{row['nonce']}__{seed_source}.npz"
+                expected_key = runner.seeded_sweep_run_key(
+                    cell, row["nonce"], bundles_root, seed_source, runner.SEEDED_SWEEPS, identity,
+                )
                 if record_path.exists():
                     existing = json.loads(record_path.read_text(encoding="utf-8"))
+                    # Refuse a mismatch as the campaign does (review finding I4): e.g.
+                    # quip_msa was rebuilt since this attempt was written, and resuming
+                    # from it would silently mix results from two different builds.
+                    if existing.get("run_key") != expected_key:
+                        raise SystemExit(
+                            f"{record_path} holds run key {existing.get('run_key')!r}, and this job's "
+                            f"run key (under the current solver build) is {expected_key!r}; refusing to "
+                            "resume from a record that is not this exact job under this exact build. "
+                            "Move or remove the stale file, or start a new output root, before running "
+                            "again."
+                        )
                     # Only a genuinely completed (or explicitly unsupported) prior run,
                     # with its samples actually on disk, is "done": a failed record is
                     # retried, never silently treated as final -- the same failure this
@@ -654,9 +687,10 @@ def cmd_seeded_sweep(args: argparse.Namespace) -> int:
                     )
                 except Exception as exc:  # never let one bad job end the whole loop
                     record, samples = {
-                        "schema": "round2-seeded-sweep-v1", "cell": cell, "nonce": row["nonce"],
+                        "schema": "round2-seeded-sweep-v2", "cell": cell, "nonce": row["nonce"],
                         "seed_source": seed_source, "exit_ok": False, "unsupported": False,
                         "error": f"{type(exc).__name__}: {exc}",
+                        "solver_identity": identity, "run_key": expected_key,
                     }, None
                 record_path.parent.mkdir(parents=True, exist_ok=True)
                 # Samples first, record last (finding 2): an interruption between the two
@@ -720,11 +754,17 @@ def cmd_portfolio_deadline(args: argparse.Namespace) -> int:
             if out_path.exists():
                 record = json.loads(out_path.read_text(encoding="utf-8"))
             else:
+                # A hard kill in the parent is "timeout", not "failed" (review finding
+                # I5): the hard deadline is always well above the application deadline
+                # (PORTFOLIO_HARD_DEADLINE_S > PORTFOLIO_DEADLINE_S), so by the time the
+                # parent gives up on the child, the run was certainly already late --
+                # exit_ok stays False (the child never actually returned), but the
+                # classification reflects what is actually known.
                 record = {
                     "schema": "round2-portfolio-deadline-v1", "n_assets": n, "cardinality_k": k,
-                    "beta_label": beta_label, "exit_ok": False,
+                    "beta_label": beta_label, "provenance": runner.PORTFOLIO_PROVENANCE, "exit_ok": False,
                     "error": f"hard subprocess deadline exceeded ({args.hard_deadline_s:.1f}s); exit_ok={exit_ok}",
-                    "elapsed_s": wall_s, "status": "failed",
+                    "elapsed_s": wall_s, "repair_s": None, "end_to_end_s": wall_s, "status": "timeout",
                 }
                 regime_io.atomic_write_json(out_path, record)
             records.append(record)

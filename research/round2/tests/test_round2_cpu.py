@@ -169,6 +169,43 @@ def test_resolve_run_retries_a_hard_deadline_kill_once_the_deadline_changes(tmp_
     assert attempt == 1
 
 
+# ---------------------------------- final review, M1: a crash is not a hard-deadline kill
+
+
+def test_fallback_record_is_hard_deadline_when_the_parent_actually_enforced_it(tmp_path, monkeypatch):
+    # wall_s >= hard_deadline_s means run_subprocess_with_hard_deadline's own
+    # TimeoutExpired path fired: the parent genuinely killed the child at the deadline.
+    bundles_root = tmp_path / "bundles"
+    _write_bundle(bundles_root, "native-pm1", _nonce(0))
+    job = _job()
+    out_dir = tmp_path / "out"
+    monkeypatch.setattr(runner, "run_one_subprocess", lambda *a, **k: (False, 5.0))
+    record = cpu._run_one_job(job, bundles_root, out_dir, None, 0, IDENTITY, 5.0)
+    assert record["killed_reason"] == "hard_deadline"
+
+
+def test_fallback_record_is_crashed_no_record_when_the_child_exits_before_the_deadline(tmp_path, monkeypatch):
+    # review finding M1: the child exited (crashed, or exited nonzero before ever
+    # reaching its own write) well before the hard deadline ever fired -- this is a
+    # plain crash, not a deadline kill, and must stay retryable.
+    bundles_root = tmp_path / "bundles"
+    _write_bundle(bundles_root, "native-pm1", _nonce(0))
+    job = _job()
+    out_dir = tmp_path / "out"
+    monkeypatch.setattr(runner, "run_one_subprocess", lambda *a, **k: (False, 0.01))
+    record = cpu._run_one_job(job, bundles_root, out_dir, None, 0, IDENTITY, 5.0)
+    assert record["killed_reason"] == "crashed_no_record"
+
+
+def test_crashed_no_record_fallback_is_never_terminal(tmp_path):
+    bundles_root = tmp_path / "bundles"
+    _write_bundle(bundles_root, "native-pm1", _nonce(0))
+    job = _job()
+    out_dir = tmp_path / "out"
+    record = {"exit_ok": False, "killed_reason": "crashed_no_record"}
+    assert cpu._is_terminal(record, out_dir, job, 0, hard_deadline_s=5.0) is False
+
+
 def test_earlier_attempts_are_never_overwritten_or_deleted(tmp_path):
     bundles_root = tmp_path / "bundles"
     _write_bundle(bundles_root, "native-pm1", _nonce(0))
@@ -389,7 +426,7 @@ def test_parallel_run_end_to_end_with_real_subprocesses(tmp_path):
         jobs.append(_job(nonce=nonce, kernel="cpu-msa-unit", sweeps=512))
     out_dir = tmp_path / "out"
 
-    records = cpu._run_jobs(jobs, bundles_root, out_dir, cpus=[0, 1])
+    records = cpu._run_jobs(jobs, bundles_root, out_dir, cpus=[10, 11])
 
     assert len(records) == 4
     assert all(r["exit_ok"] for r in records)
@@ -411,9 +448,9 @@ def test_parallel_run_is_resumable_like_the_serial_path(tmp_path):
         jobs.append(_job(nonce=nonce, kernel="cpu-msa-unit", sweeps=512))
     out_dir = tmp_path / "out"
 
-    cpu._run_jobs(jobs, bundles_root, out_dir, cpus=[0, 1])
+    cpu._run_jobs(jobs, bundles_root, out_dir, cpus=[10, 11])
     # a second parallel pass over the same jobs must resume, not re-run
-    second = cpu._run_jobs(jobs, bundles_root, out_dir, cpus=[0, 1])
+    second = cpu._run_jobs(jobs, bundles_root, out_dir, cpus=[10, 11])
     assert len(second) == 2
     for job in jobs:
         assert not cpu._attempt_paths(out_dir, job, 1)[0].exists()
@@ -432,7 +469,7 @@ def test_parallel_run_killed_by_sigterm_leaves_no_false_completed_record(tmp_pat
     timer.start()
     try:
         with pytest.raises(runner.Cancelled):
-            cpu._run_jobs(jobs, bundles_root, out_dir, cpus=[0, 1])
+            cpu._run_jobs(jobs, bundles_root, out_dir, cpus=[10, 11])
     finally:
         timer.cancel()
 
@@ -465,10 +502,131 @@ def test_worker_exception_is_logged_with_job_and_cpu(tmp_path, monkeypatch, caps
 
     monkeypatch.setattr(cpu, "_run_one_job", fake_run_one_job)
     with pytest.raises(RuntimeError, match="boom"):
-        cpu._run_jobs([job], bundles_root, out_dir, cpus=[0, 1])
+        cpu._run_jobs([job], bundles_root, out_dir, cpus=[10, 11])
 
     captured = capsys.readouterr()
     combined = captured.out + captured.err
     assert job.nonce in combined
     assert job.cell in combined
     assert "boom" in combined
+
+
+# ------------------------------------------------- final review, I4: cmd_seeded_sweep
+
+
+def _seeded_sweep_index(bundles_root: Path, cell: str = "native-pm1") -> str:
+    model_hash = _write_bundle(bundles_root, cell, _nonce(0))
+    (bundles_root / "index.json").write_text(
+        json.dumps({"rows": [{"cell": cell, "nonce": _nonce(0), "model_hash": model_hash}]}),
+        encoding="utf-8",
+    )
+    return model_hash
+
+
+def _seeded_sweep_args(tmp_path: Path, **overrides: Any):
+    import argparse
+
+    fields: Dict[str, Any] = dict(
+        bundles_root=str(tmp_path / "bundles"), round1_root=str(tmp_path / "round1"),
+        out_root=str(tmp_path / "cpu"), cells=["native-pm1"], models=1,
+    )
+    fields.update(overrides)
+    return argparse.Namespace(**fields)
+
+
+def _fake_seeded_sweep_job(spins_value=1):
+    def fake(cell, nonce, bundles_root, round1_root, seed_source):
+        record = {
+            "schema": "round2-seeded-sweep-v2", "cell": cell, "nonce": nonce,
+            "seed_source": seed_source, "exit_ok": True, "unsupported": False,
+        }
+        samples = {"spins": np.full((1, 3), spins_value, dtype=np.int8), "energies": np.zeros(1)}
+        return record, samples
+
+    return fake
+
+
+def test_seeded_sweep_writes_to_a_versioned_v2_output_directory_not_the_old_one(tmp_path, monkeypatch):
+    # review finding I4: existing seeded-sweep outputs are superseded -- new runs go to
+    # a new directory name, and the old one is never touched.
+    bundles_root = tmp_path / "bundles"
+    _seeded_sweep_index(bundles_root)
+    monkeypatch.setattr(runner, "solver_identity", lambda: IDENTITY)
+    monkeypatch.setattr(runner, "execute_seeded_sweep_job", _fake_seeded_sweep_job())
+    args = _seeded_sweep_args(tmp_path)
+    assert cpu.cmd_seeded_sweep(args) == 0
+    assert (Path(args.out_root) / "seeded-sweep-v2" / "native-pm1").exists()
+    assert not (Path(args.out_root) / "seeded-sweep").exists()
+
+
+def test_seeded_sweep_resume_skips_a_run_key_matching_completed_record(tmp_path, monkeypatch):
+    bundles_root = tmp_path / "bundles"
+    _seeded_sweep_index(bundles_root)
+    monkeypatch.setattr(runner, "solver_identity", lambda: IDENTITY)
+    args = _seeded_sweep_args(tmp_path)
+    out_dir = Path(args.out_root) / "seeded-sweep-v2"
+    out_dir.mkdir(parents=True)
+    for seed_source in runner.SEED_SOURCES:
+        expected_key = runner.seeded_sweep_run_key(
+            "native-pm1", _nonce(0), bundles_root, seed_source, runner.SEEDED_SWEEPS, IDENTITY,
+        )
+        cell_dir = out_dir / "native-pm1"
+        cell_dir.mkdir(exist_ok=True)
+        record_path = cell_dir / f"{_nonce(0)}__{seed_source}.json"
+        samples_path = cell_dir / f"{_nonce(0)}__{seed_source}.npz"
+        record_path.write_text(json.dumps({
+            "schema": "round2-seeded-sweep-v2", "exit_ok": True, "unsupported": False, "run_key": expected_key,
+        }), encoding="utf-8")
+        np.savez(samples_path, spins=np.ones((1, 3)), energies=np.zeros(1))
+
+    def never_called(*args, **kwargs):
+        raise AssertionError("a matching, completed record must not be re-run")
+
+    monkeypatch.setattr(runner, "execute_seeded_sweep_job", never_called)
+    assert cpu.cmd_seeded_sweep(args) == 0
+
+
+def test_seeded_sweep_resume_refuses_a_run_key_mismatch(tmp_path, monkeypatch):
+    # review finding I4: "check the key on resume, refusing a mismatch as the campaign
+    # does" -- e.g. quip_msa was rebuilt since this attempt was written.
+    bundles_root = tmp_path / "bundles"
+    _seeded_sweep_index(bundles_root)
+    monkeypatch.setattr(runner, "solver_identity", lambda: IDENTITY)
+    args = _seeded_sweep_args(tmp_path)
+    out_dir = Path(args.out_root) / "seeded-sweep-v2" / "native-pm1"
+    out_dir.mkdir(parents=True)
+    stale_identity = {**IDENTITY, "binary_sha256": "a-different-build"}
+    stale_key = runner.seeded_sweep_run_key(
+        "native-pm1", _nonce(0), bundles_root, "qpu", runner.SEEDED_SWEEPS, stale_identity,
+    )
+    (out_dir / f"{_nonce(0)}__qpu.json").write_text(json.dumps({
+        "schema": "round2-seeded-sweep-v2", "exit_ok": True, "unsupported": False, "run_key": stale_key,
+    }), encoding="utf-8")
+
+    with pytest.raises(SystemExit, match="run key"):
+        cpu.cmd_seeded_sweep(args)
+
+
+# --------------------------------------- final review, I5: portfolio-deadline hard kill
+
+
+def test_portfolio_deadline_hard_kill_in_the_parent_is_a_timeout_not_a_failure(tmp_path, monkeypatch):
+    # review finding I5: "a hard kill in the parent is recorded as timeout, not failed" --
+    # the hard deadline (300 s) always exceeds the application deadline (10 s), so by the
+    # time the parent gives up, the run was certainly already late.
+    monkeypatch.setattr(
+        cpu.runner, "run_subprocess_with_hard_deadline",
+        lambda cmd, hard_deadline_s, **kwargs: (False, hard_deadline_s),
+    )
+    import argparse
+
+    args = argparse.Namespace(
+        out_root=str(tmp_path / "cpu"), p_python="fake-python", pythonpath="", hard_deadline_s=0.01,
+    )
+    assert cpu.cmd_portfolio_deadline(args) == 0
+    record_paths = sorted((Path(args.out_root) / "portfolio-deadline").glob("n*-k*-*.json"))
+    assert record_paths
+    for record_path in record_paths:
+        record = json.loads(record_path.read_text(encoding="utf-8"))
+        assert record["status"] == "timeout"
+        assert record["exit_ok"] is False

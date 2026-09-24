@@ -638,12 +638,25 @@ def test_qpu_seed_lanes_rejects_a_genuine_mismatch(tmp_path):
 class _SeededSweepFakeSampler:
     """cpu-msa-f64 has no eligibility limit at all: any ValueError it raises is an
     unanticipated defect, never a known ineligibility (review findings 7/8).
+
+    Records every call's ``num_reads``, ``initial_spins`` (presence only), and
+    ``start_beta`` in ``self.calls``, so a test can check the seeded and cold
+    lanes really come from two independent calls (final-review finding I4:
+    the cold lanes must be a genuine full-ladder anneal, not the tail of one
+    call the seeded schedule already shortened).
     """
 
     def __init__(self, *, fail_on_main: bool):
         self._fail_on_main = fail_on_main
+        self.calls: list = []
 
-    def sample_research(self, h, edges, j, *, kernel, num_sweeps, num_reads, seed, beta_range, initial_spins=None):
+    def sample_research(
+        self, h, edges, j, *, kernel, num_sweeps, num_reads, seed, beta_range,
+        initial_spins=None, start_beta=None,
+    ):
+        self.calls.append(
+            {"num_reads": num_reads, "seeded": initial_spins is not None, "start_beta": start_beta}
+        )
         if self._fail_on_main and num_sweeps == runner.SEEDED_SWEEPS:
             raise ValueError("unexpected defect")
         spins = np.ones((num_reads, len(h)), dtype=np.int8)
@@ -671,6 +684,72 @@ def test_seeded_sweep_completes_when_the_kernel_behaves(tmp_path, monkeypatch):
     assert record["exit_ok"] is True
     assert record["unsupported"] is False
     assert samples is not None
+
+
+def test_seeded_and_cold_lanes_come_from_two_independent_calls(tmp_path, monkeypatch):
+    # review finding I4: the previous single call let the kernel apply the seeded
+    # (midpoint-start) beta schedule to the "cold" reads too. The cold lanes must
+    # instead come from their own call, with no initial_spins at all -- a genuine
+    # full-ladder anneal, not the tail of the seeded call.
+    _write_bundle(tmp_path, "native-pm1", _nonce(0))
+    sampler = _SeededSweepFakeSampler(fail_on_main=False)
+    monkeypatch.setattr(runner, "_msa", lambda: _fake_msa_module(sampler))
+    runner.execute_seeded_sweep_job("native-pm1", _nonce(0), tmp_path, tmp_path, "cpu-lite")
+
+    # one lite-seed call (64 reads, cold) plus the seeded call and the cold call.
+    main_calls = [c for c in sampler.calls if c["num_reads"] in (runner.SEED_LANES, runner.COLD_LANES)]
+    assert len(main_calls) == 2
+    seeded_call = next(c for c in main_calls if c["seeded"])
+    cold_call = next(c for c in main_calls if not c["seeded"])
+    assert seeded_call["num_reads"] == runner.SEED_LANES
+    assert cold_call["num_reads"] == runner.COLD_LANES
+    assert seeded_call["start_beta"] is not None  # explicit, not left to the kernel's own default
+    assert cold_call["start_beta"] is None  # start_beta is illegal on an unseeded call
+
+
+def test_seeded_sweep_record_carries_start_betas_solver_identity_and_run_key(tmp_path, monkeypatch):
+    _write_bundle(tmp_path, "native-pm1", _nonce(0))
+    monkeypatch.setattr(runner, "_msa", lambda: _fake_msa_module(_SeededSweepFakeSampler(fail_on_main=False)))
+    record, _samples = runner.execute_seeded_sweep_job("native-pm1", _nonce(0), tmp_path, tmp_path, "cpu-lite")
+    hot, cold = record["beta_range"]
+    assert record["seeded_start_beta"] == pytest.approx((hot * cold) ** 0.5)
+    assert record["cold_start_beta"] == pytest.approx(hot)
+    assert record["solver_identity"]["package"] == "quip_msa"
+    assert record["cold_seed"] != record["seed"]
+    assert isinstance(record["run_key"], str) and record["run_key"]
+
+
+def test_seeded_sweep_schema_is_versioned_v2(tmp_path, monkeypatch):
+    _write_bundle(tmp_path, "native-pm1", _nonce(0))
+    monkeypatch.setattr(runner, "_msa", lambda: _fake_msa_module(_SeededSweepFakeSampler(fail_on_main=False)))
+    record, _samples = runner.execute_seeded_sweep_job("native-pm1", _nonce(0), tmp_path, tmp_path, "cpu-lite")
+    assert record["schema"] == "round2-seeded-sweep-v2"
+
+
+# ---------------------------------------------------------------- cpu_lite_seed_lanes
+
+
+class _WrongKernelSampler:
+    def sample_research(self, h, edges, j, *, kernel, num_sweeps, num_reads, seed, beta_range, initial_spins=None):
+        spins = np.ones((num_reads, len(h)), dtype=np.int8)
+        energies = regimes.energy(spins, h, edges, j)
+        meta = {
+            "observed_kernel": "cpu-sa", "representation": "fake", "rng_scheme": "fake",
+            "seeded_reads": 0, "workspace_bytes": None,
+        }
+        return spins, energies, meta
+
+
+def test_cpu_lite_seed_lanes_rejects_the_wrong_observed_kernel(monkeypatch):
+    # review finding M8: cpu_lite_seed_lanes captured meta["observed_kernel"] into its
+    # return value but never checked it -- a silent kernel substitution would have gone
+    # unnoticed.
+    h = np.zeros(3)
+    edges = BUNDLE_EDGES
+    j = np.array([1.0, -1.0])
+    monkeypatch.setattr(runner, "_msa", lambda: _fake_msa_module(_WrongKernelSampler()))
+    with pytest.raises(runner.RunnerError, match="observed"):
+        runner.cpu_lite_seed_lanes(h, edges, j, seed=0)
 
 
 # ------------------------------------------------------------ portfolio deadline arm
@@ -717,6 +796,83 @@ def test_portfolio_deadline_arm_masks_the_seed_to_32_bits(monkeypatch):
     assert 0 <= captured["seed"] < (1 << 31)
     assert captured["num_reads"] == runner.PORTFOLIO_NEAL_READS
     assert captured["num_sweeps"] == runner.PORTFOLIO_NEAL_SWEEPS
+
+
+def test_portfolio_deadline_arm_labels_its_provenance_as_synthetic_test(monkeypatch):
+    # review finding I5: the instance is a synthetic, deterministically-seeded
+    # portfolio, never a captured historical one -- every record must say so.
+    pytest.importorskip("qpo")
+    pytest.importorskip("dwave.samplers")
+    seed, _ = runner.seed_for("4-2-beta-zero", "neal-500-500", 500, 500, "portfolio-deadline")
+    record = runner.run_portfolio_deadline_arm(4, 2, "beta-zero", seed)
+    assert record["provenance"] == "synthetic-test"
+
+
+def test_portfolio_deadline_arm_records_p_head_and_package_versions(monkeypatch):
+    pytest.importorskip("qpo")
+    pytest.importorskip("dwave.samplers")
+    seed, _ = runner.seed_for("4-2-beta-zero", "neal-500-500", 500, 500, "portfolio-deadline")
+    record = runner.run_portfolio_deadline_arm(4, 2, "beta-zero", seed)
+    assert record["p_head"] is None or isinstance(record["p_head"], str)
+    assert record["package_versions"]["dwave-samplers"]
+    assert record["package_versions"]["dimod"]
+
+
+def test_portfolio_deadline_arm_times_repair_separately_from_sampling(monkeypatch):
+    pytest.importorskip("qpo")
+    pytest.importorskip("dwave.samplers")
+    from quip_miner_dwave import portfolio_replication as pr
+
+    problem = runner.build_portfolio_deadline_problem(4, 2, "beta-zero")
+    n_vars = pr.encode_to_ising(problem)[0].n
+
+    class FakeResponse:
+        variables = list(range(n_vars))
+        record = types.SimpleNamespace(sample=np.ones((1, n_vars), dtype=np.int8))
+
+    class FakeSampler:
+        def sample(self, bqm, *, num_reads, num_sweeps, seed):
+            return FakeResponse()
+
+    monkeypatch.setattr("dwave.samplers.SimulatedAnnealingSampler", lambda: FakeSampler(), raising=False)
+    seed, _ = runner.seed_for("4-2-beta-zero", "neal-500-500", 500, 500, "portfolio-deadline")
+    record = runner.run_portfolio_deadline_arm(4, 2, "beta-zero", seed)
+    assert record["repair_s"] is not None
+    assert record["repair_s"] >= 0.0
+    assert record["end_to_end_s"] >= record["elapsed_s"] + record["repair_s"]
+
+
+def test_portfolio_deadline_arm_status_comes_from_end_to_end_time_not_sampling_alone(monkeypatch):
+    # review finding I5: a slow repair/weighting phase must be able to push a run past
+    # the deadline even when sampling itself was fast -- status must reflect that, not
+    # silently call it a win because sampling alone was on time.
+    pytest.importorskip("qpo")
+    pytest.importorskip("dwave.samplers")
+    from quip_miner_dwave import portfolio_replication as pr
+
+    problem = runner.build_portfolio_deadline_problem(4, 2, "beta-zero")
+    n_vars = pr.encode_to_ising(problem)[0].n
+
+    class FakeResponse:
+        variables = list(range(n_vars))
+        record = types.SimpleNamespace(sample=np.ones((1, n_vars), dtype=np.int8))
+
+    class FakeSampler:
+        def sample(self, bqm, *, num_reads, num_sweeps, seed):
+            return FakeResponse()  # fast: sampling alone is nowhere near the deadline
+
+    def slow_score_reads(problem, qubo, spins):
+        time.sleep(runner.PORTFOLIO_DEADLINE_S + 0.05)
+        return real_score_reads(problem, qubo, spins)
+
+    real_score_reads = pr.score_reads
+    monkeypatch.setattr("dwave.samplers.SimulatedAnnealingSampler", lambda: FakeSampler(), raising=False)
+    monkeypatch.setattr(pr, "score_reads", slow_score_reads)
+    seed, _ = runner.seed_for("4-2-beta-zero", "neal-500-500", 500, 500, "portfolio-deadline")
+    record = runner.run_portfolio_deadline_arm(4, 2, "beta-zero", seed)
+    assert record["elapsed_s"] < runner.PORTFOLIO_DEADLINE_S
+    assert record["end_to_end_s"] > runner.PORTFOLIO_DEADLINE_S
+    assert record["status"] == "timeout"
 
 
 # ------------------------------------------------------------ hard deadline scaling

@@ -32,6 +32,7 @@ primitives ``scripts/round2_cpu.py`` orchestrates around it.
 from __future__ import annotations
 
 import json
+import math
 import os
 import resource
 import signal
@@ -1305,6 +1306,10 @@ PORTFOLIO_NEAL_SWEEPS = 500
 #: fixtures already share (``scripts/portfolio_replication.py``'s ``FIXTURES``).
 PORTFOLIO_DEADLINE_BASKETS: Tuple[Tuple[int, int], ...] = ((18, 6), (28, 9))
 PORTFOLIO_BETA_LABELS: Tuple[str, ...] = ("beta-zero", "beta-nonzero")
+#: This arm's instance source: a synthetic, deterministically-seeded portfolio, never
+#: a captured historical or production one (review finding I5: the report must never
+#: call this arm "historical").
+PORTFOLIO_PROVENANCE = "synthetic-test"
 
 
 def build_portfolio_deadline_problem(n: int, k: int, beta_label: str) -> Any:
@@ -1331,6 +1336,39 @@ def build_portfolio_deadline_problem(n: int, k: int, beta_label: str) -> Any:
     return problem
 
 
+def _portfolio_deadline_provenance() -> Dict[str, Any]:
+    """P's HEAD commit and the versions of the packages this arm imports.
+
+    Degrades to ``None``s rather than raising, like :func:`solver_identity`:
+    provenance-gathering must never crash an otherwise-successful, or
+    otherwise-failing, run. Not gated on any tree being clean -- unlike a
+    fixture bundle's own manifest (``portfolio_replication.export_provenance``),
+    this arm builds nothing that must be reproduced bit-for-bit from a
+    committed checkout; it only needs to name, on every record, exactly what
+    ran it (review finding I5).
+    """
+    import importlib.metadata
+
+    p_head: Optional[str] = None
+    try:
+        import qpo  # pyright: ignore[reportMissingImports]
+
+        if qpo.__file__ is not None:
+            p_root = Path(qpo.__file__).resolve().parents[2]
+            head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=p_root, capture_output=True, text=True)
+            if head.returncode == 0:
+                p_head = head.stdout.strip()
+    except Exception:
+        p_head = None
+    versions: Dict[str, Optional[str]] = {}
+    for name in ("qpo", "dimod", "dwave-samplers"):
+        try:
+            versions[name] = importlib.metadata.version(name)
+        except importlib.metadata.PackageNotFoundError:
+            versions[name] = None
+    return {"p_head": p_head, "package_versions": versions}
+
+
 def run_portfolio_deadline_arm(n: int, k: int, beta_label: str, seed: int) -> Dict[str, Any]:
     """The historical-settings neal arm (500 reads / 500 sweeps) under the 10 s application deadline.
 
@@ -1339,8 +1377,12 @@ def run_portfolio_deadline_arm(n: int, k: int, beta_label: str, seed: int) -> Di
     enforce it" (design's portfolio-replication contract) -- so this is the
     orchestration that contract calls for: run to completion, never killed
     at 10 seconds, classify with :func:`deadline_status` from the measured
-    elapsed time, and KEEP a late-but-good record for diagnosis rather than
-    reclassify it as an on-time win. Requires P's pinned environment.
+    END-TO-END time (sampling plus P's own repair and weighting, review
+    finding I5 -- a slow repair phase must be able to push a run late even
+    when sampling alone was fast), and KEEP a late-but-good record for
+    diagnosis rather than reclassify it as an on-time win. The instance is
+    always synthetic (``PORTFOLIO_PROVENANCE``), never a captured historical
+    one; every record says so. Requires P's pinned environment.
     """
     import dimod
     from dwave.samplers import SimulatedAnnealingSampler
@@ -1370,29 +1412,21 @@ def run_portfolio_deadline_arm(n: int, k: int, beta_label: str, seed: int) -> Di
     except Exception as exc:  # a real, observed failure of the reference sampler
         exit_ok = False
         error = f"{type(exc).__name__}: {exc}"
-    elapsed_s = time.perf_counter() - t_start
+    sampling_s = time.perf_counter() - t_start
 
-    record: Dict[str, Any] = {
-        "schema": "round2-portfolio-deadline-v1",
-        "n_assets": n, "cardinality_k": k, "beta_label": beta_label,
-        "frustration_beta": float(problem.frustration_beta),
-        "reads": PORTFOLIO_NEAL_READS, "sweeps": PORTFOLIO_NEAL_SWEEPS, "seed": neal_seed,
-        "deadline_s": PORTFOLIO_DEADLINE_S,
-        "elapsed_s": elapsed_s,
-        "exit_ok": exit_ok,
-        "error": error,
-        "status": deadline_status(elapsed_s, PORTFOLIO_DEADLINE_S, exit_ok),
-    }
+    repair_s: Optional[float] = None
+    extra: Dict[str, Any] = {}
     if response is not None:
+        t_repair_start = time.perf_counter()
         column = {var: idx for idx, var in enumerate(response.variables)}
         order = [column[i] for i in range(qubo.n)]
         bits = np.asarray(response.record.sample, dtype=np.float64)[:, order]
         spins = bits * 2.0 - 1.0
         scored = pr.score_reads(problem, qubo, spins)
-        record["objective"] = float(scored["objective"])
-        record["feasible"] = bool(scored["feasible"])
-        record["raw_feasible_count"] = scored["raw_feasible_count"]
-        record["returned_reads"] = int(scored["returned_reads"])
+        extra["objective"] = float(scored["objective"])
+        extra["feasible"] = bool(scored["feasible"])
+        extra["raw_feasible_count"] = scored["raw_feasible_count"]
+        extra["returned_reads"] = int(scored["returned_reads"])
 
         # "feasible" above comes entirely from P's own repair and weighting; a raw read
         # rarely satisfies the cardinality constraint on its own (raw_feasible_count is
@@ -1405,14 +1439,35 @@ def run_portfolio_deadline_arm(n: int, k: int, beta_label: str, seed: int) -> Di
         match = np.all(bits.astype(np.int8) == selected_bits, axis=1)
         if match.any():
             selected_record = diagnostics["records"][int(np.argmax(match))]
-            record["weighting_failed"] = selected_record["weighting_failed"]
-            record["selected_raw_cardinality"] = selected_record["raw_cardinality"]
+            extra["weighting_failed"] = selected_record["weighting_failed"]
+            extra["selected_raw_cardinality"] = selected_record["raw_cardinality"]
         else:
             # Should not happen (selected_bits always comes from one of the input
             # reads); recorded as unknown rather than silently assumed one way or
             # the other if it ever does.
-            record["weighting_failed"] = None
-            record["selected_raw_cardinality"] = None
+            extra["weighting_failed"] = None
+            extra["selected_raw_cardinality"] = None
+        repair_s = time.perf_counter() - t_repair_start
+
+    end_to_end_s = time.perf_counter() - t_start
+    provenance = _portfolio_deadline_provenance()  # bookkeeping only; excluded from the timed budget above
+    record: Dict[str, Any] = {
+        "schema": "round2-portfolio-deadline-v1",
+        "n_assets": n, "cardinality_k": k, "beta_label": beta_label,
+        "frustration_beta": float(problem.frustration_beta),
+        "reads": PORTFOLIO_NEAL_READS, "sweeps": PORTFOLIO_NEAL_SWEEPS, "seed": neal_seed,
+        "deadline_s": PORTFOLIO_DEADLINE_S,
+        "provenance": PORTFOLIO_PROVENANCE,
+        "elapsed_s": sampling_s,
+        "repair_s": repair_s,
+        "end_to_end_s": end_to_end_s,
+        "exit_ok": exit_ok,
+        "error": error,
+        "p_head": provenance["p_head"],
+        "package_versions": provenance["package_versions"],
+        "status": deadline_status(end_to_end_s, PORTFOLIO_DEADLINE_S, exit_ok),
+    }
+    record.update(extra)
     return record
 
 
@@ -1478,14 +1533,35 @@ def cpu_lite_seed_lanes(
     spins, energies, meta = sampler.sample_research(
         h, edges, j, kernel="cpu-msa-f64", num_sweeps=lite_sweeps, num_reads=64, seed=seed, beta_range=beta_range,
     )
+    observed_kernel = meta["observed_kernel"]
+    if observed_kernel != "cpu-msa-f64":
+        # review finding M8: this was captured into the return value but never
+        # checked -- a silent kernel substitution here would have gone unnoticed.
+        raise RunnerError(f"cpu_lite_seed_lanes observed {observed_kernel!r}, not cpu-msa-f64")
     order = np.argsort(energies, kind="stable")[:lanes]
     lane_spins = spins[order]
     unique_lanes = len(np.unique(lane_spins, axis=0))
     return {
         "spins": lane_spins, "energies": energies[order], "lanes": lanes,
         "unique_lanes": unique_lanes, "duplicate_lanes": lanes - unique_lanes,
-        "observed_kernel": meta["observed_kernel"],
+        "observed_kernel": observed_kernel,
     }
+
+
+def seeded_sweep_run_key(
+    cell: str, nonce: str, bundles_root: PathLike, seed_source: str, sweeps: int, identity: Mapping[str, Any],
+) -> str:
+    """The resume identity of one seeded-sweep job: the same "solver build matters"
+    guarantee :meth:`CpuJob.run_key` gives the campaign (review finding 5), applied
+    to the seeded/cold arm (review finding I4: "check the key on resume, refusing a
+    mismatch as the campaign does").
+    """
+    return round2_io.run_id(
+        {
+            "bundles_root": str(bundles_root), "cell": cell, "nonce": nonce,
+            "seed_source": seed_source, "sweeps": sweeps, "solver_identity": dict(identity),
+        }
+    )
 
 
 def execute_seeded_sweep_job(
@@ -1493,11 +1569,19 @@ def execute_seeded_sweep_job(
     sweeps: int = SEEDED_SWEEPS,
 ) -> Tuple[Dict[str, Any], Optional[Dict[str, np.ndarray]]]:
     """One seeded/cold comparison at ``sweeps``: :data:`SEED_LANES` lanes from ``seed_source``
-    ("qpu" or "cpu-lite"), plus :data:`COLD_LANES` lanes left cold, on ``cpu-msa-f64``.
+    ("qpu" or "cpu-lite"), plus :data:`COLD_LANES` lanes on a genuinely separate cold
+    anneal, both on ``cpu-msa-f64``.
 
-    ``initial_spins`` carries only the seed lanes: per ``Msa.sample_research``'s
-    own contract ("row r seeds read r, later reads start cold"), the reads
-    past the seed rows start cold without any extra bookkeeping here.
+    Two independent ``sample_research`` calls, not one (review finding I4): packing
+    both lane groups into a single call with ``initial_spins`` covering only the
+    seed rows makes the KERNEL apply the seeded run's shortened, midpoint-start beta
+    schedule to the whole call -- the nominally "cold" reads never see the hot end of
+    the ladder. The seeded call keeps that midpoint start (the geometric mean of the
+    beta range, Round 1's own ``seeded_sweep.py`` convention); the cold call passes no
+    ``initial_spins`` and no ``start_beta`` at all (illegal together per
+    ``Msa.sample_research``'s own contract), so it anneals the full ladder from the
+    hot end, unseeded. Both share the identical ``beta_range``, so the only
+    difference between them is exactly the one this comparison is meant to measure.
     """
     if seed_source not in SEED_SOURCES:
         raise ValueError(f"seed_source must be one of {SEED_SOURCES}, got {seed_source!r}")
@@ -1513,24 +1597,38 @@ def execute_seeded_sweep_job(
         lite_seed, _ = seed_for(manifest["hash"], "cpu-msa-f64", CPU_LITE_SWEEPS, 64, "cpu-lite-source")
         lanes = cpu_lite_seed_lanes(h, edges, j, lite_seed)
 
-    seed, seed_input_hash = seed_for(manifest["hash"], "cpu-msa-f64", sweeps, reads, f"{seed_source}-seeded")
+    seed, seed_input_hash = seed_for(manifest["hash"], "cpu-msa-f64", sweeps, SEED_LANES, f"{seed_source}-seeded")
+    cold_seed, cold_seed_input_hash = seed_for(manifest["hash"], "cpu-msa-f64", sweeps, COLD_LANES, "cold")
+
+    identity = solver_identity()
+    run_key = seeded_sweep_run_key(cell, nonce, bundles_root, seed_source, sweeps, identity)
 
     quip_msa = _msa()
     sampler = quip_msa.Msa()
     beta_range = quip_msa.default_beta_range(h, edges, j)
+    hot, cold = beta_range
+    seeded_start_beta = math.sqrt(hot * cold)
+    cold_start_beta = hot  # the unseeded call's own default: the full ladder starts hot.
     record: Dict[str, Any] = {
-        "schema": "round2-seeded-sweep-v1",
+        "schema": "round2-seeded-sweep-v2",
         "cell": cell, "nonce": nonce, "model_hash": manifest["hash"], "seed_source": seed_source,
         "sweeps": sweeps, "reads": reads, "seed_lanes": SEED_LANES, "cold_lanes": COLD_LANES,
         "seed": seed, "seed_input_hash": seed_input_hash, "lite_source_seed": lite_seed,
+        "cold_seed": cold_seed, "cold_seed_input_hash": cold_seed_input_hash,
         "unique_seed_lanes": lanes["unique_lanes"], "duplicate_seed_lanes": lanes["duplicate_lanes"],
-        "beta_range": [float(beta_range[0]), float(beta_range[1])],
+        "beta_range": [float(hot), float(cold)],
+        "seeded_start_beta": float(seeded_start_beta), "cold_start_beta": float(cold_start_beta),
+        "solver_identity": identity, "run_key": run_key,
     }
 
     try:
-        spins, energies, meta = sampler.sample_research(
-            h, edges, j, kernel="cpu-msa-f64", num_sweeps=sweeps, num_reads=reads,
-            seed=seed, beta_range=beta_range, initial_spins=lanes["spins"],
+        seeded_spins, _seeded_energies, seeded_meta = sampler.sample_research(
+            h, edges, j, kernel="cpu-msa-f64", num_sweeps=sweeps, num_reads=SEED_LANES,
+            seed=seed, beta_range=beta_range, initial_spins=lanes["spins"], start_beta=seeded_start_beta,
+        )
+        cold_spins, _cold_energies, cold_meta = sampler.sample_research(
+            h, edges, j, kernel="cpu-msa-f64", num_sweeps=sweeps, num_reads=COLD_LANES,
+            seed=cold_seed, beta_range=beta_range,
         )
     except ValueError as exc:
         # cpu-msa-f64 has no eligibility limit at all (unlike cpu-msa-unit): any
@@ -1539,9 +1637,11 @@ def execute_seeded_sweep_job(
         record.update(unsupported=False, unsupported_reason=None, exit_ok=False, error=f"{type(exc).__name__}: {exc}")
         return record, None
 
-    observed_kernel = meta["observed_kernel"]
-    if observed_kernel != "cpu-msa-f64":
-        raise RunnerError(f"{cell}/{nonce}: seeded sweep observed {observed_kernel!r}, not cpu-msa-f64")
+    for observed_kernel in (seeded_meta["observed_kernel"], cold_meta["observed_kernel"]):
+        if observed_kernel != "cpu-msa-f64":
+            raise RunnerError(f"{cell}/{nonce}: seeded sweep observed {observed_kernel!r}, not cpu-msa-f64")
+
+    spins = np.concatenate([seeded_spins, cold_spins], axis=0)
     rescored = regimes.energy(spins, h, edges, j)
     if not np.isfinite(rescored).all():
         raise RunnerError(f"{cell}/{nonce}: seeded sweep produced a nonfinite score")
@@ -1550,7 +1650,7 @@ def execute_seeded_sweep_job(
     cold_energies = rescored[SEED_LANES:]
     record.update(
         unsupported=False, unsupported_reason=None, exit_ok=True, error=None,
-        observed_kernel=observed_kernel, representation=meta["representation"],
+        observed_kernel="cpu-msa-f64", representation=seeded_meta["representation"],
         best_seeded_energy=float(seeded_energies.min()), best_cold_energy=float(cold_energies.min()),
         unique_reads=int(len(np.unique(spins, axis=0))),
     )
