@@ -123,6 +123,15 @@ def test_format_reconstructed_feasibility_does_not_call_an_ambiguous_share_exact
     assert text.startswith("3 / 4 (75%)")
 
 
+def test_lane_diversity_reports_unique_states_and_pairwise_hamming_distances():
+    spins = np.asarray([[1, 1, 1], [1, 1, -1], [-1, -1, -1]], dtype=np.int8)
+    assert metrics.lane_diversity(spins) == {
+        "unique_states": 3,
+        "mean_pairwise_hamming": 2.0,
+        "minimum_pairwise_hamming": 1,
+    }
+
+
 # ----------------------------------------------------------------- arm summary
 
 
@@ -272,7 +281,8 @@ def _cpu_record(
     return {
         "schema": "round2-cpu-run-v1", "cell": cell, "nonce": nonce, "requested_kernel": kernel,
         "sweeps": sweeps, "reads": 64, "exit_ok": exit_ok, "unsupported": unsupported,
-        "best_energy": best_energy, "wall_s": wall_s, "repetition_kind": "timing", "repetition_id": 0,
+        "best_energy": best_energy, "wall_s": wall_s, "elapsed_sampling_s": wall_s,
+        "repetition_kind": "timing", "repetition_id": 0,
         "variant": "timing",
     }
 
@@ -378,6 +388,82 @@ def test_depth_quality_time_table_labels_clean_contaminated_and_parallel_timing_
     assert "1 (1)" in row  # clean serial: median 1.0 s, n=1
     assert "100 (1)" in row  # contaminated: median 100 s, n=1
     assert "0.5 (1)" in row  # parallel: median 0.5 s, n=1
+
+
+def test_campaign_quality_uses_timing_subset_for_sampling_and_wall_time(tmp_path, monkeypatch):
+    cpu_root = tmp_path / "cpu"
+    campaign_dir = cpu_root / "campaign" / "native-pm1"
+    campaign_record = _cpu_record("native-pm1", "campaign-model", "cpu-sa", 512, best_energy=-7.0, wall_s=99.0)
+    campaign_record.update(timing_mode="parallel", elapsed_sampling_s=90.0)
+    _write_attempt(campaign_dir, "campaign-model", "cpu-sa", 512, 0, campaign_record)
+
+    timing_dir = cpu_root / "timing-subset" / "native-pm1"
+    timing_record = _cpu_record("native-pm1", "timing-model", "cpu-sa", 512, best_energy=-6.0, wall_s=2.0)
+    timing_record.update(timing_mode="serial", elapsed_sampling_s=1.25)
+    _write_attempt(timing_dir, "timing-model", "cpu-sa", 512, 0, timing_record)
+    out_dir = tmp_path / "report"
+    monkeypatch.setattr("sys.argv", [
+        "round2_report.py", "--cpu-root", str(cpu_root), "--run", "campaign",
+        "--out-dir", str(out_dir), "--cells", "native-pm1", "--kernels", "cpu-sa", "--depths", "512",
+    ])
+
+    assert report.main() == 0
+    draft = (out_dir / "REPORT.md").read_text(encoding="utf-8")
+    depth_section = draft.split("## Depth, quality, and time")[1].split("## ")[0]
+    row = next(line for line in depth_section.splitlines() if line.startswith("| `native-pm1` | `cpu-sa` | 512 |"))
+    assert "timing-subset" in depth_section
+    assert "1.25 (1)" in row  # clean sampling seconds come from the matched subset
+    assert "2 (1)" in row  # end-to-end wall seconds come from the matched subset
+    assert [cell.strip() for cell in row.split("|")][10] == "-7"  # quality remains from campaign records
+    figure = (out_dir / "quality-time-native-pm1.svg").read_text(encoding="utf-8")
+    assert "median sampling 1.25 s" in figure
+    assert "median wall 2 s" in figure
+
+
+def test_campaign_without_timing_subset_reports_reason_and_never_uses_parallel_time(tmp_path, monkeypatch):
+    cpu_root = tmp_path / "cpu"
+    campaign_dir = cpu_root / "campaign" / "native-pm1"
+    campaign_record = _cpu_record("native-pm1", "campaign-model", "cpu-sa", 512, best_energy=-7.0, wall_s=0.25)
+    campaign_record.update(timing_mode="parallel", elapsed_sampling_s=0.1)
+    _write_attempt(campaign_dir, "campaign-model", "cpu-sa", 512, 0, campaign_record)
+    out_dir = tmp_path / "report"
+    monkeypatch.setattr("sys.argv", [
+        "round2_report.py", "--cpu-root", str(cpu_root), "--run", "campaign",
+        "--out-dir", str(out_dir), "--cells", "native-pm1", "--kernels", "cpu-sa", "--depths", "512",
+    ])
+
+    assert report.main() == 0
+    draft = (out_dir / "REPORT.md").read_text(encoding="utf-8")
+    depth_section = draft.split("## Depth, quality, and time")[1].split("## ")[0]
+    row = next(line for line in depth_section.splitlines() if line.startswith("| `native-pm1` | `cpu-sa` | 512 |"))
+    assert "timing-subset" in depth_section
+    cells = [cell.strip() for cell in row.split("|")]
+    assert "no matching clean timing-subset record" in cells[11]
+    assert "no matching clean timing-subset record" in cells[12]
+    assert cells[14] == "0.25 (1)"  # still shown under parallel, never used as clean time
+    figure = (out_dir / "quality-time-native-pm1.svg").read_text(encoding="utf-8")
+    assert "No clean timing-subset record" in figure
+    assert "<circle" not in figure
+
+
+def test_lane_diversity_table_separates_seeded_and_cold_lanes_from_v2_samples(tmp_path):
+    spins = np.asarray([
+        [1, 1, 1], [1, 1, -1],  # seeded lanes: distance 1
+        [-1, -1, -1], [-1, 1, -1],  # cold lanes: distance 1
+    ], dtype=np.int8)
+    samples_path = tmp_path / "seeded-v2.npz"
+    np.savez_compressed(samples_path, spins=spins)
+    record = {
+        "schema": "round2-seeded-sweep-v2", "cell": "native-pm1", "nonce": "model-a",
+        "seed_source": "qpu", "sweeps": 32768, "seed_lanes": 2, "cold_lanes": 2,
+        "exit_ok": True, "unsupported": False, "_samples_path": str(samples_path),
+    }
+
+    lines = report.lane_diversity_table({"native-pm1": [record]})
+    seeded_row = next(line for line in lines if "| seeded |" in line)
+    cold_row = next(line for line in lines if "| cold |" in line)
+    assert "| 1 | 2 | 1 | 1 |" in seeded_row
+    assert "| 1 | 2 | 1 | 1 |" in cold_row
 
 
 def test_feasibility_table_formats_the_regression_case_and_flags_unknown_weighting():

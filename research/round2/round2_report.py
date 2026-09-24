@@ -99,28 +99,30 @@ def load_cpu_records(run_dir: Path, cell: str) -> List[Dict[str, Any]]:
     cell_dir = Path(run_dir) / cell
     if not cell_dir.exists():
         return []
-    attempts_by_base: Dict[str, Dict[int, Dict[str, Any]]] = {}
+    attempts_by_base: Dict[str, Dict[int, Tuple[Dict[str, Any], Path]]] = {}
     for path in cell_dir.glob("*__attempt*.json"):
         match = _ATTEMPT_RE.match(path.name)
         if match is None:
             continue
         base = match.group("base")
         attempt = int(match.group("attempt"))
-        attempts_by_base.setdefault(base, {})[attempt] = json.loads(path.read_text(encoding="utf-8"))
+        attempts_by_base.setdefault(base, {})[attempt] = (json.loads(path.read_text(encoding="utf-8")), path)
 
     records: List[Dict[str, Any]] = []
     for by_attempt in attempts_by_base.values():
-        ok_attempts = {n: r for n, r in by_attempt.items() if r.get("exit_ok")}
+        ok_attempts = {n: pair for n, pair in by_attempt.items() if pair[0].get("exit_ok")}
         if not ok_attempts:
-            records.append(by_attempt[max(by_attempt)])
+            records.append(by_attempt[max(by_attempt)][0])
             continue
-        quality_record = ok_attempts[max(ok_attempts)]
+        quality_record, quality_path = ok_attempts[max(ok_attempts)]
         clean_attempts = {
-            n: r for n, r in ok_attempts.items() if not bool((r.get("host") or {}).get("contaminated"))
+            n: pair for n, pair in ok_attempts.items()
+            if not bool((pair[0].get("host") or {}).get("contaminated"))
         }
         record = dict(quality_record)
+        record["_samples_path"] = str(quality_path.with_suffix(".npz"))
         if clean_attempts:
-            clean_record = clean_attempts[max(clean_attempts)]
+            clean_record = clean_attempts[max(clean_attempts)][0]
             if clean_record is not quality_record:
                 for field in ("wall_s", "host", "timing_mode", "concurrent_workers"):
                     if field in clean_record:
@@ -134,7 +136,12 @@ def load_seeded_sweep_records(seeded_root: Path, cell: str) -> List[Dict[str, An
     cell_dir = Path(seeded_root) / cell
     if not cell_dir.exists():
         return []
-    return [json.loads(path.read_text(encoding="utf-8")) for path in sorted(cell_dir.glob("*.json"))]
+    records = []
+    for path in sorted(cell_dir.glob("*.json")):
+        record = json.loads(path.read_text(encoding="utf-8"))
+        record["_samples_path"] = str(path.with_suffix(".npz"))
+        records.append(record)
+    return records
 
 
 def load_portfolio_deadline(path: Path) -> List[Dict[str, Any]]:
@@ -320,7 +327,15 @@ def _timing_cell(summary: Dict[str, Any], label: str) -> str:
 def depth_quality_time_table(
     records_by_cell: Dict[str, List[Dict[str, Any]]],
     *, kernels: Sequence[str], depths: Sequence[int], expected_per_arm: Optional[int] = None,
+    timing_records_by_cell: Optional[Dict[str, List[Dict[str, Any]]]] = None,
+    timing_source: Optional[str] = None,
 ) -> List[str]:
+    timing_label = timing_source or "quality run"
+    quality_source_note = (
+        "Campaign quality remains from campaign records. "
+        if timing_source == "timing-subset" else "Quality remains from the selected run. "
+    )
+    time_records_by_cell = timing_records_by_cell if timing_records_by_cell is not None else records_by_cell
     lines = [
         "## Depth, quality, and time", "",
         "Every row is one (cell, kernel, sweep depth) arm. Missing, failed, unsupported, and nonfinite "
@@ -329,24 +344,111 @@ def depth_quality_time_table(
         "condition. A completed energy result is equally valid on a clean host or a busy one. Wall time "
         "gets separate treatment. A contaminated run or a parallel-worker run measures a different host "
         "condition than a clean serial run, so this table always reports their medians apart, as "
-        "`median (n)` for each label, and never pools them into one number (review, Important item 1).", "",
+        "`median (n)` for each label, and never pools them into one number (review, Important item 1). "
+        f"Clean sampling and end-to-end timing use `{timing_label}` records. {quality_source_note}"
+        "Sampling time is `elapsed_sampling_s`. Wall time remains end-to-end.", "",
         "| Cell | Kernel | Sweeps | Observed | Missing | Completed | Failed | Unsupported | Nonfinite "
-        "| Median best energy | Wall s, clean serial (n) | Wall s, contaminated (n) | Wall s, parallel (n) |",
-        "| -- | -- | -- | -- | -- | -- | -- | -- | -- | -- | -- | -- | -- |",
+        f"| Median best energy | Sampling s, clean serial from {timing_label} (n) "
+        f"| Wall s, clean serial from {timing_label} (n) | Wall s, contaminated (n) | Wall s, parallel (n) |",
+        "| -- | -- | -- | -- | -- | -- | -- | -- | -- | -- | -- | -- | -- | -- |",
     ]
     for cell, records in records_by_cell.items():
         for kernel in kernels:
             for sweeps in depths:
                 arm = [r for r in records if r.get("requested_kernel") == kernel and r.get("sweeps") == sweeps]
                 summary = metrics.summarize_arm(arm, expected=expected_per_arm)
+                source_records = time_records_by_cell.get(cell, [])
+                timing_arm = [
+                    r for r in source_records
+                    if r.get("requested_kernel") == kernel and r.get("sweeps") == sweeps
+                ]
+                clean_timing = [
+                    r for r in timing_arm
+                    if r.get("exit_ok") and not r.get("unsupported")
+                    and r.get("timing_mode") != "parallel"
+                    and not bool((r.get("host") or {}).get("contaminated"))
+                ]
+                sampling_values = [
+                    float(r["elapsed_sampling_s"])
+                    for r in clean_timing
+                    if r.get("elapsed_sampling_s") is not None
+                    and math.isfinite(float(r["elapsed_sampling_s"]))
+                ]
+                clean_summary = metrics.summarize_arm(clean_timing)
+                clean_wall = clean_summary["timing_by_label"].get(metrics.CLEAN_SERIAL)
+                missing_reason = "no matching clean timing-subset record" if timing_source == "timing-subset" and not clean_timing else None
+                sampling_cell = (
+                    f"{fmt(float(np.median(sampling_values)))} ({len(sampling_values)})" if sampling_values
+                    else f"n/a (0; {missing_reason or 'no sampling-time observations'})"
+                )
+                wall_cell = (
+                    f"{fmt(clean_wall['median_wall_s'])} ({clean_wall['n']})" if clean_wall and clean_wall["n"]
+                    else f"n/a (0; {missing_reason or 'no clean serial wall-time observations'})"
+                )
                 lines.append(
                     f"| `{cell}` | `{kernel}` | {sweeps} | {summary['observed']} | {fmt(summary['missing'])} | "
                     f"{summary['completed']} | {summary['failed']} | {summary['unsupported']} | "
                     f"{summary['nonfinite']} | {fmt(summary['median_best_energy'])} | "
-                    f"{_timing_cell(summary, metrics.CLEAN_SERIAL)} | "
+                    f"{sampling_cell} | {wall_cell} | "
                     f"{_timing_cell(summary, metrics.CONTAMINATED)} | "
                     f"{_timing_cell(summary, metrics.PARALLEL)} |"
                 )
+    return lines
+
+
+def lane_diversity_table(records_by_cell: Dict[str, List[Dict[str, Any]]]) -> List[str]:
+    """Summarize saved-read diversity per arm, keeping each record's pairs within
+    its own model and separating the seeded-sweep-v2 lane groups."""
+    grouped: Dict[Tuple[str, str, int, str, str], List[Dict[str, Any]]] = {}
+    for cell, records in records_by_cell.items():
+        for record in records:
+            if not record.get("exit_ok") or record.get("unsupported"):
+                continue
+            if str(record.get("schema", "")).startswith("round2-seeded-sweep-") and record.get("schema") != "round2-seeded-sweep-v2":
+                continue
+            samples_path = record.get("_samples_path")
+            if not samples_path or not Path(samples_path).is_file():
+                continue
+            with np.load(samples_path) as data:
+                spins = np.asarray(data["spins"])
+            if record.get("schema") == "round2-seeded-sweep-v2":
+                kernel = str(record.get("observed_kernel", "cpu-msa-f64"))
+                seed_source = str(record.get("seed_source", "unknown"))
+                seed_count = int(record["seed_lanes"])
+                cold_count = int(record["cold_lanes"])
+                batches = (
+                    ("seeded", spins[:seed_count]),
+                    ("cold", spins[seed_count:seed_count + cold_count]),
+                )
+            else:
+                kernel = str(record.get("requested_kernel", "unknown"))
+                seed_source = ""
+                batches = (("all", spins),)
+            for lane_group, batch in batches:
+                key = (cell, kernel, int(record["sweeps"]), lane_group, seed_source)
+                grouped.setdefault(key, []).append(metrics.lane_diversity(batch))
+
+    lines = [
+        "## Lane diversity by arm", "",
+        "Unique states and pairwise Hamming distances come from each saved `.npz` spin batch. Per-arm "
+        "unique counts and mean distances are averages across records. The minimum is the lowest within-record "
+        "pairwise distance. Seeded-sweep-v2 separates the saved seeded and cold lane batches.", "",
+        "| Cell | Kernel / seed source | Sweeps | Lane group | Records | Mean unique states / record | "
+        "Mean pairwise Hamming / record | Minimum pairwise Hamming |",
+        "| -- | -- | -- | -- | -- | -- | -- | -- |",
+    ]
+    for (cell, kernel, sweeps, lane_group, seed_source), values in sorted(grouped.items()):
+        pair_means = [value["mean_pairwise_hamming"] for value in values if value["mean_pairwise_hamming"] is not None]
+        pair_mins = [value["minimum_pairwise_hamming"] for value in values if value["minimum_pairwise_hamming"] is not None]
+        kernel_label = f"{kernel} ({seed_source})" if seed_source else kernel
+        lines.append(
+            f"| `{cell}` | `{kernel_label}` | {sweeps} | {lane_group} | {len(values)} | "
+            f"{fmt(float(np.mean([value['unique_states'] for value in values])))} | "
+            f"{fmt(float(np.mean(pair_means))) if pair_means else 'n/a'} | "
+            f"{min(pair_mins) if pair_mins else 'n/a'} |"
+        )
+    if not grouped:
+        lines.append("| n/a | n/a | n/a | n/a | 0 | n/a | n/a | n/a |")
     return lines
 
 
@@ -453,7 +555,7 @@ def qpu_outcome_table(
     if not any_row:
         lines.append("")
         lines.append(
-            "No comparable pairs. No cell has both a physical-pilot QPU capture and a matching CPU arm yet."
+            "No comparable pairs exist because no cell has both a physical-pilot QPU capture and a matching CPU arm yet."
         )
     return lines
 
@@ -500,7 +602,7 @@ def paired_gaps_table(
     if not any_row:
         lines.append("")
         lines.append(
-            "No comparable pairs. No cell has both a physical-pilot QPU capture and a matching CPU arm yet."
+            "No comparable pairs exist because no cell has both a physical-pilot QPU capture and a matching CPU arm yet."
         )
     return lines
 
@@ -868,9 +970,10 @@ def _chart_header(title: str, subtitle: str, width: int, left_margin: int = 10) 
 
 def quality_time_figure(
     cell: str, records: Sequence[Dict[str, Any]], kernels: Sequence[str], depths: Sequence[int],
+    *, timing_records: Optional[Sequence[Dict[str, Any]]] = None, timing_source: Optional[str] = None,
 ) -> str:
-    """One quality/time panel per regime (task brief, step 7): median wall time
-    (x, log-scaled) against median best energy (y) for every (kernel, depth) arm.
+    """One quality/time panel per regime: clean median sampling time (x,
+    log-scaled) against median best energy (y) for every (kernel, depth) arm.
 
     Readable as a static image, not only via hover tooltips (review, Important
     item 7): the caption word-wraps inside the canvas, both axes carry visible
@@ -886,21 +989,41 @@ def quality_time_figure(
     margin = 90
     max_chars = max(20, int((width - 2 * margin) / (12 * 0.6)))
 
-    points: List[Tuple[str, int, float, float, int]] = []
+    points: List[Tuple[str, int, float, float, float, int, int]] = []
     incomplete: List[str] = []
     for kernel in kernels:
         for sweeps in depths:
             arm = [r for r in records if r.get("requested_kernel") == kernel and r.get("sweeps") == sweeps]
             summary = metrics.summarize_arm(arm)
-            if summary["median_best_energy"] is None or summary["median_wall_s"] is None:
-                incomplete.append(f"{kernel}@{sweeps}")
+            time_records = timing_records if timing_records is not None else records
+            time_arm = [r for r in time_records if r.get("requested_kernel") == kernel and r.get("sweeps") == sweeps]
+            clean_time_arm = [
+                r for r in time_arm
+                if r.get("exit_ok") and not r.get("unsupported") and r.get("timing_mode") != "parallel"
+                and not bool((r.get("host") or {}).get("contaminated"))
+            ]
+            sampling_values = [
+                float(r["elapsed_sampling_s"])
+                for r in clean_time_arm
+                if r.get("elapsed_sampling_s") is not None and math.isfinite(float(r["elapsed_sampling_s"]))
+            ]
+            timing_summary = metrics.summarize_arm(clean_time_arm)
+            wall = timing_summary["median_wall_s"]
+            if summary["median_best_energy"] is None or not sampling_values:
+                reason = "No clean timing-subset record" if timing_source == "timing-subset" else "No clean sampling time"
+                incomplete.append(f"{kernel}@{sweeps} ({reason})")
                 continue
-            points.append((kernel, sweeps, summary["median_wall_s"], summary["median_best_energy"], summary["completed"]))
+            sampling = float(np.median(sampling_values))
+            points.append((
+                kernel, sweeps, sampling, float(wall) if wall is not None else float("nan"),
+                summary["median_best_energy"], summary["completed"], len(sampling_values),
+            ))
 
     caption = (
-        "Energy units: canonical, rescored from the original model, lower is better. Wall time is the "
-        "clean-serial median only. Contaminated and parallel-worker runs are reported separately in the "
-        "depth table, never pooled here. No application deadline applies to this arm."
+        "Energy units: canonical, rescored from the original model, lower is better. The x axis uses "
+        f"clean-serial elapsed_sampling_s from {timing_source or 'the quality run'}; end-to-end wall_s "
+        "(wall time) is retained separately in the table and point details. Contaminated and parallel-worker runs "
+        "are never pooled into this timing axis."
     )
     body_parts: List[str] = [f'<text x="{margin}" y="24" font-size="16" font-weight="bold">{cell}: quality vs. time (CPU)</text>']
     y_cursor = 42
@@ -926,7 +1049,7 @@ def quality_time_figure(
         legend_x = margin
         legend_y = plot_top + 4
         for kernel, color in colors.items():
-            n_values = sorted({p[4] for p in points if p[0] == kernel})
+            n_values = sorted({p[5] for p in points if p[0] == kernel})
             label = f"{kernel} (n={','.join(str(n) for n in n_values)})"
             body_parts.append(f'<rect x="{legend_x}" y="{legend_y}" width="12" height="12" fill="{color}"/>')
             body_parts.append(f'<text x="{legend_x + 16}" y="{legend_y + 11}" font-size="12">{label}</text>')
@@ -934,7 +1057,7 @@ def quality_time_figure(
         plot_top = legend_y + 26
 
         raw_wall = [p[2] for p in points]
-        raw_energy = [p[3] for p in points]
+        raw_energy = [p[4] for p in points]
         log_wall = [math.log10(max(w, 1e-9)) for w in raw_wall]
         x_min, x_max = _pad_range(min(log_wall), max(log_wall))
         y_min, y_max = _pad_range(min(raw_energy), max(raw_energy))
@@ -942,13 +1065,14 @@ def quality_time_figure(
         y_span = y_max - y_min
         plot_height = height - margin - plot_top
 
-        for kernel, sweeps, wall_s, energy, n in points:
-            x = margin + (math.log10(max(wall_s, 1e-9)) - x_min) / x_span * (width - 2 * margin)
+        for kernel, sweeps, sampling_s, wall_s, energy, n, timing_n in points:
+            x = margin + (math.log10(max(sampling_s, 1e-9)) - x_min) / x_span * (width - 2 * margin)
             y = height - margin - (energy - y_min) / y_span * plot_height
             body_parts.append(
                 f'<circle cx="{x:.1f}" cy="{y:.1f}" r="6" fill="{colors[kernel]}" fill-opacity="0.85">'
-                f'<title>{kernel} @ {sweeps} sweeps: median wall {wall_s:.3g} s, '
-                f'median best energy {energy:.6g}, n={n}</title></circle>'
+                f'<title>{kernel} @ {sweeps} sweeps: median sampling {sampling_s:.3g} s, '
+                f'median wall {wall_s:.3g} s, median best energy {energy:.6g}, '
+                f'quality n={n}, timing n={timing_n}</title></circle>'
                 # The sweep count is part of the visible label, not only the kernel's
                 # count (fix round 2: "nothing says which depth is which" when a
                 # kernel has one point per depth and both only ever said "n=15").
@@ -967,7 +1091,7 @@ def quality_time_figure(
             )
         body_parts.append(
             f'<text x="{(margin + width - margin) / 2:.0f}" y="{height - margin + 32}" font-size="11" '
-            'text-anchor="middle">Median wall time (s), log scale</text>'
+            'text-anchor="middle">Median sampling time (s), log scale</text>'
         )
         for tick in _axis_ticks(y_min, y_max, count=5):
             tick_y = height - margin - (tick - y_min) / y_span * plot_height
@@ -1235,12 +1359,20 @@ def write_figures(
     out_dir: Path, records_by_cell: Dict[str, List[Dict[str, Any]]], kernels: Sequence[str], depths: Sequence[int],
     capture_proposal: Optional[Dict[str, Any]], portfolio_records: Sequence[Dict[str, Any]],
     captures_by_arm: Optional[Dict[Tuple[str, float, int], List[Dict[str, Any]]]] = None,
+    timing_records_by_cell: Optional[Dict[str, List[Dict[str, Any]]]] = None,
+    timing_source: Optional[str] = None,
 ) -> List[Path]:
     out_dir.mkdir(parents=True, exist_ok=True)
     paths = []
     for cell, records in records_by_cell.items():
         path = out_dir / f"quality-time-{cell}.svg"
-        path.write_text(quality_time_figure(cell, records, kernels, depths), encoding="utf-8")
+        path.write_text(
+            quality_time_figure(
+                cell, records, kernels, depths,
+                timing_records=(timing_records_by_cell or {}).get(cell), timing_source=timing_source,
+            ),
+            encoding="utf-8",
+        )
         paths.append(path)
     captured_regimes = {cell for cell, _scale, _anneal in (captures_by_arm or {})}
     physical_path = out_dir / "physical-scale-plan.svg"
@@ -1272,6 +1404,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=(__doc__ or "").split("\n\n")[0])
     parser.add_argument("--cpu-root", required=True, help="Root of the CPU comparison output (contains pilot/, campaign/).")
     parser.add_argument("--run", default="pilot", choices=("pilot", "campaign"))
+    parser.add_argument(
+        "--timing-subset-root", default=None,
+        help="Clean serial timing source for campaign quality reports; defaults to cpu-root/timing-subset.",
+    )
     parser.add_argument("--cells", nargs="+", default=list(regimes.CELL_NAMES))
     parser.add_argument("--kernels", nargs="+", default=list(DEFAULT_KERNELS))
     parser.add_argument(
@@ -1300,6 +1436,16 @@ def main(argv: Optional[List[str]] = None) -> int:
     depths = args.depths or (list(PILOT_DEPTHS) if args.run == "pilot" else list(FULL_DEPTHS))
 
     records_by_cell = {cell: load_cpu_records(run_dir, cell) for cell in args.cells}
+    timing_source = "timing-subset" if args.run == "campaign" else None
+    timing_records_by_cell = (
+        {
+            cell: load_cpu_records(
+                Path(args.timing_subset_root) if args.timing_subset_root else cpu_root / "timing-subset", cell,
+            )
+            for cell in args.cells
+        }
+        if timing_source else None
+    )
     seeded_by_cell = (
         {cell: load_seeded_sweep_records(Path(args.seeded_root), cell) for cell in args.cells}
         if args.seeded_root else {}
@@ -1340,7 +1486,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     lines += solver_settings_table(records_by_cell) + [""]
     lines += depth_quality_time_table(
         records_by_cell, kernels=args.kernels, depths=depths, expected_per_arm=expected_per_arm,
+        timing_records_by_cell=timing_records_by_cell, timing_source=timing_source,
     ) + [""]
+    diversity_records_by_cell = {
+        cell: records + seeded_by_cell.get(cell, []) for cell, records in records_by_cell.items()
+    }
+    lines += lane_diversity_table(diversity_records_by_cell) + [""]
     lines += cpu_kernel_gap_table(records_by_cell, kernels=args.kernels, depths=depths) + [""]
     lines += qpu_outcome_table(args.cells, captures_by_arm, records_by_cell, args.kernels, depths) + [""]
     lines += paired_gaps_table(args.cells, captures_by_arm, records_by_cell, args.kernels, depths) + [""]
@@ -1366,7 +1517,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
     report_path = out_dir / "REPORT.md"
     report_path.write_text("\n".join(lines), encoding="utf-8")
-    write_figures(out_dir, records_by_cell, args.kernels, depths, capture_proposal, portfolio_records, captures_by_arm)
+    write_figures(
+        out_dir, records_by_cell, args.kernels, depths, capture_proposal, portfolio_records, captures_by_arm,
+        timing_records_by_cell=timing_records_by_cell, timing_source=timing_source,
+    )
     print(f"wrote {report_path}")
     return 0
 

@@ -220,6 +220,23 @@ def summarize_arm(records: Sequence[Mapping[str, Any]], expected: Optional[int] 
     }
 
 
+def lane_diversity(spins: np.ndarray) -> Dict[str, Any]:
+    """Unique states and pairwise Hamming distances for one reads-by-spins matrix."""
+    states = np.asarray(spins)
+    if states.ndim != 2:
+        raise ValueError("spins must be a two-dimensional reads-by-spins array")
+    distances = [
+        int(np.count_nonzero(states[left] != states[right]))
+        for left in range(len(states))
+        for right in range(left + 1, len(states))
+    ]
+    return {
+        "unique_states": int(len(np.unique(states, axis=0))),
+        "mean_pairwise_hamming": float(np.mean(distances)) if distances else None,
+        "minimum_pairwise_hamming": min(distances) if distances else None,
+    }
+
+
 def denominator_text(count: int, total: int) -> str:
     """``"N of M"``, so a percentage never appears without stating what it is a share of."""
     return f"{count} of {total}"
