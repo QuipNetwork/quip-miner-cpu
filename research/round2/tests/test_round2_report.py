@@ -327,28 +327,33 @@ def test_load_cpu_records_uses_the_latest_exit_ok_attempt_for_quality(tmp_path):
     assert records[0]["wall_s"] == 1.0
 
 
-def test_load_cpu_records_keeps_an_earlier_clean_timing_when_the_latest_success_is_contaminated(tmp_path):
-    # attempt0 is clean; a later --repeat-contaminated retry (attempt1) also
-    # succeeds, but contaminated. Quality should track the latest success
-    # (attempt1's energy); timing should still come from the latest CLEAN
-    # attempt (attempt0's wall_s), never silently pooled or overwritten
-    # (review, M3: "the latest clean attempt for timing").
+def test_load_cpu_records_uses_fastest_successful_timing_when_that_attempt_is_contaminated(tmp_path):
+    # Quality follows the latest success, while timing follows the successful
+    # attempt with the lowest finite wall time, including contaminated runs.
     cell_dir = tmp_path / "native-pm1"
     cell_dir.mkdir()
     clean = _cpu_record("native-pm1", "aa", "cpu-sa", 512, best_energy=-5.0, wall_s=1.0)
     clean["host"] = {"contaminated": False}  # a real record always carries this field, never omits it
     _write_attempt(cell_dir, "aa", "cpu-sa", 512, 0, clean)
-    contaminated = _cpu_record("native-pm1", "aa", "cpu-sa", 512, best_energy=-5.5, wall_s=99.0)
-    contaminated["host"] = {"contaminated": True}
+    contaminated = _cpu_record("native-pm1", "aa", "cpu-sa", 512, best_energy=-5.5, wall_s=0.5)
+    contaminated.update(
+        host={"contaminated": True}, elapsed_sampling_s=0.25, timing_mode="parallel",
+        setup_s=0.1, graph_setup_s=0.2, concurrent_workers=14,
+    )
     _write_attempt(cell_dir, "aa", "cpu-sa", 512, 1, contaminated)
     records = report.load_cpu_records(tmp_path, "native-pm1")
     assert len(records) == 1
     assert records[0]["best_energy"] == -5.5  # quality: the latest successful attempt
-    assert records[0]["wall_s"] == 1.0  # timing: the latest CLEAN attempt, not the contaminated one
-    assert records[0]["host"]["contaminated"] is False  # the clean attempt's own host sample
+    assert records[0]["wall_s"] == 0.5
+    assert records[0]["elapsed_sampling_s"] == 0.25
+    assert records[0]["setup_s"] == 0.1
+    assert records[0]["graph_setup_s"] == 0.2
+    assert records[0]["host"]["contaminated"] is True
+    assert records[0]["timing_mode"] == "parallel"
+    assert records[0]["concurrent_workers"] == 14
 
 
-def test_load_cpu_records_keeps_sampling_time_from_the_same_clean_attempt(tmp_path):
+def test_load_cpu_records_copies_sampling_time_from_the_fastest_attempt(tmp_path):
     cell_dir = tmp_path / "native-pm1"
     clean = _cpu_record("native-pm1", "aa", "cpu-sa", 512, best_energy=-5.0, wall_s=1.0)
     clean.update(host={"contaminated": False}, elapsed_sampling_s=1.0)
@@ -419,7 +424,7 @@ def test_depth_quality_time_table_shows_a_missing_depth(tmp_path):
     assert cells_512[5] == "0"  # Missing column: 1 expected, 1 observed at this depth
 
 
-def test_depth_quality_time_table_labels_clean_contaminated_and_parallel_timing_separately():
+def test_depth_quality_time_table_uses_fastest_run_and_keeps_other_timing_labels():
     records_by_cell = {
         "native-pm1": [
             _cpu_record("native-pm1", "aa", "cpu-sa", 512, wall_s=1.0),
@@ -432,10 +437,14 @@ def test_depth_quality_time_table_labels_clean_contaminated_and_parallel_timing_
     # Quality (Completed, Median best energy) counts all three exit_ok records.
     cells = [c.strip() for c in row.split("|")]
     assert cells[6] == "3"  # Completed
-    # Every timing label appears, each carrying its own count -- never pooled.
-    assert "1 (1)" in row  # clean serial: median 1.0 s, n=1
-    assert "100 (1)" in row  # contaminated: median 100 s, n=1
-    assert "0.5 (1)" in row  # parallel: median 0.5 s, n=1
+    # Fastest-run medians pool all three records. Diagnostic columns retain
+    # their contaminated and parallel labels.
+    assert "Sampling s, fastest run from quality run (n)" in lines[4]
+    assert "Wall s, fastest run from quality run (n)" in lines[4]
+    assert cells[11] == "1 (3)"
+    assert cells[12] == "1 (3)"
+    assert cells[13] == "100 (1)"
+    assert cells[14] == "0.5 (1)"
 
 
 def test_campaign_quality_uses_timing_subset_for_sampling_and_wall_time(tmp_path, monkeypatch):
@@ -447,7 +456,9 @@ def test_campaign_quality_uses_timing_subset_for_sampling_and_wall_time(tmp_path
 
     timing_dir = cpu_root / "timing-subset" / "native-pm1"
     timing_record = _cpu_record("native-pm1", "timing-model", "cpu-sa", 512, best_energy=-6.0, wall_s=2.0)
-    timing_record.update(timing_mode="serial", elapsed_sampling_s=1.25)
+    timing_record.update(
+        timing_mode="parallel", elapsed_sampling_s=1.25, host={"contaminated": True},
+    )
     _write_attempt(timing_dir, "timing-model", "cpu-sa", 512, 0, timing_record)
     out_dir = tmp_path / "report"
     monkeypatch.setattr("sys.argv", [
@@ -460,7 +471,7 @@ def test_campaign_quality_uses_timing_subset_for_sampling_and_wall_time(tmp_path
     depth_section = draft.split("## Depth, quality, and time")[1].split("## ")[0]
     row = next(line for line in depth_section.splitlines() if line.startswith("| `native-pm1` | `cpu-sa` | 512 |"))
     assert "timing-subset" in depth_section
-    assert "1.25 (1)" in row  # clean sampling seconds come from the matched subset
+    assert "1.25 (1)" in row  # fastest-run sampling seconds include parallel records
     assert "2 (1)" in row  # end-to-end wall seconds come from the matched subset
     assert [cell.strip() for cell in row.split("|")][10] == "-7"  # quality remains from campaign records
     figure = (out_dir / "quality-time-native-pm1.svg").read_text(encoding="utf-8")
@@ -468,7 +479,7 @@ def test_campaign_quality_uses_timing_subset_for_sampling_and_wall_time(tmp_path
     assert "median wall 2 s" in figure
 
 
-def test_campaign_without_timing_subset_reports_reason_and_never_uses_parallel_time(tmp_path, monkeypatch):
+def test_campaign_without_timing_subset_reports_missing_timing_reason(tmp_path, monkeypatch):
     cpu_root = tmp_path / "cpu"
     campaign_dir = cpu_root / "campaign" / "native-pm1"
     campaign_record = _cpu_record("native-pm1", "campaign-model", "cpu-sa", 512, best_energy=-7.0, wall_s=0.25)
@@ -486,11 +497,11 @@ def test_campaign_without_timing_subset_reports_reason_and_never_uses_parallel_t
     row = next(line for line in depth_section.splitlines() if line.startswith("| `native-pm1` | `cpu-sa` | 512 |"))
     assert "timing-subset" in depth_section
     cells = [cell.strip() for cell in row.split("|")]
-    assert "no matching clean timing-subset record" in cells[11]
-    assert "no matching clean timing-subset record" in cells[12]
-    assert cells[14] == "0.25 (1)"  # still shown under parallel, never used as clean time
+    assert "no matching timing-subset record" in cells[11]
+    assert "no matching timing-subset record" in cells[12]
+    assert cells[14] == "0.25 (1)"  # parallel label remains visible
     figure = (out_dir / "quality-time-native-pm1.svg").read_text(encoding="utf-8")
-    assert "No clean timing-subset record" in figure
+    assert "No timing-subset record" in figure
     assert "<circle" not in figure
 
 

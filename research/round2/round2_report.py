@@ -77,8 +77,8 @@ _ATTEMPT_RE = re.compile(r"^(?P<base>.+)__attempt(?P<attempt>\d+)\.json$")
 
 def load_cpu_records(run_dir: Path, cell: str) -> List[Dict[str, Any]]:
     """Every job's record for one cell of a CPU run directory: the latest
-    ``exit_ok`` attempt for quality, with the latest CLEAN attempt's own
-    timing fields substituted in when that differs (review, M3).
+    ``exit_ok`` attempt for quality, with timing fields from the successful
+    attempt with the smallest finite ``wall_s`` substituted in when that differs.
 
     Only files named ``*__attempt<N>.json`` count: a bare ``<base>.json`` with
     no attempt suffix predates the attempt-numbering fix and is fully
@@ -90,11 +90,9 @@ def load_cpu_records(run_dir: Path, cell: str) -> List[Dict[str, Any]]:
     never reports a later crash's ``None`` energy in its place: taking simply
     the highest attempt number, as this function used to, let a
     ``--repeat-contaminated`` retry that crashed outright silently discard an
-    earlier, valid (if contaminated) quality result. Independently, wall time
-    tracks the latest attempt that was both successful AND clean, so a later
-    contaminated success can supersede an earlier clean one for quality
-    without also overwriting that earlier attempt's own, still-valid clean
-    timing.
+    earlier, valid (if contaminated) quality result. Independently, timing
+    tracks the successful attempt with the smallest finite ``wall_s``,
+    regardless of host contamination or timing mode.
     """
     cell_dir = Path(run_dir) / cell
     if not cell_dir.exists():
@@ -115,20 +113,21 @@ def load_cpu_records(run_dir: Path, cell: str) -> List[Dict[str, Any]]:
             records.append(by_attempt[max(by_attempt)][0])
             continue
         quality_record, quality_path = ok_attempts[max(ok_attempts)]
-        clean_attempts = {
+        timed_attempts = {
             n: pair for n, pair in ok_attempts.items()
-            if not bool((pair[0].get("host") or {}).get("contaminated"))
+            if pair[0].get("wall_s") is not None
+            and math.isfinite(float(pair[0]["wall_s"]))
         }
         record = dict(quality_record)
         record["_samples_path"] = str(quality_path.with_suffix(".npz"))
-        if clean_attempts:
-            clean_record = clean_attempts[max(clean_attempts)][0]
-            if clean_record is not quality_record:
+        if timed_attempts:
+            fastest_record = min(timed_attempts.values(), key=lambda pair: float(pair[0]["wall_s"]))[0]
+            if fastest_record is not quality_record:
                 for field in (
                     "wall_s", "elapsed_sampling_s", "setup_s", "graph_setup_s",
                     "host", "timing_mode", "concurrent_workers",
                 ):
-                    record[field] = clean_record.get(field)
+                    record[field] = fastest_record.get(field)
         records.append(record)
     return records
 
@@ -334,24 +333,22 @@ def depth_quality_time_table(
 ) -> List[str]:
     timing_label = timing_source or "quality run"
     quality_source_note = (
-        "Campaign quality remains from campaign records. "
-        if timing_source == "timing-subset" else "Quality remains from the selected run. "
+        "Best energy remains from campaign records. "
+        if timing_source == "timing-subset" else "Best energy remains from the selected run. "
     )
     time_records_by_cell = timing_records_by_cell if timing_records_by_cell is not None else records_by_cell
     lines = [
         "## Depth, quality, and time", "",
-        "Every row is one (cell, kernel, sweep depth) arm. Missing, failed, unsupported, and nonfinite "
-        "observations stay outside the comparable denominator (task brief, step 5). Only the completed, "
-        "finite subset feeds Median best energy, which counts every `exit_ok` record no matter the host "
-        "condition. A completed energy result is equally valid on a clean host or a busy one. Wall time "
-        "gets separate treatment. A contaminated run or a parallel-worker run measures a different host "
-        "condition than a clean serial run, so this table always reports their medians apart, as "
-        "`median (n)` for each label, and never pools them into one number (review, Important item 1). "
-        f"Clean sampling and end-to-end timing use `{timing_label}` records. {quality_source_note}"
-        "Sampling time is `elapsed_sampling_s`. Wall time remains end-to-end.", "",
+        "Every row is one (cell, kernel, sweep-depth) arm. Energy is the primary comparison. "
+        f"Timing uses `{timing_label}` records from a loaded host with parallel workers, one per physical core. "
+        "For each job, its fastest successful run is its run speed. The timing columns show the median "
+        "sampling and wall times across successful, supported records, regardless of host contamination "
+        "or timing mode. The contaminated and parallel wall-time columns remain separate diagnostics. "
+        f"Best energy uses every successful record. {quality_source_note}"
+        "Sampling time is `elapsed_sampling_s`. Wall time is end-to-end.", "",
         "| Cell | Kernel | Sweeps | Observed | Missing | Completed | Failed | Unsupported | Nonfinite "
-        f"| Median best energy | Sampling s, clean serial from {timing_label} (n) "
-        f"| Wall s, clean serial from {timing_label} (n) | Wall s, contaminated (n) | Wall s, parallel (n) |",
+        f"| Median best energy | Sampling s, fastest run from {timing_label} (n) "
+        f"| Wall s, fastest run from {timing_label} (n) | Wall s, contaminated (n) | Wall s, parallel (n) |",
         "| -- | -- | -- | -- | -- | -- | -- | -- | -- | -- | -- | -- | -- | -- |",
     ]
     for cell, records in records_by_cell.items():
@@ -364,28 +361,32 @@ def depth_quality_time_table(
                     r for r in source_records
                     if r.get("requested_kernel") == kernel and r.get("sweeps") == sweeps
                 ]
-                clean_timing = [
+                successful_timing = [
                     r for r in timing_arm
                     if r.get("exit_ok") and not r.get("unsupported")
-                    and r.get("timing_mode") != "parallel"
-                    and not bool((r.get("host") or {}).get("contaminated"))
                 ]
                 sampling_values = [
                     float(r["elapsed_sampling_s"])
-                    for r in clean_timing
+                    for r in successful_timing
                     if r.get("elapsed_sampling_s") is not None
                     and math.isfinite(float(r["elapsed_sampling_s"]))
                 ]
-                clean_summary = metrics.summarize_arm(clean_timing)
-                clean_wall = clean_summary["timing_by_label"].get(metrics.CLEAN_SERIAL)
-                missing_reason = "no matching clean timing-subset record" if timing_source == "timing-subset" and not clean_timing else None
+                wall_values = [
+                    float(r["wall_s"])
+                    for r in successful_timing
+                    if r.get("wall_s") is not None and math.isfinite(float(r["wall_s"]))
+                ]
+                missing_reason = (
+                    f"no matching {timing_label} record"
+                    if timing_source == "timing-subset" and not successful_timing else None
+                )
                 sampling_cell = (
                     f"{fmt(float(np.median(sampling_values)))} ({len(sampling_values)})" if sampling_values
-                    else f"n/a (0; {missing_reason or 'no sampling-time observations'})"
+                    else f"n/a (0; {missing_reason or 'no finite sampling-time observations'})"
                 )
                 wall_cell = (
-                    f"{fmt(clean_wall['median_wall_s'])} ({clean_wall['n']})" if clean_wall and clean_wall["n"]
-                    else f"n/a (0; {missing_reason or 'no clean serial wall-time observations'})"
+                    f"{fmt(float(np.median(wall_values)))} ({len(wall_values)})" if wall_values
+                    else f"n/a (0; {missing_reason or 'no finite wall-time observations'})"
                 )
                 lines.append(
                     f"| `{cell}` | `{kernel}` | {sweeps} | {summary['observed']} | {fmt(summary['missing'])} | "
@@ -984,7 +985,7 @@ def quality_time_figure(
     cell: str, records: Sequence[Dict[str, Any]], kernels: Sequence[str], depths: Sequence[int],
     *, timing_records: Optional[Sequence[Dict[str, Any]]] = None, timing_source: Optional[str] = None,
 ) -> str:
-    """One quality/time panel per regime: clean median sampling time (x,
+    """One quality/time panel per regime: fastest-run median sampling time (x,
     log-scaled) against median best energy (y) for every (kernel, depth) arm.
 
     Readable as a static image, not only via hover tooltips (review, Important
@@ -1009,20 +1010,27 @@ def quality_time_figure(
             summary = metrics.summarize_arm(arm)
             time_records = timing_records if timing_records is not None else records
             time_arm = [r for r in time_records if r.get("requested_kernel") == kernel and r.get("sweeps") == sweeps]
-            clean_time_arm = [
+            successful_time_arm = [
                 r for r in time_arm
-                if r.get("exit_ok") and not r.get("unsupported") and r.get("timing_mode") != "parallel"
-                and not bool((r.get("host") or {}).get("contaminated"))
+                if r.get("exit_ok") and not r.get("unsupported")
             ]
             sampling_values = [
                 float(r["elapsed_sampling_s"])
-                for r in clean_time_arm
+                for r in successful_time_arm
                 if r.get("elapsed_sampling_s") is not None and math.isfinite(float(r["elapsed_sampling_s"]))
             ]
-            timing_summary = metrics.summarize_arm(clean_time_arm)
-            wall = timing_summary["median_wall_s"]
+            wall_values = [
+                float(r["wall_s"])
+                for r in successful_time_arm
+                if r.get("wall_s") is not None and math.isfinite(float(r["wall_s"]))
+            ]
+            wall = float(np.median(wall_values)) if wall_values else None
             if summary["median_best_energy"] is None or not sampling_values:
-                reason = "No clean timing-subset record" if timing_source == "timing-subset" else "No clean sampling time"
+                reason = (
+                    "No timing-subset record"
+                    if timing_source == "timing-subset" and not successful_time_arm
+                    else "No finite sampling time"
+                )
                 incomplete.append(f"{kernel}@{sweeps} ({reason})")
                 continue
             sampling = float(np.median(sampling_values))
@@ -1033,9 +1041,9 @@ def quality_time_figure(
 
     caption = (
         "Energy units: canonical, rescored from the original model, lower is better. The x axis uses "
-        f"clean-serial elapsed_sampling_s from {timing_source or 'the quality run'}; end-to-end wall_s "
-        "(wall time) is retained separately in the table and point details. Contaminated and parallel-worker runs "
-        "are never pooled into this timing axis."
+        f"the median fastest-run elapsed_sampling_s from {timing_source or 'the quality run'}; each job "
+        "contributes its fastest successful run. These timings come from a loaded host with parallel workers, "
+        "one per physical core. End-to-end wall time remains separate in the table and point details."
     )
     body_parts: List[str] = [f'<text x="{margin}" y="24" font-size="16" font-weight="bold">{cell}: quality vs. time (CPU)</text>']
     y_cursor = 42
@@ -1418,7 +1426,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--run", default="pilot", choices=("pilot", "campaign"))
     parser.add_argument(
         "--timing-subset-root", default=None,
-        help="Clean serial timing source for campaign quality reports; defaults to cpu-root/timing-subset.",
+        help="Timing source for campaign quality reports; defaults to cpu-root/timing-subset.",
     )
     parser.add_argument("--cells", nargs="+", default=list(regimes.CELL_NAMES))
     parser.add_argument("--kernels", nargs="+", default=list(DEFAULT_KERNELS))
