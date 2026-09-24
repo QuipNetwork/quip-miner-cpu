@@ -282,9 +282,120 @@ def _cpu_record(
         "schema": "round2-cpu-run-v1", "cell": cell, "nonce": nonce, "requested_kernel": kernel,
         "sweeps": sweeps, "reads": 64, "exit_ok": exit_ok, "unsupported": unsupported,
         "best_energy": best_energy, "wall_s": wall_s, "elapsed_sampling_s": wall_s,
+        "model_hash": nonce,
         "repetition_kind": "timing", "repetition_id": 0,
         "variant": "timing",
     }
+
+
+def test_derive_cpu_msa_records_routes_unit_when_supported_and_f64_when_unit_is_unsupported():
+    records = [
+        _cpu_record("diamond-pm1", "unit-model", "cpu-msa-unit", 512, best_energy=-2.0),
+        _cpu_record("diamond-pm1", "fallback-model", "cpu-msa-unit", 512, unsupported=True),
+        _cpu_record("diamond-pm1", "fallback-model", "cpu-msa-f64", 512, best_energy=-3.0),
+    ]
+
+    routed = report.derive_cpu_msa_records(records)
+
+    assert [(r["model_hash"], r["routed_kernel"]) for r in routed] == [
+        ("unit-model", "cpu-msa-unit"), ("fallback-model", "cpu-msa-f64"),
+    ]
+    assert all(record["requested_kernel"] == "cpu-msa" for record in routed)
+    assert routed[0]["best_energy"] == -2.0
+    assert routed[1]["best_energy"] == -3.0
+
+
+def test_derive_cpu_msa_records_falls_back_when_unit_failed():
+    records = [
+        _cpu_record("diamond-pm1", "failed-unit", "cpu-msa-unit", 512, exit_ok=False),
+        _cpu_record("diamond-pm1", "failed-unit", "cpu-msa-f64", 512, best_energy=-3.0),
+    ]
+
+    routed = report.derive_cpu_msa_records(records)
+
+    assert len(routed) == 1
+    assert routed[0]["routed_kernel"] == "cpu-msa-f64"
+
+
+def test_derive_cpu_msa_records_does_not_invent_a_record_without_either_source():
+    assert report.derive_cpu_msa_records([_cpu_record("diamond-pm1", "other", "cpu-sa", 512)]) == []
+
+
+def test_matched_runtime_comparison_selects_deepest_affordable_and_counts_over_budget():
+    captures = [{
+        "cell": "diamond-pm1", "requested_scale": 1.0, "anneal_us": 20,
+        "model_hash": "within", "best_energy": -2.0, "access_us": 1_000_000,
+        "end_to_end_s": 1.2,
+    }, {
+        "cell": "diamond-pm1", "requested_scale": 1.0, "anneal_us": 20,
+        "model_hash": "over", "best_energy": -3.0, "access_us": 1_000_000,
+        "end_to_end_s": 1.4,
+    }]
+    records = [
+        _cpu_record("diamond-pm1", "within", "cpu-sa", 512, best_energy=-1.0, wall_s=0.2),
+        _cpu_record("diamond-pm1", "within", "cpu-sa", 2048, best_energy=-2.0, wall_s=0.8),
+        _cpu_record("diamond-pm1", "within", "cpu-sa", 8192, best_energy=-3.0, wall_s=1.2),
+        _cpu_record("diamond-pm1", "over", "cpu-sa", 512, best_energy=-4.0, wall_s=1.1),
+    ]
+
+    result = report.matched_runtime_comparison(captures, records, kernels=("cpu-sa",))
+    row = result[("diamond-pm1", 1.0, 20, "cpu-sa")]
+
+    assert row["models"] == 2
+    assert row["over_budget"] == 1
+    assert row["equal_budget_counts"]["strict"] == {"qpu": 0, "cpu": 0, "tie": 1}
+    assert row["equal_budget_counts"]["numeric_tolerance"] == {"qpu": 0, "cpu": 0, "tie": 1}
+    assert row["reached_qpu_energy"] == 2
+    assert row["not_reached"] == 0
+    assert row["median_cpu_s_to_qpu_energy"] == pytest.approx(0.95)
+
+
+def test_matched_runtime_comparison_counts_models_that_never_reach_qpu_energy():
+    captures = [{
+        "cell": "diamond-pm1", "requested_scale": 1.0, "anneal_us": 20,
+        "model_hash": "a", "best_energy": -4.0, "access_us": 2_000_000,
+        "end_to_end_s": 2.2,
+    }]
+    records = [
+        _cpu_record("diamond-pm1", "a", "cpu-sa", 512, best_energy=-1.0, wall_s=0.4),
+        _cpu_record("diamond-pm1", "a", "cpu-sa", 2048, best_energy=-3.0, wall_s=0.7),
+    ]
+
+    row = report.matched_runtime_comparison(captures, records, kernels=("cpu-sa",))[
+        ("diamond-pm1", 1.0, 20, "cpu-sa")
+    ]
+
+    assert row["reached_qpu_energy"] == 0
+    assert row["not_reached"] == 1
+    assert row["median_cpu_s_to_qpu_energy"] is None
+
+
+def test_matched_runtime_section_renders_requested_columns():
+    lines = report.matched_runtime_table([], [], kernels=("cpu-sa",))
+    text = "\n".join(lines)
+
+    assert "## QPU against CPU at matched run time" in text
+    assert "Median QPU end-to-end s" in text
+    assert "Over budget" in text
+    assert "Reached QPU energy" in text
+    assert "Median ratio to QPU access" in text
+
+
+def test_qpu_comparison_labels_the_source_kernel_for_routed_cpu_msa():
+    captures = [{
+        "cell": "diamond-pm1", "requested_scale": 1.0, "anneal_us": 20,
+        "model_hash": "a", "best_energy": -2.0, "access_us": 1_000_000,
+        "end_to_end_s": 1.2,
+    }]
+    cpu_record = _cpu_record("diamond-pm1", "a", "cpu-msa", 512, best_energy=-1.0)
+    cpu_record["routed_kernel"] = "cpu-msa-unit"
+
+    rows = report.qpu_outcome_table(
+        ["diamond-pm1"], report.group_captures_by_arm(captures),
+        {"diamond-pm1": [cpu_record]}, kernels=("cpu-msa",), depths=(512,),
+    )
+
+    assert any("`cpu-msa (unit)`" in line for line in rows)
 
 
 def _write_attempt(cell_dir: Path, nonce, kernel, sweeps, attempt, record):
@@ -417,6 +528,21 @@ def test_next_test_section_counts_only_supported_kernels():
 
     assert "across 2 kernels (`cpu-msa-f64`, `cpu-sa`)" in row
     assert "cpu-msa-unit" not in row
+
+
+def test_next_test_section_does_not_count_the_derived_router_as_an_extra_measurement():
+    measured = [
+        _cpu_record("native-pm1", "a", "cpu-sa", 512),
+        _cpu_record("native-pm1", "b", "cpu-msa-f64", 512),
+    ]
+    routed = {**measured[1], "requested_kernel": "cpu-msa", "routed_kernel": "cpu-msa-f64"}
+
+    lines = report.next_test_section(
+        ["native-pm1"], {"native-pm1": measured + [routed]}, None, "campaign",
+    )
+    row = next(line for line in lines if line.startswith("| `native-pm1` |"))
+
+    assert "2 completed CPU timing/quality records across 2 kernels" in row
 
 
 def test_next_test_section_campaign_cell_with_no_capture_says_the_campaign_is_done():
@@ -1074,7 +1200,7 @@ def test_bar_chart_value_label_never_overlaps_a_long_category_label():
 
 def _write_qpu_capture(
     path: Path, *, cell, nonce, model_hash, capture_key,
-    requested_scale, anneal_us, energies, mock=False, access_us=50_000,
+    requested_scale, anneal_us, energies, mock=False, access_us=50_000, end_to_end_s=0.5,
 ):
     path.parent.mkdir(parents=True, exist_ok=True)
     energies_arr = np.asarray(energies, dtype=np.float64)
@@ -1083,7 +1209,8 @@ def _write_qpu_capture(
         path,
         spins=spins, energies=energies_arr,
         mock=np.bool_(mock), anneal_us=np.int64(anneal_us), requested_scale=np.float64(requested_scale),
-        access_us=np.int64(access_us), capture_key=capture_key, model_hash=model_hash,
+        access_us=np.int64(access_us), end_to_end_s=np.float64(end_to_end_s),
+        capture_key=capture_key, model_hash=model_hash,
     )
 
 
@@ -1111,6 +1238,7 @@ def test_load_qpu_captures_verifies_against_the_manifest(tmp_path):
     assert cap["anneal_us"] == 80
     assert cap["best_energy"] == -10.0
     assert cap["access_us"] == 50_000
+    assert cap["end_to_end_s"] == 0.5
 
 
 def test_load_qpu_captures_rejects_a_mock_capture(tmp_path):

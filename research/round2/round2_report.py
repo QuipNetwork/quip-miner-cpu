@@ -24,16 +24,12 @@ documents: no plotting library is installed in D's pinned venv (numpy and
 scipy are; matplotlib is not), and this report must run entirely under that
 venv.
 
-``cpu-msa`` naming (final review ruling): in Round 2's controlled comparison
-this name is never requested -- ``round2_runner.CONTROLLED_KERNELS`` names
-``cpu-sa``, ``cpu-msa-f64``, and ``cpu-msa-unit`` explicitly. Round 1's own
-records use the bare name ``cpu-msa`` to mean the UNIT kernel specifically;
-in the general ``quip_msa`` binding ``cpu-msa`` is an auto-routing name
-(unit-eligible model -> unit kernel, otherwise the float kernel), not a
-rename of either. A reader who filters by ``requested_kernel == "cpu-msa"``
-across the two rounds will silently mix a Round-1 unit-only arm with a
-Round-2 auto-routed one. This report never pools the two rounds by that bare
-kernel name.
+``cpu-msa`` naming: the report derives this routed arm from the two measured
+Round 2 arms, choosing unit when supported and successful, otherwise f64.
+The campaign runner still never requests the bare name. Round 1's caveat
+remains: its bare ``cpu-msa`` name means the unit kernel specifically, while
+the general binding routes between unit and f64. The report never pools the
+two rounds by that bare kernel name.
 """
 
 from __future__ import annotations
@@ -53,7 +49,7 @@ from quip_miner_dwave import regime_io, regimes
 import round2_metrics as metrics
 import round2_runner as runner
 
-DEFAULT_KERNELS: Tuple[str, ...] = ("cpu-sa", "cpu-msa-f64", "cpu-msa-unit")
+DEFAULT_KERNELS: Tuple[str, ...] = ("cpu-sa", "cpu-msa-f64", "cpu-msa-unit", "cpu-msa")
 FULL_DEPTHS: Tuple[int, ...] = (512, 2048, 8192, 32768, 131072)
 PILOT_DEPTHS: Tuple[int, ...] = (512, 2048)
 
@@ -132,6 +128,31 @@ def load_cpu_records(run_dir: Path, cell: str) -> List[Dict[str, Any]]:
     return records
 
 
+def derive_cpu_msa_records(records: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Build the report's routed ``cpu-msa`` arm from measured unit and f64 rows."""
+    by_job: Dict[Tuple[Any, Any], Dict[str, Dict[str, Any]]] = {}
+    for record in records:
+        kernel = record.get("requested_kernel")
+        if kernel in ("cpu-msa-unit", "cpu-msa-f64") and record.get("model_hash"):
+            key = (record.get("model_hash"), record.get("sweeps"))
+            by_job.setdefault(key, {})[kernel] = record
+
+    routed: List[Dict[str, Any]] = []
+    for sources in by_job.values():
+        unit = sources.get("cpu-msa-unit")
+        if unit is not None and unit.get("exit_ok") and not unit.get("unsupported"):
+            source = unit
+        else:
+            source = sources.get("cpu-msa-f64")
+        if source is None:
+            continue
+        copy = dict(source)
+        copy["requested_kernel"] = "cpu-msa"
+        copy["routed_kernel"] = source["requested_kernel"]
+        routed.append(copy)
+    return routed
+
+
 def load_seeded_sweep_records(seeded_root: Path, cell: str) -> List[Dict[str, Any]]:
     """Every seeded/cold weighted-MSA record for one cell (Task 8 brief, step 9)."""
     cell_dir = Path(seeded_root) / cell
@@ -200,6 +221,7 @@ def load_qpu_captures(qpu_root: Path, manifest: Dict[str, Any]) -> List[Dict[str
                 "anneal_us": int(data["anneal_us"]),
                 "best_energy": float(energies.min()),
                 "access_us": int(data["access_us"]),
+                "end_to_end_s": float(data["end_to_end_s"]),
             })
     return captures
 
@@ -238,6 +260,99 @@ def pair_qpu_cpu_by_model(
         if model_hash in cpu_best:
             pairs.append((model_hash, capture["best_energy"], cpu_best[model_hash]))
     return pairs
+
+
+def matched_runtime_comparison(
+    captures: Sequence[Dict[str, Any]], cpu_records: Sequence[Dict[str, Any]],
+    kernels: Sequence[str] = DEFAULT_KERNELS,
+) -> Dict[Tuple[str, float, int, str], Dict[str, Any]]:
+    """Compare each captured model with each kernel at equal access time and energy.
+
+    CPU records are paired by model hash across every available depth. The
+    result is keyed by ``(cell, scale, anneal_us, kernel)`` for table rendering
+    and direct testing without file access.
+    """
+    results: Dict[Tuple[str, float, int, str], Dict[str, Any]] = {}
+    for arm, arm_captures in group_captures_by_arm(captures).items():
+        cell, scale, anneal = arm
+        captures_by_model = {capture["model_hash"]: capture for capture in arm_captures}
+        for kernel in kernels:
+            cpu_by_model: Dict[str, List[Tuple[int, float, float]]] = {}
+            for record in cpu_records:
+                if record.get("cell") != cell or record.get("requested_kernel") != kernel:
+                    continue
+                if not record.get("exit_ok") or record.get("unsupported"):
+                    continue
+                energy = _finite_float(record.get("best_energy"))
+                sampling_s = _finite_float(record.get("elapsed_sampling_s"))
+                model_hash = record.get("model_hash")
+                sweeps = record.get("sweeps")
+                if energy is None or sampling_s is None or sampling_s < 0 or not model_hash:
+                    continue
+                if not isinstance(sweeps, int):
+                    continue
+                if model_hash in captures_by_model:
+                    cpu_by_model.setdefault(model_hash, []).append((sweeps, sampling_s, energy))
+
+            matched_models = sorted(set(captures_by_model) & set(cpu_by_model))
+            strict_outcomes: List[str] = []
+            numeric_outcomes: List[str] = []
+            material_outcomes: List[str] = []
+            over_budget = 0
+            time_to_energy: List[float] = []
+            time_ratios: List[float] = []
+            for model_hash in matched_models:
+                capture = captures_by_model[model_hash]
+                qpu_energy = _finite_float(capture.get("best_energy"))
+                access_us = _finite_float(capture.get("access_us"))
+                if qpu_energy is None or access_us is None or access_us <= 0:
+                    continue
+                model_records = cpu_by_model[model_hash]
+                budget_s = access_us / 1_000_000
+                affordable = [row for row in model_records if row[1] <= budget_s]
+                shallowest = min(model_records, key=lambda row: row[0])
+                if shallowest[1] > budget_s:
+                    over_budget += 1
+                else:
+                    _depth, _sampling_s, cpu_energy = max(affordable, key=lambda row: row[0])
+                    columns = metrics.quality_columns(qpu_energy, cpu_energy)
+                    strict_outcomes.append(columns["strict"])
+                    numeric_outcomes.append(columns["numeric_tolerance"])
+                    material_outcomes.append(columns["material"])
+
+                qualifying_times = [
+                    sampling_s for _depth, sampling_s, cpu_energy in model_records
+                    if metrics.quality_outcome(qpu_energy, cpu_energy, metrics.NUMERIC_TOLERANCE) != "qpu"
+                ]
+                if qualifying_times:
+                    reached_s = min(qualifying_times)
+                    time_to_energy.append(reached_s)
+                    time_ratios.append(reached_s / budget_s)
+
+            access_seconds = [
+                value / 1_000_000 for capture in arm_captures
+                if (value := _finite_float(capture.get("access_us"))) is not None
+            ]
+            end_to_end_seconds = [
+                value for capture in arm_captures
+                if (value := _finite_float(capture.get("end_to_end_s"))) is not None
+            ]
+            results[(cell, scale, anneal, kernel)] = {
+                "models": len(matched_models),
+                "median_qpu_access_s": float(np.median(access_seconds)) if access_seconds else None,
+                "median_qpu_end_to_end_s": float(np.median(end_to_end_seconds)) if end_to_end_seconds else None,
+                "equal_budget_counts": {
+                    "strict": metrics.tally_quality_outcomes(strict_outcomes),
+                    "numeric_tolerance": metrics.tally_quality_outcomes(numeric_outcomes),
+                    "material": metrics.tally_quality_outcomes(material_outcomes),
+                },
+                "over_budget": over_budget,
+                "reached_qpu_energy": len(time_to_energy),
+                "not_reached": len(matched_models) - len(time_to_energy),
+                "median_cpu_s_to_qpu_energy": float(np.median(time_to_energy)) if time_to_energy else None,
+                "median_ratio_to_qpu_access": float(np.median(time_ratios)) if time_ratios else None,
+            }
+    return results
 
 
 def reconcile_spend(qpu_root: Path, captures: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
@@ -551,8 +666,9 @@ def qpu_outcome_table(
                     strict = metrics.tally_quality_outcomes([c["strict"] for c in columns])
                     numeric = metrics.tally_quality_outcomes([c["numeric_tolerance"] for c in columns])
                     material = metrics.tally_quality_outcomes([c["material"] for c in columns])
+                    kernel_label = _kernel_label(kernel, pairs, cpu_records)
                     lines.append(
-                        f"| `{cell}` | {scale:g} | {anneal} | `{kernel}` | {sweeps} | {len(pairs)} | "
+                        f"| `{cell}` | {scale:g} | {anneal} | `{kernel_label}` | {sweeps} | {len(pairs)} | "
                         f"{_outcome_triple(strict)} | {_outcome_triple(numeric)} | {_outcome_triple(material)} |"
                     )
     if not any_row:
@@ -597,8 +713,9 @@ def paired_gaps_table(
                     ]
                     groups = [model_hash for model_hash, _, _ in pairs]
                     result = metrics.bootstrap_paired_gap(gaps, groups)
+                    kernel_label = _kernel_label(kernel, pairs, cpu_records)
                     lines.append(
-                        f"| `{cell}` | {scale:g} | {anneal} | `{kernel}` | {sweeps} | {result['group_count']} | "
+                        f"| `{cell}` | {scale:g} | {anneal} | `{kernel_label}` | {sweeps} | {result['group_count']} | "
                         f"{fmt(result['point'], 4)} | {fmt(result['low'], 4)} | {fmt(result['high'], 4)} | "
                         f"{'yes' if result['descriptive'] else 'no'} |"
                     )
@@ -622,6 +739,80 @@ def _finite_float(value: Any) -> Optional[float]:
 
 def _outcome_triple(tally: Dict[str, int]) -> str:
     return f"{tally['qpu']}/{tally['cpu']}/{tally['tie']}"
+
+
+def _kernel_label(
+    kernel: str, pairs: Sequence[Tuple[str, float, float]], cpu_records: Sequence[Dict[str, Any]],
+) -> str:
+    if kernel != "cpu-msa":
+        return kernel
+    paired_hashes = {model_hash for model_hash, _qpu, _cpu in pairs}
+    routed = _routed_kernels(cpu_records, paired_hashes)
+    return f"cpu-msa ({_route_label(routed)})"
+
+
+def _routed_kernels(cpu_records: Sequence[Dict[str, Any]], model_hashes: Iterable[Any]) -> set[str]:
+    hashes = set(model_hashes)
+    routed: set[str] = set()
+    for record in cpu_records:
+        route = record.get("routed_kernel")
+        if record.get("model_hash") in hashes and isinstance(route, str):
+            routed.add(route)
+    return routed
+
+
+def _route_label(routed: Iterable[str]) -> str:
+    routed_kernels = set(routed)
+    if len(routed_kernels) > 1:
+        return "mixed"
+    if routed_kernels == {"cpu-msa-unit"}:
+        return "unit"
+    if routed_kernels == {"cpu-msa-f64"}:
+        return "f64"
+    else:
+        return "unknown"
+
+
+def matched_runtime_table(
+    captures: Sequence[Dict[str, Any]], cpu_records: Sequence[Dict[str, Any]], kernels: Sequence[str],
+) -> List[str]:
+    results = matched_runtime_comparison(captures, cpu_records, kernels)
+    lines = [
+        "## QPU against CPU at matched run time", "",
+        "QPU time is charged access time for 64 reads, with end-to-end time also shown. CPU time is sampling "
+        "time for 64 reads from the campaign, using the fastest successful attempt on a loaded host with "
+        "parallel workers. Energy outcomes use the same strict, numeric-tolerance, and material rules as "
+        "the equal-sweep tables. Equal budget uses the deepest CPU depth completed within that capture's "
+        "access-time budget. Time to QPU energy uses the quickest CPU depth that reached the capture's best energy.", "",
+        "| Cell | Scale | Anneal us | Kernel | Models | Median QPU access s | Median QPU end-to-end s | "
+        "Equal budget: strict / numeric / material qpu/cpu/tie | Over budget | Reached QPU energy (n of Models) | "
+        "Not reached | Median CPU s to QPU energy | Median ratio to QPU access |",
+        "| -- | -- | -- | -- | -- | -- | -- | -- | -- | -- | -- | -- | -- |",
+    ]
+    for (cell, scale, anneal, kernel), row in sorted(results.items()):
+        counts = row["equal_budget_counts"]
+        equal_budget = " / ".join(
+            _outcome_triple(counts[name]) for name in ("strict", "numeric_tolerance", "material")
+        )
+        arm_hashes = {
+            capture.get("model_hash") for capture in captures
+            if capture.get("cell") == cell and capture.get("requested_scale") == scale
+            and capture.get("anneal_us") == anneal
+        }
+        routed = _routed_kernels(
+            [record for record in cpu_records if record.get("requested_kernel") == kernel], arm_hashes,
+        )
+        kernel_label = f"cpu-msa ({_route_label(routed)})" if kernel == "cpu-msa" else kernel
+        lines.append(
+            f"| `{cell}` | {scale:g} | {anneal} | `{kernel_label}` | {row['models']} | "
+            f"{fmt(row['median_qpu_access_s'])} | {fmt(row['median_qpu_end_to_end_s'])} | {equal_budget} | "
+            f"{row['over_budget']} | {row['reached_qpu_energy']} of {row['models']} | {row['not_reached']} | "
+            f"{fmt(row['median_cpu_s_to_qpu_energy'])} | {fmt(row['median_ratio_to_qpu_access'])} |"
+        )
+    if not results:
+        lines.append("| n/a | n/a | n/a | n/a | 0 | n/a | n/a | n/a | 0 | 0 of 0 | 0 | n/a | n/a |")
+        lines += ["", "No captured QPU arms are available for a matched-run-time comparison."]
+    return lines
 
 
 def seed_lane_table(records_by_cell: Dict[str, List[Dict[str, Any]]]) -> List[str]:
@@ -826,12 +1017,13 @@ def next_test_section(
         arms_by_cell.setdefault(arm["regime"], []).append(arm)
     for cell in cells:
         records = records_by_cell.get(cell, [])
+        measured_records = [r for r in records if r.get("requested_kernel") != "cpu-msa"]
         kernels = sorted({
-            str(k) for r in records
+            str(k) for r in measured_records
             if r.get("exit_ok") and not r.get("unsupported")
             and (k := r.get("requested_kernel")) is not None
         })
-        completed = sum(1 for r in records if r.get("exit_ok") and not r.get("unsupported"))
+        completed = sum(1 for r in measured_records if r.get("exit_ok") and not r.get("unsupported"))
         established = (
             f"{completed} completed CPU timing/quality records across {len(kernels)} kernels "
             f"({', '.join(f'`{k}`' for k in kernels) or 'none yet'}) from the {run} run."
@@ -1466,6 +1658,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     depths = args.depths or (list(PILOT_DEPTHS) if args.run == "pilot" else list(FULL_DEPTHS))
 
     records_by_cell = {cell: load_cpu_records(run_dir, cell) for cell in args.cells}
+    for cell, records in records_by_cell.items():
+        records.extend(derive_cpu_msa_records(records))
     timing_source = "timing-subset" if args.run == "campaign" else None
     timing_records_by_cell = (
         {
@@ -1476,6 +1670,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         }
         if timing_source else None
     )
+    if timing_records_by_cell is not None:
+        for cell, records in timing_records_by_cell.items():
+            records.extend(derive_cpu_msa_records(records))
     seeded_by_cell = (
         {cell: load_seeded_sweep_records(Path(args.seeded_root), cell) for cell in args.cells}
         if args.seeded_root else {}
@@ -1525,6 +1722,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     lines += cpu_kernel_gap_table(records_by_cell, kernels=args.kernels, depths=depths) + [""]
     lines += qpu_outcome_table(args.cells, captures_by_arm, records_by_cell, args.kernels, depths) + [""]
     lines += paired_gaps_table(args.cells, captures_by_arm, records_by_cell, args.kernels, depths) + [""]
+    lines += matched_runtime_table(captures, [record for records in records_by_cell.values() for record in records], args.kernels) + [""]
     if seeded_by_cell:
         lines += seed_lane_table(seeded_by_cell) + [""]
     lines += physical_scale_table(capture_proposal, args.cells, captured_regimes=captured_regimes) + [""]
