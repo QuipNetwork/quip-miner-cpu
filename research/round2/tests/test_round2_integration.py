@@ -269,6 +269,18 @@ def test_offline_pipeline_end_to_end(tmp_path, monkeypatch):
     # ledger agrees
     assert regime_io.read_spend(round_dir) == (0, 0)
 
+    # The assertion above only proves a MOCK capture journals nothing, which
+    # holds even if read_spend's own reconciliation arithmetic were broken
+    # (review, M7). Exercise that arithmetic directly with a fake journal: one
+    # submit that gets charged, and one still-open submit with no charge yet.
+    fake_round_dir = tmp_path / "fake-spend-round"
+    regime_io.append_spend(fake_round_dir, regime_io.SUBMIT, CELL, "nonce-a", 80, 50_000)
+    regime_io.append_spend(fake_round_dir, regime_io.CHARGE, CELL, "nonce-a", 80, 48_500)
+    regime_io.append_spend(fake_round_dir, regime_io.SUBMIT, CELL, "nonce-b", 80, 60_000)
+    charged_us, open_jobs = regime_io.read_spend(fake_round_dir)
+    assert charged_us == 48_500 + 60_000  # the real charge, plus the still-open submit's own estimate
+    assert open_jobs == 1  # nonce-b has no charge yet
+
     [capture_path] = list((round_dir / CELL).glob("scale-*/qpu-*/*.npz"))
     with np.load(capture_path) as capture:
         # identity fields complete on the capture record

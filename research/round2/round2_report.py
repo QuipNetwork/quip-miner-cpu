@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Round 2 regime search report: per-regime tables, the portfolio pipeline's
 own tables, and next-test decisions, built from CPU pilot/campaign records,
-the seeded/cold weighted-MSA control, and the portfolio historical-deadline
-arm's results. See ``round2_metrics.py`` for the pure comparison, feasibility,
-and bootstrap primitives this module assembles into a document.
+the seeded/cold weighted-MSA control, and the portfolio deadline arm's
+results (synthetic fixtures, historical settings -- see the ``PORTFOLIO``
+naming rule below). See ``round2_metrics.py`` for the pure comparison,
+feasibility, and bootstrap primitives this module assembles into a document.
 
 Task 10 of D's ``docs/superpowers/plans/2026-09-22-regime-search-round2.md``
 is the brief this implements. D's own ``scripts/regime_report.py``
@@ -11,16 +12,28 @@ feasibility-rounding fix is out of scope here (D is read-only): this report
 carries its own count-based feasibility formatter
 (:func:`round2_metrics.format_feasibility`).
 
-No QPU submission happens here, and as of this report's own generation none
-of Round 2's own QPU captures have run yet -- the physical-range pilot (12
-sorted diamond/clique nonces, 3 scales, 2 anneal times) and the portfolio
-pilot both still show ``"approval": "pending"`` in
-``/home/carback1/quip-data/regimes/round2/capture-proposal.json``. Every
-QPU-paired table below is therefore explicitly labeled unavailable rather
-than guessed at or silently left blank. Figures render as small,
-dependency-free SVG documents: no plotting library is installed in D's
-pinned venv (numpy and scipy are; matplotlib is not), and this report must
-run entirely under that venv.
+No QPU submission happens here. Every QPU-paired table and status sentence is
+built from data actually loaded, never from a fixed claim: when no capture is
+given (``--qpu-root`` and ``--physical-capture-manifest`` omitted), every
+QPU-paired table states plainly that it has no comparable pairs, rather than
+asserting a specific reason (such as "pending approval") this module cannot
+verify on its own. When real physical-pilot captures ARE given, they are
+checked against the capture manifest (:func:`load_qpu_captures`) before
+anything is paired or plotted. Figures render as small, dependency-free SVG
+documents: no plotting library is installed in D's pinned venv (numpy and
+scipy are; matplotlib is not), and this report must run entirely under that
+venv.
+
+``cpu-msa`` naming (final review ruling): in Round 2's controlled comparison
+this name is never requested -- ``round2_runner.CONTROLLED_KERNELS`` names
+``cpu-sa``, ``cpu-msa-f64``, and ``cpu-msa-unit`` explicitly. Round 1's own
+records use the bare name ``cpu-msa`` to mean the UNIT kernel specifically;
+in the general ``quip_msa`` binding ``cpu-msa`` is an auto-routing name
+(unit-eligible model -> unit kernel, otherwise the float kernel), not a
+rename of either. A reader who filters by ``requested_kernel == "cpu-msa"``
+across the two rounds will silently mix a Round-1 unit-only arm with a
+Round-2 auto-routed one. This report never pools the two rounds by that bare
+kernel name.
 """
 
 from __future__ import annotations
@@ -33,7 +46,9 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
-from quip_miner_dwave import regimes
+import numpy as np
+
+from quip_miner_dwave import regime_io, regimes
 
 import round2_metrics as metrics
 import round2_runner as runner
@@ -61,26 +76,57 @@ _ATTEMPT_RE = re.compile(r"^(?P<base>.+)__attempt(?P<attempt>\d+)\.json$")
 
 
 def load_cpu_records(run_dir: Path, cell: str) -> List[Dict[str, Any]]:
-    """Every job's LATEST attempt record for one cell of a CPU run directory.
+    """Every job's record for one cell of a CPU run directory: the latest
+    ``exit_ok`` attempt for quality, with the latest CLEAN attempt's own
+    timing fields substituted in when that differs (review, M3).
 
     Only files named ``*__attempt<N>.json`` count: a bare ``<base>.json`` with
     no attempt suffix predates the attempt-numbering fix and is fully
     contaminated (controller ruling on this task), so it is ignored outright
     rather than silently mixed in.
+
+    A job with no successful attempt at all reports its latest attempt as-is
+    (a failed record), unchanged from before. A job WITH a successful attempt
+    never reports a later crash's ``None`` energy in its place: taking simply
+    the highest attempt number, as this function used to, let a
+    ``--repeat-contaminated`` retry that crashed outright silently discard an
+    earlier, valid (if contaminated) quality result. Independently, wall time
+    tracks the latest attempt that was both successful AND clean, so a later
+    contaminated success can supersede an earlier clean one for quality
+    without also overwriting that earlier attempt's own, still-valid clean
+    timing.
     """
     cell_dir = Path(run_dir) / cell
     if not cell_dir.exists():
         return []
-    latest: Dict[str, Tuple[int, Path]] = {}
+    attempts_by_base: Dict[str, Dict[int, Dict[str, Any]]] = {}
     for path in cell_dir.glob("*__attempt*.json"):
         match = _ATTEMPT_RE.match(path.name)
         if match is None:
             continue
         base = match.group("base")
         attempt = int(match.group("attempt"))
-        if base not in latest or attempt > latest[base][0]:
-            latest[base] = (attempt, path)
-    return [json.loads(path.read_text(encoding="utf-8")) for _, path in latest.values()]
+        attempts_by_base.setdefault(base, {})[attempt] = json.loads(path.read_text(encoding="utf-8"))
+
+    records: List[Dict[str, Any]] = []
+    for by_attempt in attempts_by_base.values():
+        ok_attempts = {n: r for n, r in by_attempt.items() if r.get("exit_ok")}
+        if not ok_attempts:
+            records.append(by_attempt[max(by_attempt)])
+            continue
+        quality_record = ok_attempts[max(ok_attempts)]
+        clean_attempts = {
+            n: r for n, r in ok_attempts.items() if not bool((r.get("host") or {}).get("contaminated"))
+        }
+        record = dict(quality_record)
+        if clean_attempts:
+            clean_record = clean_attempts[max(clean_attempts)]
+            if clean_record is not quality_record:
+                for field in ("wall_s", "host", "timing_mode", "concurrent_workers"):
+                    if field in clean_record:
+                        record[field] = clean_record[field]
+        records.append(record)
+    return records
 
 
 def load_seeded_sweep_records(seeded_root: Path, cell: str) -> List[Dict[str, Any]]:
@@ -92,7 +138,7 @@ def load_seeded_sweep_records(seeded_root: Path, cell: str) -> List[Dict[str, An
 
 
 def load_portfolio_deadline(path: Path) -> List[Dict[str, Any]]:
-    """The historical-deadline arm's own ``results.json``."""
+    """The deadline arm's (synthetic fixtures, historical settings) own ``results.json``."""
     payload = json.loads(Path(path).read_text(encoding="utf-8"))
     return list(payload.get("records", []))
 
@@ -100,6 +146,116 @@ def load_portfolio_deadline(path: Path) -> List[Dict[str, Any]]:
 def load_capture_proposal(path: Path) -> Dict[str, Any]:
     """The physical-range/portfolio capture proposal, whatever its approval status."""
     return json.loads(Path(path).read_text(encoding="utf-8"))
+
+
+def load_physical_capture_manifest(path: Path) -> Dict[str, Any]:
+    """The physical-range capture manifest: the job list a real capture is checked
+    against (review, C1)."""
+    return json.loads(Path(path).read_text(encoding="utf-8"))
+
+
+def load_qpu_captures(qpu_root: Path, manifest: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Every real QPU physical-pilot capture under ``qpu_root``, verified against
+    ``manifest`` (review, Critical item C1).
+
+    Requires ``mock == False``: a mock capture must never enter a report that
+    claims to compare real QPU energies against CPU ones. Requires the
+    capture's own ``capture_key`` to name a job in the manifest, and that
+    job's ``model_hash`` to match the capture's -- the same "never trust a
+    lone file" posture the CPU runner takes toward its own resume records.
+    Pairing downstream is by ``model_hash`` alone, per the review's own
+    instruction, never by nonce or file position.
+    """
+    jobs_by_key = {job["capture_key"]: job for job in manifest.get("jobs", [])}
+    captures: List[Dict[str, Any]] = []
+    for path in sorted(Path(qpu_root).glob("*/scale-*/qpu-*/*.npz")):
+        with np.load(path) as data:
+            if bool(data["mock"]):
+                raise ValueError(f"{path}: a mock capture is not allowed in the physical-pilot report")
+            capture_key = str(data["capture_key"])
+            model_hash = str(data["model_hash"])
+            job = jobs_by_key.get(capture_key)
+            if job is None:
+                raise ValueError(f"{path}: capture_key {capture_key!r} is not in the manifest")
+            if job["model_hash"] != model_hash:
+                raise ValueError(
+                    f"{path}: model_hash {model_hash!r} does not match the manifest's "
+                    f"{job['model_hash']!r} for capture_key {capture_key!r}"
+                )
+            energies = np.asarray(data["energies"], dtype=np.float64)
+            captures.append({
+                "path": str(path),
+                "cell": job["cell"],
+                "nonce": job["nonce"],
+                "model_hash": model_hash,
+                "requested_scale": float(job["requested_scale"]),
+                "anneal_us": int(data["anneal_us"]),
+                "best_energy": float(energies.min()),
+                "access_us": int(data["access_us"]),
+            })
+    return captures
+
+
+def group_captures_by_arm(captures: Sequence[Dict[str, Any]]) -> Dict[Tuple[str, float, int], List[Dict[str, Any]]]:
+    """Captures grouped by ``(cell, requested_scale, anneal_us)`` -- one physical
+    QPU arm (review, C1: "pair each capture with CPU records by model_hash,
+    per physical scale, anneal time and CPU depth")."""
+    grouped: Dict[Tuple[str, float, int], List[Dict[str, Any]]] = {}
+    for capture in captures:
+        key = (capture["cell"], capture["requested_scale"], capture["anneal_us"])
+        grouped.setdefault(key, []).append(capture)
+    return grouped
+
+
+def pair_qpu_cpu_by_model(
+    captures: Sequence[Dict[str, Any]], cpu_records: Sequence[Dict[str, Any]],
+) -> List[Tuple[str, float, float]]:
+    """``(model_hash, qpu_best, cpu_best)`` for every model with both a real QPU
+    capture and a completed, finite CPU record (review, C1: pair by
+    ``model_hash``, never by nonce or position). A failed, unsupported, or
+    nonfinite CPU record excludes that model from the comparable set, the
+    same rule :func:`round2_metrics.summarize_arm` applies elsewhere.
+    """
+    cpu_best: Dict[str, float] = {}
+    for record in cpu_records:
+        if not record.get("exit_ok") or record.get("unsupported"):
+            continue
+        best = _finite_float(record.get("best_energy"))
+        model_hash = record.get("model_hash")
+        if best is not None and model_hash:
+            cpu_best[model_hash] = best
+    pairs: List[Tuple[str, float, float]] = []
+    for capture in captures:
+        model_hash = capture["model_hash"]
+        if model_hash in cpu_best:
+            pairs.append((model_hash, capture["best_energy"], cpu_best[model_hash]))
+    return pairs
+
+
+def reconcile_spend(qpu_root: Path, captures: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    """Submits, charges, open jobs, and the charged total against the sum of
+    every capture's own ``access_us`` (review, C1: "reconcile spend from
+    spend.jsonl ... and the total compared with the sum of access_us").
+    """
+    path = Path(qpu_root) / regime_io.SPEND_JOURNAL
+    submits = charges = 0
+    if path.exists():
+        for line in path.read_text(encoding="utf-8").splitlines():
+            event = json.loads(line)["event"]
+            if event == regime_io.SUBMIT:
+                submits += 1
+            elif event == regime_io.CHARGE:
+                charges += 1
+    charged_us, open_jobs = regime_io.read_spend(qpu_root)
+    total_access_us = sum(capture["access_us"] for capture in captures)
+    return {
+        "submits": submits,
+        "charges": charges,
+        "open_jobs": open_jobs,
+        "charged_us": charged_us,
+        "total_access_us": total_access_us,
+        "reconciled": charged_us == total_access_us and open_jobs == 0,
+    }
 
 
 # ----------------------------------------------------------------- formatting
@@ -194,29 +350,158 @@ def depth_quality_time_table(
     return lines
 
 
-def qpu_outcome_table(cells: Sequence[str]) -> List[str]:
+def cpu_kernel_gap_table(
+    records_by_cell: Dict[str, List[Dict[str, Any]]],
+    *, kernels: Sequence[str], depths: Sequence[int], base_kernel: str = "cpu-sa",
+) -> List[str]:
+    """One paired, per-model gap between each kernel and ``base_kernel`` (review,
+    M2): "Median best energy" in the depth table above compares medians over
+    whatever model set each arm happened to complete, which silently drifts
+    apart whenever either arm has a missing or failed model. This table pairs
+    by `model_hash` instead, so every comparison is over the SAME models on
+    both sides, with the shared count always shown.
+    """
     lines = [
-        "## Quantum processing unit wins, ties, and losses", "",
-        "No Round 2 QPU capture has run yet: the physical-range and portfolio pilots are still pending "
-        "approval (see the physical scale table). Every cell is unavailable until a capture exists to pair "
-        "against these CPU arms.", "",
-        "| Cell | Status |", "| -- | -- |",
+        "## Paired CPU kernel gaps", "",
+        f"Each row pairs one kernel against `{base_kernel}` on the same models (matched by `model_hash`), "
+        "never by comparing medians over two arms' completed sets, which can differ. Compared counts only "
+        "models where both kernels completed with a finite energy at that depth.", "",
+        "| Cell | Kernels | Sweeps | Compared | Strict other/base/tie |",
+        "| -- | -- | -- | -- | -- |",
     ]
-    for cell in cells:
-        lines.append(f"| `{cell}` | unavailable -- no Round 2 QPU capture yet |")
+    any_row = False
+    for cell, records in records_by_cell.items():
+        for kernel in kernels:
+            if kernel == base_kernel:
+                continue
+            for sweeps in depths:
+                base_best: Dict[str, float] = {}
+                other_best: Dict[str, float] = {}
+                for record in records:
+                    if record.get("sweeps") != sweeps or not record.get("exit_ok") or record.get("unsupported"):
+                        continue
+                    best = _finite_float(record.get("best_energy"))
+                    model_hash = record.get("model_hash")
+                    if best is None or not model_hash:
+                        continue
+                    requested = record.get("requested_kernel")
+                    if requested == base_kernel:
+                        base_best[model_hash] = best
+                    elif requested == kernel:
+                        other_best[model_hash] = best
+                shared = sorted(set(base_best) & set(other_best))
+                if not shared:
+                    continue
+                any_row = True
+                outcomes = [
+                    metrics.quality_outcome(other_best[m], base_best[m], metrics.STRICT_TOLERANCE) for m in shared
+                ]
+                tally = metrics.tally_quality_outcomes(outcomes)
+                lines.append(
+                    f"| `{cell}` | `{kernel}` vs `{base_kernel}` | {sweeps} | {len(shared)} | "
+                    f"{_outcome_triple(tally)} |"
+                )
+    if not any_row:
+        lines.append("")
+        lines.append(f"No comparable pairs against `{base_kernel}` for any kernel or depth given.")
     return lines
 
 
-def paired_gaps_table(cells: Sequence[str]) -> List[str]:
+def _cell_arms(
+    cell: str, captures_by_arm: Dict[Tuple[str, float, int], List[Dict[str, Any]]],
+) -> List[Tuple[str, float, int]]:
+    return sorted((key for key in captures_by_arm if key[0] == cell), key=lambda key: (key[1], key[2]))
+
+
+def qpu_outcome_table(
+    cells: Sequence[str],
+    captures_by_arm: Dict[Tuple[str, float, int], List[Dict[str, Any]]],
+    records_by_cell: Dict[str, List[Dict[str, Any]]],
+    kernels: Sequence[str], depths: Sequence[int],
+) -> List[str]:
+    lines = [
+        "## Quantum processing unit wins, ties, and losses", "",
+        "Every row pairs one physical-scale QPU arm (cell, scale, anneal time) against one CPU arm (kernel, "
+        "sweep depth), matched by `model_hash` (review, C1). Compared counts only models with both a real, "
+        "manifest-verified capture and a completed, finite CPU record.", "",
+        "| Cell | Scale | Anneal us | Kernel | Sweeps | Compared | Strict qpu/cpu/tie | Numeric qpu/cpu/tie "
+        "| Material qpu/cpu/tie |",
+        "| -- | -- | -- | -- | -- | -- | -- | -- | -- |",
+    ]
+    any_row = False
+    for cell in cells:
+        records = records_by_cell.get(cell, [])
+        for cell_name, scale, anneal in _cell_arms(cell, captures_by_arm):
+            captures = captures_by_arm[(cell_name, scale, anneal)]
+            for kernel in kernels:
+                for sweeps in depths:
+                    cpu_records = [
+                        r for r in records if r.get("requested_kernel") == kernel and r.get("sweeps") == sweeps
+                    ]
+                    pairs = pair_qpu_cpu_by_model(captures, cpu_records)
+                    if not pairs:
+                        continue
+                    any_row = True
+                    columns = [metrics.quality_columns(qpu, cpu) for _, qpu, cpu in pairs]
+                    strict = metrics.tally_quality_outcomes([c["strict"] for c in columns])
+                    numeric = metrics.tally_quality_outcomes([c["numeric_tolerance"] for c in columns])
+                    material = metrics.tally_quality_outcomes([c["material"] for c in columns])
+                    lines.append(
+                        f"| `{cell}` | {scale:g} | {anneal} | `{kernel}` | {sweeps} | {len(pairs)} | "
+                        f"{_outcome_triple(strict)} | {_outcome_triple(numeric)} | {_outcome_triple(material)} |"
+                    )
+    if not any_row:
+        lines.append("")
+        lines.append(
+            "No comparable pairs. No cell has both a physical-pilot QPU capture and a matching CPU arm yet."
+        )
+    return lines
+
+
+def paired_gaps_table(
+    cells: Sequence[str],
+    captures_by_arm: Dict[Tuple[str, float, int], List[Dict[str, Any]]],
+    records_by_cell: Dict[str, List[Dict[str, Any]]],
+    kernels: Sequence[str], depths: Sequence[int],
+) -> List[str]:
     lines = [
         "## Paired gaps", "",
-        "Bootstrap paired-gap intervals (round2_metrics.bootstrap_paired_gap: 10,000 resamples, a fixed "
-        "recorded seed, grouped by model or by market snapshot) need a QPU result to pair against a CPU one. "
-        "None exists yet for Round 2.", "",
-        "| Cell | Status |", "| -- | -- |",
+        "Bootstrap paired-gap intervals (`round2_metrics.bootstrap_paired_gap`: 10,000 resamples, the fixed "
+        "recorded seed, grouped by model, since every physical-pilot model is an independent draw). The gap "
+        "is the same signed relative gap `quality_outcome` itself computes: negative means the QPU energy is "
+        "lower (better).", "",
+        "| Cell | Scale | Anneal us | Kernel | Sweeps | Groups | Point | 95% low | 95% high | Descriptive |",
+        "| -- | -- | -- | -- | -- | -- | -- | -- | -- | -- |",
     ]
+    any_row = False
     for cell in cells:
-        lines.append(f"| `{cell}` | unavailable -- no paired QPU/CPU comparison yet |")
+        records = records_by_cell.get(cell, [])
+        for cell_name, scale, anneal in _cell_arms(cell, captures_by_arm):
+            captures = captures_by_arm[(cell_name, scale, anneal)]
+            for kernel in kernels:
+                for sweeps in depths:
+                    cpu_records = [
+                        r for r in records if r.get("requested_kernel") == kernel and r.get("sweeps") == sweeps
+                    ]
+                    pairs = pair_qpu_cpu_by_model(captures, cpu_records)
+                    if not pairs:
+                        continue
+                    any_row = True
+                    gaps = [
+                        (qpu - cpu) / max(abs(qpu), abs(cpu), 1e-12) for _, qpu, cpu in pairs
+                    ]
+                    groups = [model_hash for model_hash, _, _ in pairs]
+                    result = metrics.bootstrap_paired_gap(gaps, groups)
+                    lines.append(
+                        f"| `{cell}` | {scale:g} | {anneal} | `{kernel}` | {sweeps} | {result['group_count']} | "
+                        f"{fmt(result['point'], 4)} | {fmt(result['low'], 4)} | {fmt(result['high'], 4)} | "
+                        f"{'yes' if result['descriptive'] else 'no'} |"
+                    )
+    if not any_row:
+        lines.append("")
+        lines.append(
+            "No comparable pairs. No cell has both a physical-pilot QPU capture and a matching CPU arm yet."
+        )
     return lines
 
 
@@ -337,9 +622,11 @@ def feasibility_table(portfolio_records: Sequence[Dict[str, Any]]) -> List[str]:
         "Feasibility here is the share of raw returned reads that already meet the cardinality constraint "
         "before repair. P's own repair and weighting happen afterward. See the portfolio pipeline table for "
         "the repaired, selected answer's own feasibility. `weighting_failed` is a tri-state value. An unknown "
-        "result never counts as success. P's silent equal-weight fallback exposes no flag when it fires.", "",
-        "| Assets | K | Beta label | Status | Raw feasible reads | Weighting |",
-        "| -- | -- | -- | -- | -- | -- |",
+        "result never counts as success. P's silent equal-weight fallback exposes no flag when it fires. "
+        "Provenance names the market-instance source of every row (review, I5): this report never calls a "
+        "synthetic instance historical.", "",
+        "| Assets | K | Beta label | Provenance | Status | Raw feasible reads | Weighting |",
+        "| -- | -- | -- | -- | -- | -- | -- |",
     ]
     for record in portfolio_records:
         count = record.get("raw_feasible_count")
@@ -354,7 +641,7 @@ def feasibility_table(portfolio_records: Sequence[Dict[str, Any]]) -> List[str]:
             weighting_text = "not observed to fail"
         lines.append(
             f"| {record.get('n_assets')} | {record.get('cardinality_k')} | `{record.get('beta_label')}` | "
-            f"{record.get('status')} | {feasibility_text} | {weighting_text} |"
+            f"{record.get('provenance', 'n/a')} | {record.get('status')} | {feasibility_text} | {weighting_text} |"
         )
     return lines
 
@@ -362,23 +649,29 @@ def feasibility_table(portfolio_records: Sequence[Dict[str, Any]]) -> List[str]:
 def portfolio_pipeline_table(portfolio_records: Sequence[Dict[str, Any]]) -> List[str]:
     lines = [
         "## Portfolio pipeline", "",
-        "The historical-deadline arm (dwave-neal, 500 reads / 500 sweeps, the design's portfolio-replication "
-        "contract) ran to completion. This report classifies each run from its measured elapsed time. It "
-        "never kills a run at 10 seconds, so a late-but-good answer shows as a timeout, not a win. "
-        "Repaired feasible and Selected raw cardinality report P's own repair and weighting outcome for the "
-        "one selected, winning read. That differs from the feasibility table's raw feasible reads, which "
-        "count over every returned read. The strict-win, material-win, speed-only, and joint quality/time "
-        "columns each need a paired QPU portfolio result, which Round 2 has not captured yet.", "",
-        "| Assets | K | Beta label | Status | Elapsed s | Deadline s | Objective | Repaired feasible "
-        "| Selected raw cardinality | Strict/material win | Speed-only outcome | Joint quality/time |",
-        "| -- | -- | -- | -- | -- | -- | -- | -- | -- | -- | -- | -- |",
+        "The deadline arm, synthetic fixtures, historical settings (dwave-neal, 500 reads / 500 sweeps, the "
+        "design's portfolio-replication contract) ran to completion for every basket and beta label.", "",
+        "Sampling s covers only the reference sampler's own call. Repair s covers P's separate repair and "
+        "weighting step. End-to-end s is their sum, and the Status column classifies on end-to-end time, per "
+        "review finding I5, not on sampling time alone. This report has no 10-second kill switch. A slow "
+        "repair phase can still turn a fast sample into a late run.", "",
+        "Repaired feasible and Selected raw cardinality name the outcome of the one selected, winning read "
+        "after P's own repair and weighting. The feasibility table's own raw feasible reads count something "
+        "different: every returned read, before repair. Round 2 has not captured a paired QPU portfolio "
+        "result. The strict-win, material-win, speed-only, and joint quality/time columns stay unavailable "
+        "until it does.", "",
+        "| Assets | K | Beta label | Provenance | Status | Sampling s | Repair s | End-to-end s | Deadline s "
+        "| Objective | Repaired feasible | Selected raw cardinality | Strict/material win | Speed-only outcome "
+        "| Joint quality/time |",
+        "| -- | -- | -- | -- | -- | -- | -- | -- | -- | -- | -- | -- | -- | -- | -- |",
     ]
     for record in portfolio_records:
         feasible = record.get("feasible")
         feasible_text = "yes" if feasible is True else "no" if feasible is False else "n/a"
         lines.append(
             f"| {record.get('n_assets')} | {record.get('cardinality_k')} | `{record.get('beta_label')}` | "
-            f"{record.get('status')} | {fmt(record.get('elapsed_s'))} | {fmt(record.get('deadline_s'))} | "
+            f"{record.get('provenance', 'n/a')} | {record.get('status')} | {fmt(record.get('elapsed_s'))} | "
+            f"{fmt(record.get('repair_s'))} | {fmt(record.get('end_to_end_s'))} | {fmt(record.get('deadline_s'))} | "
             f"{fmt(record.get('objective'), 6)} | {feasible_text} | {fmt(record.get('selected_raw_cardinality'))} | "
             "unavailable | unavailable | unavailable |"
         )
@@ -403,13 +696,21 @@ def historical_context_section() -> List[str]:
 
 def next_test_section(
     cells: Sequence[str], records_by_cell: Dict[str, List[Dict[str, Any]]],
-    capture_proposal: Optional[Dict[str, Any]],
+    capture_proposal: Optional[Dict[str, Any]], run: str,
+    captured_regimes: Optional[Iterable[str]] = None,
 ) -> List[str]:
     """Task brief, step 10: for each regime, what the measurements establish, what
     stays unresolved, and the next control to run. A table, not prose paragraphs,
     because the same three questions repeat for every regime and a table states
     the answers without forcing five near-identical paragraphs on the reader.
+
+    ``run`` names the CPU data source actually loaded (``pilot`` or
+    ``campaign``), never a fixed "from the pilot" claim regardless of what ran
+    (review, C1). ``captured_regimes`` names cells with a REAL, manifest-
+    verified physical-pilot capture on disk; a cell there is never described
+    as still awaiting approval.
     """
+    captured = set(captured_regimes or ())
     lines = [
         "## What each regime establishes, and what runs next", "",
         "| Regime | Established | Unresolved | Next control |",
@@ -424,21 +725,33 @@ def next_test_section(
         completed = sum(1 for r in records if r.get("exit_ok") and not r.get("unsupported"))
         established = (
             f"{completed} completed CPU timing/quality records across {len(kernels)} kernels "
-            f"({', '.join(f'`{k}`' for k in kernels) or 'none yet'}) from the pilot."
+            f"({', '.join(f'`{k}`' for k in kernels) or 'none yet'}) from the {run} run."
         )
-        if cell in arms_by_cell:
+        if cell in captured:
+            established += " Real, manifest-verified physical-scale QPU captures also exist for this cell."
             unresolved = (
-                "No Round 2 QPU capture exists yet. The physical-scale pilot (12 sorted nonces, 3 scales) "
-                "awaits approval, so quality and time outcomes against the QPU stay undefined."
+                "The 12-model physical-scale pilot pairs against only this cell's own CPU pilot models so "
+                "far (see the QPU wins/ties/losses and paired-gaps tables). It earns no regime verdict on "
+                "its own."
             )
             next_control = (
-                "Run the approved physical-scale capture, then compare feasibility and quality against this "
-                "pilot's classical timings. A 12-model pilot never earns a regime verdict on its own."
+                "Extend the paired QPU/CPU comparison to the full CPU campaign once it finishes, and decide "
+                "whether this regime's next round needs a wider physical-scale capture."
+            )
+        elif cell in arms_by_cell:
+            unresolved = (
+                "No Round 2 QPU capture exists yet for this cell. The physical-scale pilot (12 sorted "
+                "nonces, 3 scales) is planned but not yet captured, so quality and time outcomes against "
+                "the QPU stay undefined."
+            )
+            next_control = (
+                "Capture the planned physical-scale pilot, then compare feasibility and quality against "
+                "this cell's classical timings. A 12-model pilot never earns a regime verdict on its own."
             )
         else:
             unresolved = (
-                "No Round 2 QPU capture exists yet, and this cell has no physical-scale plan at all. The CPU "
-                "comparison alone cannot answer the regime question."
+                "No Round 2 QPU capture exists yet, and this cell has no physical-scale plan at all. The "
+                "CPU comparison alone cannot answer the regime question."
             )
             next_control = (
                 "Extend the campaign to the full 100-model comparison for this cell, then decide whether a "
@@ -446,12 +759,13 @@ def next_test_section(
             )
         lines.append(f"| `{cell}` | {established} | {unresolved} | {next_control} |")
     lines.append(
-        "| Portfolio pipeline | The historical-deadline arm ran to completion for both baskets and both beta "
-        "labels, producing repaired objectives and raw feasibility counts. | No paired QPU portfolio result "
-        "exists, so strict and material wins, speed-only outcomes, and joint quality/time counts stay "
-        "unavailable. The 80% portfolio claim stays unresolved. | Capture the portfolio pilot (12 frozen "
-        "market instances, beta-zero and positive-beta controls) once its provenance and anneal-setting "
-        "classification are explicit, per the design doc. |"
+        "| Portfolio pipeline | The deadline arm (synthetic fixtures, historical settings) ran to "
+        "completion for both baskets and both beta labels, producing repaired objectives and raw "
+        "feasibility counts. | No paired QPU portfolio result exists, so strict and material wins, "
+        "speed-only outcomes, and joint quality/time counts stay unavailable. The 80% portfolio claim "
+        "stays unresolved. | Capture the portfolio pilot (12 frozen market instances, beta-zero and "
+        "positive-beta controls) once its provenance and anneal-setting classification are explicit, per "
+        "the design doc. |"
     )
     return lines
 
@@ -762,19 +1076,118 @@ def _signed_bar_chart(title: str, subtitle: str, bars: Sequence[Tuple[str, float
     return _svg_document(width, height, header + "".join(body_parts))
 
 
-def physical_scale_figure(capture_proposal: Optional[Dict[str, Any]]) -> str:
-    """The physical-scale panel for diamond and clique (task brief, step 7): the
-    PLANNED capture counts, since no physical capture has run yet. Never plots
-    a result that does not exist.
+def physical_scale_figure(
+    capture_proposal: Optional[Dict[str, Any]], captured_regimes: Optional[Iterable[str]] = None,
+) -> str:
+    """The physical-scale PLAN panel for diamond and clique (task brief, step 7):
+    the planned capture counts. See :func:`physical_scale_effect_figure` for
+    what was actually measured once a capture exists.
+
+    ``captured_regimes`` names cells with a real, manifest-verified capture on
+    disk. The subtitle's own capture-status sentence is never a fixed claim
+    (review, C1, and a render-inspection defect from this final fix pass:
+    the old fixed "No physical capture has run yet" stayed in the SVG even
+    after real captures existed for every planned cell).
     """
     arms = (capture_proposal or {}).get("arms", [])
     bars = [(f"{arm['regime']} @ {arm['anneal_us']} us", float(arm["captures"])) for arm in arms]
     approval = (capture_proposal or {}).get("approval", "no plan on file")
+    planned_cells = sorted({arm["regime"] for arm in arms})
+    captured = set(captured_regimes or ())
+    if not planned_cells:
+        capture_status = "No physical-scale plan is on file."
+    elif captured.issuperset(planned_cells):
+        capture_status = "Every planned cell has a real, manifest-verified capture."
+    elif captured:
+        capture_status = f"Captured so far: {', '.join(sorted(captured))}."
+    else:
+        capture_status = "No physical capture has run yet."
     subtitle = (
-        f"Planned captures per arm (diamond and clique only). Approval status: {approval}. "
-        "No physical capture has run yet."
+        f"Planned captures per arm (diamond and clique only). Approval status: {approval}. {capture_status}"
     )
     return _bar_chart("Physical-scale pilot plan (diamond, clique)", subtitle, bars, "captures planned")
+
+
+def physical_scale_effect_figure(cell: str, captures: Sequence[Dict[str, Any]]) -> str:
+    """The physical-scale EFFECT panel (task brief, step 7; review, C1): each
+    captured model's own best energy at each requested scale, colored by
+    anneal time. Per-model points, exactly the 12-model pilot's own data --
+    this never averages across models into a single line, and it assigns no
+    regime verdict (the design doc: "do not extrapolate 12 models into a
+    regime verdict").
+    """
+    width, height = 640, 420
+    margin = 90
+    title = f'<text x="{margin}" y="24" font-size="16" font-weight="bold">{cell}: physical-scale effect (QPU)</text>'
+    caption = (
+        "Energy units: canonical. Each point is one captured model at one requested scale and anneal time. "
+        "The 12-model pilot supports no regime verdict on its own."
+    )
+    max_chars = max(20, int((width - 2 * margin) / (12 * 0.6)))
+    body_parts = [title]
+    y_cursor = 42
+    for line in _wrap_lines(caption, max_chars):
+        body_parts.append(f'<text x="{margin}" y="{y_cursor}" font-size="12">{line}</text>')
+        y_cursor += 15
+    plot_top = y_cursor + 6
+
+    if not captures:
+        body_parts.append(
+            f'<text x="{margin}" y="{(plot_top + height - margin) / 2:.0f}" font-size="14">'
+            "No physical-scale captures for this cell.</text>"
+        )
+        return _svg_document(width, height, "".join(body_parts))
+
+    anneals = sorted({c["anneal_us"] for c in captures})
+    colors = {anneal: _PALETTE[i % len(_PALETTE)] for i, anneal in enumerate(anneals)}
+    legend_x = margin
+    legend_y = plot_top
+    for anneal, color in colors.items():
+        label = f"{anneal} us"
+        body_parts.append(f'<rect x="{legend_x}" y="{legend_y}" width="12" height="12" fill="{color}"/>')
+        body_parts.append(f'<text x="{legend_x + 16}" y="{legend_y + 11}" font-size="12">{label}</text>')
+        legend_x += 20 + int(_text_width_estimate(label)) + 16
+    plot_top = legend_y + 26
+
+    scales = [c["requested_scale"] for c in captures]
+    energies = [c["best_energy"] for c in captures]
+    x_min, x_max = _pad_range(min(scales), max(scales))
+    y_min, y_max = _pad_range(min(energies), max(energies))
+    x_span = x_max - x_min
+    y_span = y_max - y_min
+    plot_height = height - margin - plot_top
+    for capture in captures:
+        x = margin + (capture["requested_scale"] - x_min) / x_span * (width - 2 * margin)
+        y = height - margin - (capture["best_energy"] - y_min) / y_span * plot_height
+        color = colors[capture["anneal_us"]]
+        body_parts.append(
+            f'<circle cx="{x:.1f}" cy="{y:.1f}" r="6" fill="{color}" fill-opacity="0.85">'
+            f'<title>model {capture["model_hash"][:8]}, scale {capture["requested_scale"]:g}, '
+            f'{capture["anneal_us"]} us: best energy {capture["best_energy"]:.6g}</title></circle>'
+        )
+    for tick in _axis_ticks(x_min, x_max, count=5):
+        tick_x = margin + (tick - x_min) / x_span * (width - 2 * margin)
+        body_parts.append(
+            f'<text x="{tick_x:.1f}" y="{height - margin + 16}" font-size="10" text-anchor="middle">'
+            f'{_tick_text(tick)}</text>'
+        )
+    body_parts.append(
+        f'<text x="{(margin + width - margin) / 2:.0f}" y="{height - margin + 32}" font-size="11" '
+        'text-anchor="middle">Requested scale (share of the audited legal ceiling)</text>'
+    )
+    for tick in _axis_ticks(y_min, y_max, count=5):
+        tick_y = height - margin - (tick - y_min) / y_span * plot_height
+        body_parts.append(
+            f'<text x="{margin - 6}" y="{tick_y + 3:.1f}" font-size="10" text-anchor="end">{_tick_text(tick)}</text>'
+        )
+    y_title_pos = (plot_top + height - margin) / 2
+    body_parts.append(
+        f'<text x="{margin - 55}" y="{y_title_pos:.0f}" font-size="11" text-anchor="middle" '
+        f'transform="rotate(-90 {margin - 55} {y_title_pos:.0f})">Best energy (canonical units)</text>'
+    )
+    body_parts.append(f'<line x1="{margin}" y1="{height - margin}" x2="{width - margin}" y2="{height - margin}" stroke="black"/>')
+    body_parts.append(f'<line x1="{margin}" y1="{plot_top}" x2="{margin}" y2="{height - margin}" stroke="black"/>')
+    return _svg_document(width, height, "".join(body_parts))
 
 
 def portfolio_figure(portfolio_records: Sequence[Dict[str, Any]]) -> str:
@@ -788,7 +1201,8 @@ def portfolio_figure(portfolio_records: Sequence[Dict[str, Any]]) -> str:
         for record in portfolio_records if record.get("objective") is not None
     ]
     subtitle = (
-        "Historical-deadline arm (dwave-neal, 500 reads / 500 sweeps), repaired final objective, original "
+        "Deadline arm, synthetic fixtures, historical settings (dwave-neal, 500 reads / 500 sweeps), repaired "
+        "final objective, original "
         "units. No paired QPU portfolio result yet."
     )
     return _signed_bar_chart("Portfolio pipeline: repaired objective per basket", subtitle, bars, "objective")
@@ -820,6 +1234,7 @@ def portfolio_repair_figure(portfolio_records: Sequence[Dict[str, Any]]) -> str:
 def write_figures(
     out_dir: Path, records_by_cell: Dict[str, List[Dict[str, Any]]], kernels: Sequence[str], depths: Sequence[int],
     capture_proposal: Optional[Dict[str, Any]], portfolio_records: Sequence[Dict[str, Any]],
+    captures_by_arm: Optional[Dict[Tuple[str, float, int], List[Dict[str, Any]]]] = None,
 ) -> List[Path]:
     out_dir.mkdir(parents=True, exist_ok=True)
     paths = []
@@ -827,9 +1242,20 @@ def write_figures(
         path = out_dir / f"quality-time-{cell}.svg"
         path.write_text(quality_time_figure(cell, records, kernels, depths), encoding="utf-8")
         paths.append(path)
+    captured_regimes = {cell for cell, _scale, _anneal in (captures_by_arm or {})}
     physical_path = out_dir / "physical-scale-plan.svg"
-    physical_path.write_text(physical_scale_figure(capture_proposal), encoding="utf-8")
+    physical_path.write_text(physical_scale_figure(capture_proposal, captured_regimes), encoding="utf-8")
     paths.append(physical_path)
+    # One physical-scale EFFECT panel per cell that has a real capture (review,
+    # C1): the planned-count panel above states what was proposed; this one
+    # shows what was actually measured, per model, never averaged into a verdict.
+    captures_by_cell: Dict[str, List[Dict[str, Any]]] = {}
+    for (cell, _scale, _anneal), captures in (captures_by_arm or {}).items():
+        captures_by_cell.setdefault(cell, []).extend(captures)
+    for cell, captures in captures_by_cell.items():
+        effect_path = out_dir / f"physical-scale-effect-{cell}.svg"
+        effect_path.write_text(physical_scale_effect_figure(cell, captures), encoding="utf-8")
+        paths.append(effect_path)
     portfolio_path = out_dir / "portfolio-objective.svg"
     portfolio_path.write_text(portfolio_figure(portfolio_records), encoding="utf-8")
     paths.append(portfolio_path)
@@ -852,9 +1278,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--depths", type=int, nargs="+", default=None,
         help="Defaults to the pilot depths for --run pilot, the full ladder otherwise.",
     )
-    parser.add_argument("--seeded-root", default=None, help="cpu-root's seeded-sweep directory; omit to skip the seed-lane table.")
+    parser.add_argument("--seeded-root", default=None, help="cpu-root's seeded-sweep-v2 directory; omit to skip the seed-lane table.")
     parser.add_argument("--portfolio-results", default=None, help="portfolio-deadline/results.json; omit to skip the portfolio tables.")
     parser.add_argument("--capture-proposal", default=None, help="capture-proposal.json; omit to mark physical scale unavailable.")
+    parser.add_argument(
+        "--qpu-root", default=None,
+        help="qpu-physical-pilot/ (real captures); requires --physical-capture-manifest too.",
+    )
+    parser.add_argument(
+        "--physical-capture-manifest", default=None,
+        help="physical-capture-manifest.json, checked against every --qpu-root capture.",
+    )
     parser.add_argument("--out-dir", required=True)
     return parser
 
@@ -874,12 +1308,32 @@ def main(argv: Optional[List[str]] = None) -> int:
     capture_proposal = load_capture_proposal(Path(args.capture_proposal)) if args.capture_proposal else None
     expected_per_arm = expected_per_arm_for(args.run)
 
+    captures: List[Dict[str, Any]] = []
+    captures_by_arm: Dict[Tuple[str, float, int], List[Dict[str, Any]]] = {}
+    spend_summary: Optional[Dict[str, Any]] = None
+    if args.qpu_root and args.physical_capture_manifest:
+        manifest = load_physical_capture_manifest(Path(args.physical_capture_manifest))
+        captures = load_qpu_captures(Path(args.qpu_root), manifest)
+        captures_by_arm = group_captures_by_arm(captures)
+        spend_summary = reconcile_spend(Path(args.qpu_root), captures)
+    captured_regimes = {cell for cell, _scale, _anneal in captures_by_arm}
+
+    if captures:
+        qpu_status = (
+            f"Round 2's physical-scale QPU pilot has {len(captures)} real, manifest-verified captures across "
+            f"{len(captured_regimes)} cells: {', '.join(sorted(captured_regimes))}. See the QPU wins/ties/"
+            "losses, paired-gaps, and physical-scale tables below."
+        )
+    else:
+        qpu_status = (
+            "No Round 2 QPU capture is loaded for this report run (pass --qpu-root and "
+            "--physical-capture-manifest to load one)."
+        )
+
     lines = [
         "# Round 2 regime search report", "",
         f"Status: draft, {args.run} data, incomplete. This report draws on `{args.run}` CPU records under "
-        f"`{cpu_root}`. No Round 2 quantum processing unit (QPU) capture has run yet: the physical-scale and "
-        "portfolio pilots are still pending approval. This draft proves the reporting pipeline end to end. "
-        "It states no regime verdict.",
+        f"`{cpu_root}`. {qpu_status} This draft states no regime verdict.",
         "",
     ]
     lines += model_identity_table(records_by_cell) + [""]
@@ -887,22 +1341,32 @@ def main(argv: Optional[List[str]] = None) -> int:
     lines += depth_quality_time_table(
         records_by_cell, kernels=args.kernels, depths=depths, expected_per_arm=expected_per_arm,
     ) + [""]
-    lines += qpu_outcome_table(args.cells) + [""]
-    lines += paired_gaps_table(args.cells) + [""]
+    lines += cpu_kernel_gap_table(records_by_cell, kernels=args.kernels, depths=depths) + [""]
+    lines += qpu_outcome_table(args.cells, captures_by_arm, records_by_cell, args.kernels, depths) + [""]
+    lines += paired_gaps_table(args.cells, captures_by_arm, records_by_cell, args.kernels, depths) + [""]
     if seeded_by_cell:
         lines += seed_lane_table(seeded_by_cell) + [""]
-    lines += physical_scale_table(capture_proposal, args.cells) + [""]
+    lines += physical_scale_table(capture_proposal, args.cells, captured_regimes=captured_regimes) + [""]
+    if spend_summary is not None:
+        lines += [
+            "## Physical-pilot spend reconciliation", "",
+            f"Submits: {spend_summary['submits']}. Charges: {spend_summary['charges']}. Open jobs (submitted, "
+            f"never charged): {spend_summary['open_jobs']}. Charged total: {spend_summary['charged_us']} us. "
+            f"Sum of every capture's own access_us: {spend_summary['total_access_us']} us. The totals "
+            f"{'reconcile' if spend_summary['reconciled'] else 'do not reconcile'}.",
+            "",
+        ]
     if portfolio_records:
         lines += feasibility_table(portfolio_records) + [""]
         lines += portfolio_pipeline_table(portfolio_records) + [""]
     lines += historical_context_section() + [""]
-    lines += next_test_section(args.cells, records_by_cell, capture_proposal) + [""]
+    lines += next_test_section(args.cells, records_by_cell, capture_proposal, args.run, captured_regimes) + [""]
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     report_path = out_dir / "REPORT.md"
     report_path.write_text("\n".join(lines), encoding="utf-8")
-    write_figures(out_dir, records_by_cell, args.kernels, depths, capture_proposal, portfolio_records)
+    write_figures(out_dir, records_by_cell, args.kernels, depths, capture_proposal, portfolio_records, captures_by_arm)
     print(f"wrote {report_path}")
     return 0
 

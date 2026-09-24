@@ -265,7 +265,10 @@ def test_bootstrap_paired_gap_defaults_to_the_named_fixed_seed_constant():
 # ============================================================= round2_report
 
 
-def _cpu_record(cell, nonce, kernel, sweeps, *, best_energy=-1.0, wall_s=1.0, exit_ok=True, unsupported=False):
+def _cpu_record(
+    cell, nonce, kernel, sweeps, *,
+    best_energy: Optional[float] = -1.0, wall_s: Optional[float] = 1.0, exit_ok=True, unsupported=False,
+):
     return {
         "schema": "round2-cpu-run-v1", "cell": cell, "nonce": nonce, "requested_kernel": kernel,
         "sweeps": sweeps, "reads": 64, "exit_ok": exit_ok, "unsupported": unsupported,
@@ -292,6 +295,47 @@ def test_load_cpu_records_ignores_pre_attempt_files_and_takes_the_latest_attempt
     records = report.load_cpu_records(tmp_path, "native-pm1")
     assert len(records) == 1
     assert records[0]["best_energy"] == -2.0  # the latest attempt wins
+
+
+def test_load_cpu_records_uses_the_latest_exit_ok_attempt_for_quality(tmp_path):
+    # A --repeat-contaminated retry (review, M3): attempt0 succeeded, attempt1
+    # crashed outright. The old "just take the highest attempt number" rule
+    # would report attempt1's None energy, silently discarding a valid result.
+    cell_dir = tmp_path / "native-pm1"
+    cell_dir.mkdir()
+    _write_attempt(
+        cell_dir, "aa", "cpu-sa", 512, 0,
+        _cpu_record("native-pm1", "aa", "cpu-sa", 512, best_energy=-5.0, wall_s=1.0),
+    )
+    _write_attempt(
+        cell_dir, "aa", "cpu-sa", 512, 1,
+        _cpu_record("native-pm1", "aa", "cpu-sa", 512, exit_ok=False, best_energy=None, wall_s=None),
+    )
+    records = report.load_cpu_records(tmp_path, "native-pm1")
+    assert len(records) == 1
+    assert records[0]["best_energy"] == -5.0
+    assert records[0]["wall_s"] == 1.0
+
+
+def test_load_cpu_records_keeps_an_earlier_clean_timing_when_the_latest_success_is_contaminated(tmp_path):
+    # attempt0 is clean; a later --repeat-contaminated retry (attempt1) also
+    # succeeds, but contaminated. Quality should track the latest success
+    # (attempt1's energy); timing should still come from the latest CLEAN
+    # attempt (attempt0's wall_s), never silently pooled or overwritten
+    # (review, M3: "the latest clean attempt for timing").
+    cell_dir = tmp_path / "native-pm1"
+    cell_dir.mkdir()
+    clean = _cpu_record("native-pm1", "aa", "cpu-sa", 512, best_energy=-5.0, wall_s=1.0)
+    clean["host"] = {"contaminated": False}  # a real record always carries this field, never omits it
+    _write_attempt(cell_dir, "aa", "cpu-sa", 512, 0, clean)
+    contaminated = _cpu_record("native-pm1", "aa", "cpu-sa", 512, best_energy=-5.5, wall_s=99.0)
+    contaminated["host"] = {"contaminated": True}
+    _write_attempt(cell_dir, "aa", "cpu-sa", 512, 1, contaminated)
+    records = report.load_cpu_records(tmp_path, "native-pm1")
+    assert len(records) == 1
+    assert records[0]["best_energy"] == -5.5  # quality: the latest successful attempt
+    assert records[0]["wall_s"] == 1.0  # timing: the latest CLEAN attempt, not the contaminated one
+    assert records[0]["host"]["contaminated"] is False  # the clean attempt's own host sample
 
 
 def test_depth_quality_time_table_handles_an_empty_arm(tmp_path):
@@ -347,6 +391,20 @@ def test_feasibility_table_formats_the_regression_case_and_flags_unknown_weighti
     text = "\n".join(lines)
     assert "31993 / 32000 (99.978125%)" in text
     assert "unknown" in text  # weighting_failed=None must read as unknown, never success
+
+
+def test_feasibility_table_prints_provenance_so_synthetic_is_never_mistaken_for_historical():
+    portfolio_records = [
+        {
+            "n_assets": 28, "cardinality_k": 9, "beta_label": "beta-zero", "status": "completed",
+            "raw_feasible_count": 0, "returned_reads": 500, "weighting_failed": None,
+            "provenance": "synthetic-test",
+        },
+    ]
+    lines = report.feasibility_table(portfolio_records)
+    text = "\n".join(lines)
+    assert "synthetic-test" in text
+    assert "historical-deadline" not in text.lower()
 
 
 def test_feasibility_table_reports_a_known_weighting_failure():
@@ -473,12 +531,31 @@ def test_portfolio_pipeline_table_shows_the_repaired_feasibility_the_feasibility
     assert "| no | n/a |" in text
 
 
-def test_qpu_outcome_table_and_paired_gaps_table_are_explicitly_unavailable():
+def test_portfolio_pipeline_table_shows_provenance_and_classifies_on_end_to_end_time():
+    # elapsed_s is sampling time only; status is decided by end_to_end_s, which
+    # includes repair/weighting time (review, I5). Both must be visible, along
+    # with the arm's own provenance, never silently defaulted to "historical".
+    portfolio_records = [
+        {
+            "n_assets": 18, "cardinality_k": 6, "beta_label": "beta-zero", "status": "completed",
+            "provenance": "synthetic-test", "elapsed_s": 0.06, "repair_s": 0.02, "end_to_end_s": 0.08,
+            "deadline_s": 10.0, "objective": 0.0001, "feasible": True, "selected_raw_cardinality": 2,
+        },
+    ]
+    lines = report.portfolio_pipeline_table(portfolio_records)
+    text = "\n".join(lines)
+    assert "synthetic-test" in text
+    assert "0.08" in text  # end_to_end_s, the time the status is classified on
+    assert "0.02" in text  # repair_s
+    assert "historical-deadline" not in text.lower()  # never call the arm itself historical
+
+
+def test_qpu_outcome_table_and_paired_gaps_table_state_no_comparable_pairs_with_no_captures():
     cells = ["native-pm1", "diamond-pm1"]
-    outcome_text = "\n".join(report.qpu_outcome_table(cells))
-    gaps_text = "\n".join(report.paired_gaps_table(cells))
-    assert "unavailable" in outcome_text and "native-pm1" in outcome_text
-    assert "unavailable" in gaps_text and "diamond-pm1" in gaps_text
+    outcome_text = "\n".join(report.qpu_outcome_table(cells, {}, {}, ["cpu-sa"], [512]))
+    gaps_text = "\n".join(report.paired_gaps_table(cells, {}, {}, ["cpu-sa"], [512]))
+    assert "No comparable pairs" in outcome_text
+    assert "No comparable pairs" in gaps_text
 
 
 def test_main_writes_a_draft_report_and_figures_from_a_small_fixture(tmp_path, monkeypatch):
@@ -764,6 +841,17 @@ def test_physical_scale_figure_subtitle_wraps_within_the_canvas():
         assert x + len(text) * 12 * 0.6 <= width, f"text {text!r} at x={x} overflows a {width}px canvas"
 
 
+def test_physical_scale_figure_never_claims_no_capture_has_run_once_one_has(tmp_path):
+    # A real render-inspection defect (final fix pass): once real captures
+    # exist for a cell, this figure's own fixed subtitle text was still false.
+    proposal = {
+        "arms": [{"regime": "diamond-pm1", "anneal_us": 80, "captures": 36, "reads_per_capture": 64}],
+        "approval": "approved",
+    }
+    svg = report.physical_scale_figure(proposal, captured_regimes={"diamond-pm1"})
+    assert "No physical capture has run yet" not in svg
+
+
 def test_portfolio_repair_figure_subtitle_wraps_within_the_canvas():
     records = [
         {
@@ -805,3 +893,223 @@ def test_bar_chart_value_label_never_overlaps_a_long_category_label():
     value_x, _, value_text = next(e for e in elements if e[2] == "0 raw feasible reads")
     category_right_edge = category_x + report._text_width_estimate(category_text)
     assert value_x >= category_right_edge
+
+
+# ==================================================== final fix pass: C1 QPU captures
+
+
+def _write_qpu_capture(
+    path: Path, *, cell, nonce, model_hash, capture_key,
+    requested_scale, anneal_us, energies, mock=False, access_us=50_000,
+):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    energies_arr = np.asarray(energies, dtype=np.float64)
+    spins = np.ones((len(energies_arr), 4), dtype=np.int8)
+    np.savez_compressed(
+        path,
+        spins=spins, energies=energies_arr,
+        mock=np.bool_(mock), anneal_us=np.int64(anneal_us), requested_scale=np.float64(requested_scale),
+        access_us=np.int64(access_us), capture_key=capture_key, model_hash=model_hash,
+    )
+
+
+def _manifest_job(cell, nonce, model_hash, capture_key, requested_scale, anneal_us):
+    return {
+        "cell": cell, "nonce": nonce, "model_hash": model_hash, "capture_key": capture_key,
+        "requested_scale": requested_scale, "anneal_us": anneal_us,
+    }
+
+
+def test_load_qpu_captures_verifies_against_the_manifest(tmp_path):
+    qpu_root = tmp_path / "qpu-physical-pilot"
+    _write_qpu_capture(
+        qpu_root / "diamond-pm1" / "scale-050" / "qpu-80" / "aa.npz",
+        cell="diamond-pm1", nonce="aa", model_hash="mh-aa", capture_key="key-aa",
+        requested_scale=0.5, anneal_us=80, energies=[-10.0, -9.0],
+    )
+    manifest = {"jobs": [_manifest_job("diamond-pm1", "aa", "mh-aa", "key-aa", 0.5, 80)]}
+    captures = report.load_qpu_captures(qpu_root, manifest)
+    assert len(captures) == 1
+    cap = captures[0]
+    assert cap["cell"] == "diamond-pm1"
+    assert cap["model_hash"] == "mh-aa"
+    assert cap["requested_scale"] == 0.5
+    assert cap["anneal_us"] == 80
+    assert cap["best_energy"] == -10.0
+    assert cap["access_us"] == 50_000
+
+
+def test_load_qpu_captures_rejects_a_mock_capture(tmp_path):
+    qpu_root = tmp_path / "qpu-physical-pilot"
+    _write_qpu_capture(
+        qpu_root / "diamond-pm1" / "scale-050" / "qpu-80" / "aa.npz",
+        cell="diamond-pm1", nonce="aa", model_hash="mh-aa", capture_key="key-aa",
+        requested_scale=0.5, anneal_us=80, energies=[-10.0], mock=True,
+    )
+    manifest = {"jobs": [_manifest_job("diamond-pm1", "aa", "mh-aa", "key-aa", 0.5, 80)]}
+    with pytest.raises(ValueError, match="mock"):
+        report.load_qpu_captures(qpu_root, manifest)
+
+
+def test_load_qpu_captures_rejects_a_capture_key_not_in_the_manifest(tmp_path):
+    qpu_root = tmp_path / "qpu-physical-pilot"
+    _write_qpu_capture(
+        qpu_root / "diamond-pm1" / "scale-050" / "qpu-80" / "aa.npz",
+        cell="diamond-pm1", nonce="aa", model_hash="mh-aa", capture_key="unknown-key",
+        requested_scale=0.5, anneal_us=80, energies=[-10.0],
+    )
+    with pytest.raises(ValueError, match="capture_key"):
+        report.load_qpu_captures(qpu_root, {"jobs": []})
+
+
+def test_load_qpu_captures_rejects_a_model_hash_mismatch(tmp_path):
+    qpu_root = tmp_path / "qpu-physical-pilot"
+    _write_qpu_capture(
+        qpu_root / "diamond-pm1" / "scale-050" / "qpu-80" / "aa.npz",
+        cell="diamond-pm1", nonce="aa", model_hash="wrong-hash", capture_key="key-aa",
+        requested_scale=0.5, anneal_us=80, energies=[-10.0],
+    )
+    manifest = {"jobs": [_manifest_job("diamond-pm1", "aa", "mh-aa", "key-aa", 0.5, 80)]}
+    with pytest.raises(ValueError, match="model_hash"):
+        report.load_qpu_captures(qpu_root, manifest)
+
+
+def test_pair_qpu_cpu_by_model_matches_on_model_hash_and_excludes_failed_cpu_records():
+    captures = [
+        {"model_hash": "mh-a", "best_energy": -10.0},
+        {"model_hash": "mh-b", "best_energy": -8.0},
+    ]
+    cpu_ok = _cpu_record("diamond-pm1", "aa", "cpu-sa", 512, best_energy=-9.5)
+    cpu_ok["model_hash"] = "mh-a"
+    cpu_failed = _cpu_record("diamond-pm1", "bb", "cpu-sa", 512, exit_ok=False, best_energy=None)
+    cpu_failed["model_hash"] = "mh-b"
+    pairs = report.pair_qpu_cpu_by_model(captures, [cpu_ok, cpu_failed])
+    assert pairs == [("mh-a", -10.0, -9.5)]
+
+
+def test_qpu_outcome_table_shows_real_pairs_when_captures_exist():
+    cpu_a = _cpu_record("diamond-pm1", "aa", "cpu-sa", 512, best_energy=-9.9)
+    cpu_a["model_hash"] = "mh-a"
+    cpu_b = _cpu_record("diamond-pm1", "bb", "cpu-sa", 512, best_energy=-7.0)
+    cpu_b["model_hash"] = "mh-b"
+    captures_by_arm = {
+        ("diamond-pm1", 0.5, 80): [
+            {"model_hash": "mh-a", "best_energy": -10.0},
+            {"model_hash": "mh-b", "best_energy": -7.0},
+        ],
+    }
+    records_by_cell = {"diamond-pm1": [cpu_a, cpu_b]}
+    lines = report.qpu_outcome_table(["diamond-pm1"], captures_by_arm, records_by_cell, ["cpu-sa"], [512])
+    text = "\n".join(lines)
+    assert "| `diamond-pm1` | 0.5 | 80 | `cpu-sa` | 512 | 2 |" in text
+    assert "No Round 2 QPU capture" not in text
+    assert "pending approval" not in text
+
+
+def test_qpu_outcome_table_states_no_comparable_pairs_when_none_exist():
+    lines = report.qpu_outcome_table(["native-pm1"], {}, {"native-pm1": []}, ["cpu-sa"], [512])
+    assert "No comparable pairs" in "\n".join(lines)
+
+
+def test_paired_gaps_table_computes_a_real_bootstrap_interval_when_pairs_exist():
+    captures_by_arm = {
+        ("diamond-pm1", 0.5, 80): [{"model_hash": f"mh-{i}", "best_energy": -10.0 - i} for i in range(6)],
+    }
+    records = []
+    for i in range(6):
+        record = _cpu_record("diamond-pm1", f"n{i}", "cpu-sa", 512, best_energy=-9.5 - i)
+        record["model_hash"] = f"mh-{i}"
+        records.append(record)
+    records_by_cell = {"diamond-pm1": records}
+    lines = report.paired_gaps_table(["diamond-pm1"], captures_by_arm, records_by_cell, ["cpu-sa"], [512])
+    row = next(line for line in lines if line.startswith("| `diamond-pm1` | 0.5 | 80 | `cpu-sa` | 512 |"))
+    cells = [c.strip() for c in row.split("|")]
+    assert cells[6] == "6"  # Groups: every model is an independent draw
+    assert cells[10] == "no"  # 6 groups clears MIN_INDEPENDENT_GROUPS (5): a real interval, not descriptive
+
+
+def test_paired_gaps_table_states_no_comparable_pairs_when_none_exist():
+    lines = report.paired_gaps_table(["native-pm1"], {}, {"native-pm1": []}, ["cpu-sa"], [512])
+    assert "No comparable pairs" in "\n".join(lines)
+
+
+def test_reconcile_spend_compares_the_charged_total_against_capture_access_us(tmp_path):
+    from quip_miner_dwave import regime_io
+
+    qpu_root = tmp_path / "qpu-physical-pilot"
+    regime_io.append_spend(qpu_root, regime_io.SUBMIT, "diamond-pm1", "aa", 80, 50_000)
+    regime_io.append_spend(qpu_root, regime_io.CHARGE, "diamond-pm1", "aa", 80, 48_000)
+    result = report.reconcile_spend(qpu_root, [{"access_us": 48_000}])
+    assert result["submits"] == 1
+    assert result["charges"] == 1
+    assert result["open_jobs"] == 0
+    assert result["charged_us"] == 48_000
+    assert result["total_access_us"] == 48_000
+    assert result["reconciled"] is True
+
+
+def test_reconcile_spend_flags_a_mismatch_between_charges_and_captures(tmp_path):
+    from quip_miner_dwave import regime_io
+
+    qpu_root = tmp_path / "qpu-physical-pilot"
+    regime_io.append_spend(qpu_root, regime_io.SUBMIT, "diamond-pm1", "aa", 80, 50_000)
+    regime_io.append_spend(qpu_root, regime_io.CHARGE, "diamond-pm1", "aa", 80, 48_000)
+    # A capture whose own access_us disagrees with the journaled charge.
+    result = report.reconcile_spend(qpu_root, [{"access_us": 47_000}])
+    assert result["reconciled"] is False
+
+
+def test_physical_scale_effect_figure_plots_per_model_points():
+    captures = [
+        {"model_hash": "mh-a", "requested_scale": 0.5, "anneal_us": 80, "best_energy": -10.0},
+        {"model_hash": "mh-a", "requested_scale": 1.0, "anneal_us": 80, "best_energy": -12.0},
+        {"model_hash": "mh-b", "requested_scale": 0.5, "anneal_us": 400, "best_energy": -9.0},
+    ]
+    svg = report.physical_scale_effect_figure("diamond-pm1", captures)
+    assert svg.count("<circle") == 3
+    assert "no regime verdict" in svg.lower()
+
+
+def test_physical_scale_effect_figure_handles_no_captures():
+    svg = report.physical_scale_effect_figure("native-pm1", [])
+    assert "No physical-scale capture" in svg
+
+
+# ==================================================== final fix pass: M2 kernel gaps
+
+
+def test_cpu_kernel_gap_table_pairs_by_model_not_by_median():
+    # Two models: msa-f64 wins on one, loses on the other. A median-of-medians
+    # comparison (the old "Depth, quality, and time" table) cannot see this;
+    # a per-model pairing can (review, M2).
+    records = [
+        _cpu_record("diamond-pm1", "aa", "cpu-sa", 512, best_energy=-10.0),
+        _cpu_record("diamond-pm1", "aa", "cpu-msa-f64", 512, best_energy=-10.5),
+        _cpu_record("diamond-pm1", "bb", "cpu-sa", 512, best_energy=-8.0),
+        _cpu_record("diamond-pm1", "bb", "cpu-msa-f64", 512, best_energy=-7.5),
+    ]
+    for record, model_hash in zip(records, ["mh-a", "mh-a", "mh-b", "mh-b"]):
+        record["model_hash"] = model_hash
+    lines = report.cpu_kernel_gap_table({"diamond-pm1": records}, kernels=("cpu-msa-f64",), depths=(512,))
+    text = "\n".join(lines)
+    assert "| `diamond-pm1` | `cpu-msa-f64` vs `cpu-sa` | 512 | 2 | 1/1/0 |" in text
+
+
+def test_cpu_kernel_gap_table_excludes_models_missing_from_either_kernel():
+    records = [
+        _cpu_record("diamond-pm1", "aa", "cpu-sa", 512, best_energy=-10.0),
+        _cpu_record("diamond-pm1", "aa", "cpu-msa-f64", 512, best_energy=-10.5),
+        _cpu_record("diamond-pm1", "bb", "cpu-sa", 512, best_energy=-8.0),
+        # "bb" has no cpu-msa-f64 record at all.
+    ]
+    records[0]["model_hash"] = "mh-a"
+    records[1]["model_hash"] = "mh-a"
+    records[2]["model_hash"] = "mh-b"
+    lines = report.cpu_kernel_gap_table({"diamond-pm1": records}, kernels=("cpu-msa-f64",), depths=(512,))
+    text = "\n".join(lines)
+    assert "| `diamond-pm1` | `cpu-msa-f64` vs `cpu-sa` | 512 | 1 |" in text
+
+
+def test_cpu_kernel_gap_table_states_no_comparable_pairs_when_none_exist():
+    lines = report.cpu_kernel_gap_table({"native-pm1": []}, kernels=("cpu-msa-f64",), depths=(512,))
+    assert "No comparable pairs" in "\n".join(lines)

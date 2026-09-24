@@ -59,6 +59,11 @@ SWEEP_DEPTHS: Tuple[int, ...] = (512, 2048, 8192, 32768, 131072)
 PILOT_SWEEP_DEPTHS: Tuple[int, ...] = (512, 2048)
 
 #: Kernels of the controlled comparison. ``cpu-msa`` (auto-select) never appears here.
+#: Final review ruling: ``cpu-msa`` auto-routes in Round 2 (unit-eligible -> the unit
+#: kernel, otherwise the float kernel). Round 1's own records use the SAME bare name
+#: to mean the unit kernel specifically. A consumer that filters `requested_kernel ==
+#: "cpu-msa"` across the two rounds will silently mix a Round-1 unit-only arm with a
+#: Round-2 auto-routed one -- never pool the two rounds by that bare kernel name.
 CONTROLLED_KERNELS: Tuple[str, ...] = ("cpu-sa", "cpu-msa-f64", "cpu-msa-unit")
 
 #: The kernel whose eligibility is a per-model, empirically-checked outcome.
