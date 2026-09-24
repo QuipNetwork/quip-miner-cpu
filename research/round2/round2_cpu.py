@@ -589,16 +589,15 @@ def cmd_campaign(args: argparse.Namespace) -> int:
     bundles_root = Path(args.bundles_root)
     index = _load_index(bundles_root)
     if args.timing_subset:
-        # Requirement 3: always exactly one worker, serial, pinned, in its own
-        # output directory -- never the quality campaign's own attempt stream.
+        # Its own output directory, never the quality campaign's own attempt
+        # stream. It runs on a loaded host and takes the fastest run as the run
+        # speed (maintainer, 2026-09-24), so it uses every requested worker.
         out_dir = Path(args.out_root) / "timing-subset"
         jobs = runner.build_timing_subset_jobs(index, args.cells)
-        subset_cpus = args.cpus[:1] if args.cpus else None
-        cpus = runner.select_worker_cpus(1, cpus=subset_cpus)
     else:
         out_dir = Path(args.out_root) / "campaign"
         jobs = runner.build_campaign_jobs(index, args.cells)
-        cpus = runner.select_worker_cpus(args.workers, cpus=args.cpus)
+    cpus = runner.select_worker_cpus(args.workers, cpus=args.cpus)
     records = _run_jobs(
         jobs, bundles_root, out_dir, cpus,
         hard_deadline_s=args.hard_deadline_s, repeat_contaminated=args.repeat_contaminated,
@@ -841,8 +840,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     campaign.add_argument(
         "--timing-subset", action="store_true",
-        help="Run the clean serial timing subset instead of the full campaign: one model per "
-        "cell, every depth, every eligible kernel, one pinned worker, in its own output directory.",
+        help="Run the timing subset instead of the full campaign: one model per cell, every "
+        "depth, every eligible kernel, in its own output directory.",
     )
     campaign.set_defaults(func=cmd_campaign)
 

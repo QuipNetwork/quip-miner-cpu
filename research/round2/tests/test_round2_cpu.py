@@ -660,3 +660,23 @@ def test_portfolio_deadline_hard_kill_in_the_parent_is_a_timeout_not_a_failure(t
         assert record["exit_ok"] is False
         assert "p_head" in record
         assert "package_versions" in record
+
+
+def test_timing_subset_runs_on_every_named_cpu(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    # The timing subset runs on a loaded host (maintainer, 2026-09-24): it
+    # takes the fastest run as the run speed, so it uses every named core.
+    seen: Dict[str, Any] = {}
+    monkeypatch.setattr(cpu, "_load_index", lambda root: {})
+    monkeypatch.setattr(runner, "build_timing_subset_jobs", lambda index, cells: [])
+    monkeypatch.setattr(runner, "select_worker_cpus", lambda n, cpus=None: list(cpus or []))
+
+    def fake_run_jobs(jobs: Any, bundles_root: Path, out_dir: Path, cpus: Any, **kwargs: Any) -> list:
+        seen["out_dir"], seen["cpus"] = out_dir, list(cpus)
+        return []
+
+    monkeypatch.setattr(cpu, "_run_jobs", fake_run_jobs)
+    parser = cpu.build_parser()
+    args = parser.parse_args(["campaign", "--timing-subset", "--cpus", "1,2,3", "--out-root", str(tmp_path)])
+    assert args.func(args) == 0
+    assert seen["cpus"] == [1, 2, 3]
+    assert seen["out_dir"] == tmp_path / "timing-subset"
