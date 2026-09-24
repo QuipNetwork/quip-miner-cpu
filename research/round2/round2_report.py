@@ -826,7 +826,11 @@ def next_test_section(
         arms_by_cell.setdefault(arm["regime"], []).append(arm)
     for cell in cells:
         records = records_by_cell.get(cell, [])
-        kernels = sorted({str(k) for r in records if (k := r.get("requested_kernel")) is not None})
+        kernels = sorted({
+            str(k) for r in records
+            if r.get("exit_ok") and not r.get("unsupported")
+            and (k := r.get("requested_kernel")) is not None
+        })
         completed = sum(1 for r in records if r.get("exit_ok") and not r.get("unsupported"))
         established = (
             f"{completed} completed CPU timing/quality records across {len(kernels)} kernels "
@@ -869,6 +873,9 @@ def next_test_section(
                 "CPU comparison alone cannot answer the regime question."
             )
             next_control = (
+                "The CPU campaign for this cell is complete. Decide whether a QPU arm belongs in this "
+                "regime's next round."
+            ) if run == "campaign" else (
                 "Extend the campaign to the full 100-model comparison for this cell, then decide whether a "
                 "QPU arm belongs in this regime's next round."
             )

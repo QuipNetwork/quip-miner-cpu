@@ -401,6 +401,35 @@ def test_captured_cell_status_matches_the_loaded_run(run, expected_text, unexpec
         assert unexpected_text not in status
 
 
+def test_next_test_section_counts_only_supported_kernels():
+    # native-125 and clique-portfolio report cpu-msa-unit for every model, but
+    # every one of those records is unsupported. The established text must name
+    # only kernels that actually produced a supported, completed CPU record.
+    records = {
+        "native-125": [
+            _cpu_record("native-125", "aa", "cpu-msa-f64", 512),
+            _cpu_record("native-125", "bb", "cpu-sa", 512),
+            _cpu_record("native-125", "cc", "cpu-msa-unit", 512, exit_ok=True, unsupported=True),
+        ],
+    }
+    lines = report.next_test_section(["native-125"], records, None, "pilot")
+    row = next(line for line in lines if line.startswith("| `native-125` |"))
+
+    assert "across 2 kernels (`cpu-msa-f64`, `cpu-sa`)" in row
+    assert "cpu-msa-unit" not in row
+
+
+def test_next_test_section_campaign_cell_with_no_capture_says_the_campaign_is_done():
+    # When the loaded run is the campaign, the cell with no capture and no
+    # physical-scale plan has already run its full comparison. Telling the reader
+    # to extend it would ask for work that is complete.
+    lines = report.next_test_section(["native-125"], {"native-125": []}, None, "campaign")
+    row = next(line for line in lines if line.startswith("| `native-125` |"))
+
+    assert "The CPU campaign for this cell is complete." in row
+    assert "Extend the campaign to the full 100-model comparison" not in row
+
+
 def test_depth_quality_time_table_handles_an_empty_arm(tmp_path):
     records_by_cell = {"native-pm1": []}
     lines = report.depth_quality_time_table(records_by_cell, kernels=("cpu-sa",), depths=(512,))
