@@ -63,6 +63,7 @@ import round2_runner as runner
 SCRIPT_PATH = Path(__file__).resolve()
 DEFAULT_BUNDLES_ROOT = Path("/home/carback1/quip-data/regimes/round2/bundles")
 DEFAULT_CPU_ROOT = Path("/home/carback1/quip-data/regimes/round2/cpu")
+DEFAULT_CAPTURED_CPU_ROOT = Path("/home/carback1/quip-data/regimes/round3/cpu")
 DEFAULT_CAPTURE_MANIFEST = Path("/home/carback1/quip-data/regimes/round2/physical-capture-manifest.json")
 ROUND1 = Path("/home/carback1/quip-data/regimes/round1")
 #: P's pinned reference checkout (task-3 report; unchanged here).
@@ -864,7 +865,7 @@ def build_parser() -> argparse.ArgumentParser:
     captured = sub.add_parser("captured", help="The captured-model four-kernel comparison.")
     captured.add_argument("--bundles-root", default=str(DEFAULT_BUNDLES_ROOT))
     captured.add_argument("--capture-manifest", default=str(DEFAULT_CAPTURE_MANIFEST))
-    captured.add_argument("--out-root", default=str(DEFAULT_CPU_ROOT))
+    captured.add_argument("--out-root", default=str(DEFAULT_CAPTURED_CPU_ROOT))
     captured.add_argument("--workers", type=int, default=1, help="Concurrent workers, one physical core each.")
     captured.add_argument(
         "--cpus", type=_parse_cpu_list, default=None,

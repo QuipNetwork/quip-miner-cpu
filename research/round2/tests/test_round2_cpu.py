@@ -713,3 +713,10 @@ def test_captured_command_loads_manifest_and_uses_captured_output_directory(
     assert seen["manifest"] == capture_payload
     assert seen["cpus"] == [15]
     assert seen["out_dir"] == tmp_path / "captured"
+
+
+def test_captured_command_defaults_to_the_round3_cpu_root():
+    args = cpu.build_parser().parse_args(["captured"])
+
+    assert cpu.DEFAULT_CAPTURED_CPU_ROOT == Path("/home/carback1/quip-data/regimes/round3/cpu")
+    assert args.out_root == str(cpu.DEFAULT_CAPTURED_CPU_ROOT)

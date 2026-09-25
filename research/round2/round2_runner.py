@@ -768,6 +768,7 @@ def execute_cpu_job(
         quip_msa = _msa()
         sampler = quip_msa.Msa()
         beta_range = quip_msa.default_beta_range(h, edges, j)
+    effective_seed = job.seed % (1 << 31) if job.kernel == NEAL_KERNEL else None
     t_setup_end = time.perf_counter()
 
     record: Dict[str, Any] = {
@@ -781,6 +782,7 @@ def execute_cpu_job(
         "sweeps": job.sweeps,
         "beta_range": None if beta_range is None else [float(beta_range[0]), float(beta_range[1])],
         "seed": job.seed,
+        "effective_seed": effective_seed,
         "seed_input_hash": job.seed_input_hash,
         "repetition_id": job.repetition_id,
         "repetition_kind": job.repetition_kind,
@@ -849,15 +851,17 @@ def execute_cpu_job(
     record["kernel_input_hash"] = kernel_input["input_hash"]
 
     try:
-        t_sample_start = time.perf_counter()
         if job.kernel == NEAL_KERNEL:
+            assert effective_seed is not None
             quadratic: Dict[Tuple[Any, Any], float] = {}
             for edge, coupling in zip(edges, j):
                 pair = (int(edge[0]), int(edge[1]))
                 quadratic[pair] = quadratic.get(pair, 0.0) + float(coupling)
+            ising_h = {i: float(bias) for i, bias in enumerate(h)}
+
+            t_sample_start = time.perf_counter()
             response = sampler.sample_ising(
-                {i: float(bias) for i, bias in enumerate(h)}, quadratic,
-                num_sweeps=job.sweeps, num_reads=job.reads, seed=job.seed % (1 << 31),
+                ising_h, quadratic, num_sweeps=job.sweeps, num_reads=job.reads, seed=effective_seed,
             )
             t_sample_end = time.perf_counter()
             column = {variable: i for i, variable in enumerate(response.variables)}
@@ -870,6 +874,7 @@ def execute_cpu_job(
             beta_range = response.info["beta_range"]
             record["beta_range"] = [float(beta_range[0]), float(beta_range[1])]
         else:
+            t_sample_start = time.perf_counter()
             spins, energies, meta = sampler.sample_research(
                 kernel_input["h"], kernel_input["edges"], kernel_input["j"], kernel=job.kernel,
                 num_sweeps=job.sweeps, num_reads=job.reads, seed=job.seed,
@@ -932,7 +937,7 @@ _RECORD_FIELDS = (
     "unsupported", "unsupported_reason", "exit_ok", "error", "observed_kernel", "representation",
     "workspace_bytes", "rng_scheme", "elapsed_sampling_s", "best_energy", "mean_energy", "unique_reads",
     "setup_s", "graph_setup_s", "beta_range", "submitted_beta_range", "kernel_energy_scale",
-    "kernel_input_hash", "wall_s", "peak_rss_kb",
+    "kernel_input_hash", "wall_s", "peak_rss_kb", "effective_seed",
 )
 
 
@@ -973,6 +978,7 @@ def failure_record(
     }
     for field in _RECORD_FIELDS:
         record[field] = None
+    record["effective_seed"] = job.seed % (1 << 31) if job.kernel == NEAL_KERNEL else None
     record["unsupported"] = False
     record["exit_ok"] = False
     record["error"] = f"{type(exc).__name__}: {exc}"

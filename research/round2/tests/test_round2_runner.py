@@ -324,6 +324,8 @@ def test_captured_jobs_cover_unique_manifest_models_with_all_captured_arms():
     assert {job.repetition_kind for job in jobs} == {runner.REPETITION_TIMING}
     assert {job.variant for job in jobs} == {"timing"}
     assert len({(job.cell, job.nonce) for job in jobs}) == 24
+    assert len({job.run_key(Path("/bundles"), FAKE_IDENTITY) for job in jobs}) == 480
+    assert len({job.seed for job in jobs}) == 480
     assert sum(job.kernel == runner.UNIT_KERNEL for job in jobs if job.cell == "clique-portfolio") == 60
     assert all(job.nonce != _nonce(99) for job in jobs)
     neal_job = next(job for job in jobs if job.kernel == "dwave-neal")
@@ -419,12 +421,104 @@ def test_dwave_neal_uses_its_default_schedule_and_records_its_actual_beta_range(
         "num_reads": 2, "num_sweeps": 8, "seed": 17,
     }
     assert record["requested_kernel"] == record["observed_kernel"] == "dwave-neal"
+    assert record["seed"] == (1 << 40) + 17
+    assert record["effective_seed"] == captured["kwargs"]["seed"]
     assert record["beta_range"] == [0.123, 3.456]
     assert record["submitted_beta_range"] is None
     assert record["elapsed_sampling_s"] >= 0.0
     assert samples is not None
     np.testing.assert_array_equal(samples["spins"], spins)
     np.testing.assert_array_equal(samples["energies"], energies)
+
+
+@pytest.mark.parametrize(
+    ("cell", "h", "edges", "j"),
+    [
+        (
+            "cubic-dimer-pm1", np.zeros(3),
+            np.array([[0, 1], [1, 2]], dtype=np.int64), np.array([-0.5, 1.0]),
+        ),
+        (
+            "native-pm1", np.zeros(3), BUNDLE_EDGES, np.array([0.001, -0.001]),
+        ),
+    ],
+)
+def test_dwave_neal_rescores_canonical_cubic_and_milli_models(
+    tmp_path, monkeypatch, cell, h, edges, j,
+):
+    manifest = {
+        "cell": cell, "nonce": _nonce(0),
+        "identity": {"topology_hash": "t", "model_order_hash": "o"}, "offset": 0.0,
+    }
+    round2_io.write_bundle(tmp_path / cell / _nonce(0), manifest, {"h": h, "edges": edges, "j": j})
+    spins = np.array([[1, 1, 1], [1, -1, 1]], dtype=np.int8)
+    energies = regimes.energy(spins, h, edges, j)
+    response = types.SimpleNamespace(
+        variables=[0, 1, 2], record=types.SimpleNamespace(sample=spins, energy=energies),
+        info={"beta_range": (0.1, 2.0)},
+    )
+
+    class FakeNealSampler:
+        def sample_ising(self, *args, **kwargs):
+            return response
+
+    monkeypatch.setattr("dwave.samplers.SimulatedAnnealingSampler", FakeNealSampler)
+    record, samples = runner.execute_cpu_job(
+        _job(cell, _nonce(0), kernel="dwave-neal", reads=2), tmp_path,
+    )
+
+    assert record["exit_ok"] is True
+    assert samples is not None
+    np.testing.assert_allclose(samples["energies"], regimes.energy(spins, h, edges, j))
+
+
+def test_dwave_neal_sampling_time_excludes_input_construction(tmp_path, monkeypatch):
+    _write_bundle(tmp_path, "native-pm1", _nonce(0))
+
+    class FakeClock:
+        value = 0.0
+
+        def advance(self, seconds):
+            self.value += seconds
+
+        def perf_counter(self):
+            return self.value
+
+    clock = FakeClock()
+
+    class SlowArray(np.ndarray):
+        def __iter__(self):
+            clock.advance(2.0)
+            return super().__iter__()
+
+    read_bundle = round2_io.read_bundle
+
+    def read_slow_bundle(path):
+        manifest, arrays = read_bundle(path)
+        return manifest, {name: np.asarray(value).view(SlowArray) for name, value in arrays.items()}
+
+    monkeypatch.setattr(round2_io, "read_bundle", read_slow_bundle)
+    monkeypatch.setattr(runner.time, "perf_counter", clock.perf_counter)
+
+    spins = np.ones((2, 3), dtype=np.int8)
+    energies = np.zeros(2)
+    response = types.SimpleNamespace(
+        variables=[0, 1, 2], record=types.SimpleNamespace(sample=spins, energy=energies),
+        info={"beta_range": (0.1, 2.0)},
+    )
+
+    class TimedNealSampler:
+        def sample_ising(self, *args, **kwargs):
+            clock.advance(3.0)
+            return response
+
+    monkeypatch.setattr("dwave.samplers.SimulatedAnnealingSampler", TimedNealSampler)
+
+    record, _ = runner.execute_cpu_job(
+        _job("native-pm1", _nonce(0), kernel="dwave-neal", reads=2), tmp_path,
+    )
+
+    assert record["elapsed_sampling_s"] == pytest.approx(3.0)
 
 
 def test_wrong_observed_kernel_is_never_recorded_as_a_completed_run(tmp_path, monkeypatch):
