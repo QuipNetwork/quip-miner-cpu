@@ -1086,7 +1086,9 @@ def test_captured_root_defaults_to_none_and_omitting_it_preserves_report_bytes(t
         output_bytes.append({path.name: path.read_bytes() for path in out_dir.iterdir() if path.is_file()})
 
     assert output_bytes[0] == output_bytes[1]
-    assert output_bytes[0]["REPORT.md"] == (
+    checkout_root = Path(report.__file__).resolve().parents[2]
+    actual_report = output_bytes[0]["REPORT.md"].replace(str(checkout_root).encode(), b"<CHECKOUT_ROOT>")
+    assert actual_report == (
         Path(report.__file__).parent / "tests" / "fixtures" / "report-captured-root-omitted.md"
     ).read_bytes()
 
@@ -1156,6 +1158,8 @@ def test_captured_root_adds_captured_neal_comparisons_and_uses_captured_matched_
     depth_quality = draft.split("## Depth, quality, and time")[1].split("## ")[0]
 
     assert "captured run" in matched
+    assert "CPU rows use campaign records, except `dwave-neal` rows use the captured run" in outcome
+    assert "CPU rows use campaign records, except `dwave-neal` rows use the captured run" in gaps
     assert "1 distinct model" in matched
     assert "1 to 2 workers" in matched
     assert "single-threaded BLAS" not in matched
@@ -1167,11 +1171,15 @@ def test_captured_root_adds_captured_neal_comparisons_and_uses_captured_matched_
         "| `native-pm1` | 1 | 20 | `cpu-sa` | 1 | 0.5 | 0.6 | 0/0/1 / 0/0/1 / 0/0/1 | 0 | 1 of 1 | 0 | 0.25 | 0.5 |",
         "| `native-pm1` | 1 | 20 | `dwave-neal` | 1 | 0.5 | 0.6 | 0/0/1 / 0/0/1 / 0/0/1 | 0 | 1 of 1 | 0 | 0.4 | 0.8 |",
     ]
-    neal_outcome = next(line for line in outcome.splitlines() if "`dwave-neal`" in line)
+    neal_outcome = next(
+        line for line in outcome.splitlines() if line.startswith("| `native-pm1` |") and "`dwave-neal`" in line
+    )
     assert neal_outcome == "| `native-pm1` | 1 | 20 | `dwave-neal` | 512 | 1 | 0/0/1 | 0/0/1 | 0/0/1 |"
     assert "| `native-pm1` | 1 | 20 | `cpu-sa` | 512 | 1 | 0/1/0 |" in outcome
     assert "| `native-pm1` | 1 | 20 | `dwave-neal` | 512 | 1 |" in gaps
-    neal_gap = next(line for line in gaps.splitlines() if "`dwave-neal`" in line)
+    neal_gap = next(
+        line for line in gaps.splitlines() if line.startswith("| `native-pm1` |") and "`dwave-neal`" in line
+    )
     assert neal_gap.startswith("| `native-pm1` | 1 | 20 | `dwave-neal` | 512 | 1 |")
     campaign_row = next(
         line for line in depth_quality.splitlines()

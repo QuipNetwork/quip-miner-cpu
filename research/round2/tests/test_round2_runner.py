@@ -11,6 +11,7 @@ is the only way to force those specific failure paths deterministically.
 
 from __future__ import annotations
 
+import importlib.metadata
 import os
 import signal
 import subprocess
@@ -201,6 +202,20 @@ def test_run_key_is_sensitive_to_the_solvers_build_identity(tmp_path):
     )
     other_build = {**FAKE_IDENTITY, "binary_sha256": "def456"}
     assert job.run_key(tmp_path, FAKE_IDENTITY) != job.run_key(tmp_path, other_build)
+
+
+def test_dwave_neal_run_key_tracks_sampler_version_without_changing_other_kernels(tmp_path, monkeypatch):
+    versions = {"dwave-samplers": "1.0.0", "quip_msa": "0.1.0"}
+    monkeypatch.setattr(importlib.metadata, "version", lambda package: versions[package])
+    neal_job = _job("native-pm1", _nonce(1), kernel="dwave-neal")
+    msa_job = _job("native-pm1", _nonce(1), kernel="cpu-sa")
+    neal_v1 = neal_job.run_key(tmp_path, FAKE_IDENTITY)
+    msa_v1 = msa_job.run_key(tmp_path, FAKE_IDENTITY)
+
+    versions["dwave-samplers"] = "1.1.0"
+
+    assert neal_job.run_key(tmp_path, FAKE_IDENTITY) != neal_v1
+    assert msa_job.run_key(tmp_path, FAKE_IDENTITY) == msa_v1
 
 
 def test_job_round_trips_through_to_dict_and_from_dict():
@@ -397,6 +412,9 @@ def test_a_completed_run_is_rescored_independently(tmp_path, monkeypatch):
 def test_dwave_neal_uses_its_default_schedule_and_records_its_actual_beta_range(tmp_path, monkeypatch):
     _write_bundle(tmp_path, "native-pm1", _nonce(0))
     monkeypatch.setattr(runner, "_msa", lambda: _fake_msa_module(_FakeSampler()))
+    monkeypatch.setattr(importlib.metadata, "version", lambda package: {
+        "dwave-samplers": "1.0.0", "quip_msa": "0.1.0",
+    }[package])
     captured = {}
     spins = np.array([[1, 1, 1], [-1, -1, -1]], dtype=np.int8)
     energies = runner.regimes.energy(spins, np.zeros(3), BUNDLE_EDGES, np.array([1.0, -1.0]))
@@ -421,6 +439,7 @@ def test_dwave_neal_uses_its_default_schedule_and_records_its_actual_beta_range(
         "num_reads": 2, "num_sweeps": 8, "seed": 17,
     }
     assert record["requested_kernel"] == record["observed_kernel"] == "dwave-neal"
+    assert record["solver_identity"]["dwave_samplers_version"] == "1.0.0"
     assert record["seed"] == (1 << 40) + 17
     assert record["effective_seed"] == captured["kwargs"]["seed"]
     assert record["beta_range"] == [0.123, 3.456]

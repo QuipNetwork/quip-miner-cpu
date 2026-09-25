@@ -1,6 +1,6 @@
 # Round 2 regime search report
 
-Status: draft, campaign data, incomplete. This report draws on `campaign` CPU records under `/home/carback1/quip-miner-cpu/research/round2/tests/fixtures/empty-cpu-root`. No Round 2 QPU capture is loaded for this report run (pass --qpu-root and --physical-capture-manifest to load one). This draft states no regime verdict.
+Status: draft, campaign data, incomplete. This report draws on `campaign` CPU records under `<CHECKOUT_ROOT>/research/round2/tests/fixtures/empty-cpu-root`. No Round 2 QPU capture is loaded for this report run (pass --qpu-root and --physical-capture-manifest to load one). This draft states no regime verdict.
 
 ## Model identity
 

@@ -464,7 +464,7 @@ class CpuJob:
                 "variant": self.variant,
                 "seed": self.seed,
                 "seed_input_hash": self.seed_input_hash,
-                "solver_identity": dict(solver_identity),
+                "solver_identity": job_solver_identity(self, solver_identity),
             }
         )
 
@@ -646,6 +646,23 @@ def solver_identity() -> Dict[str, Any]:
         }
 
 
+def job_solver_identity(job: CpuJob, identity: Mapping[str, Any]) -> Dict[str, Any]:
+    """Add the sampler package version only to ``dwave-neal`` job identities.
+
+    The version is both recorded and hashed into that kernel's resume key. Other
+    kernels keep the Round 2 identity and run keys unchanged.
+    """
+    job_identity = dict(identity)
+    if job.kernel == NEAL_KERNEL:
+        import importlib.metadata
+
+        try:
+            job_identity["dwave_samplers_version"] = importlib.metadata.version("dwave-samplers")
+        except importlib.metadata.PackageNotFoundError:
+            job_identity["dwave_samplers_version"] = None
+    return job_identity
+
+
 #: cubic-dimer-pm1's unit bond, in energy units (UNIT_MILLI["cubic-dimer-pm1"] = 500 milli
 #: in quip_miner_dwave.regimes, divided by the milli-to-energy-units factor of 1000).
 CUBIC_DIMER_UNIT_ENERGY = 0.5
@@ -751,7 +768,7 @@ def execute_cpu_job(
     ineligible unit kernel comes back with ``unsupported=True`` and no
     samples, not a different kernel's answer.
     """
-    identity = solver_identity()
+    identity = job_solver_identity(job, solver_identity())
     t_start = time.perf_counter()
 
     manifest, arrays = round2_io.read_bundle(Path(bundles_root) / job.cell / job.nonce)
@@ -959,7 +976,7 @@ def failure_record(
     when the caller already knows it (the bundle loaded fine and something else failed
     afterward); otherwise it stays None.
     """
-    identity = dict(identity) if identity is not None else solver_identity()
+    identity = job_solver_identity(job, identity if identity is not None else solver_identity())
     record: Dict[str, Any] = {
         "schema": "round2-cpu-run-v1",
         "run_key": job.run_key(bundles_root, identity),

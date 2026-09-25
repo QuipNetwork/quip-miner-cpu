@@ -649,12 +649,14 @@ def qpu_outcome_table(
     captures_by_arm: Dict[Tuple[str, float, int], List[Dict[str, Any]]],
     records_by_cell: Dict[str, List[Dict[str, Any]]],
     kernels: Sequence[str], depths: Sequence[int],
+    *, cpu_source_note: Optional[str] = None,
 ) -> List[str]:
     lines = [
         "## Quantum processing unit wins, ties, and losses", "",
         "Every row pairs one physical-scale QPU arm (cell, scale, anneal time) against one CPU arm (kernel, "
         "sweep depth), matched by `model_hash` (review, C1). Compared counts only models with both a real, "
-        "manifest-verified capture and a completed, finite CPU record.", "",
+        "manifest-verified capture and a completed, finite CPU record."
+        + (f" {cpu_source_note}" if cpu_source_note else ""), "",
         "| Cell | Scale | Anneal us | Kernel | Sweeps | Compared | Strict qpu/cpu/tie | Numeric qpu/cpu/tie "
         "| Material qpu/cpu/tie |",
         "| -- | -- | -- | -- | -- | -- | -- | -- | -- |",
@@ -695,13 +697,14 @@ def paired_gaps_table(
     captures_by_arm: Dict[Tuple[str, float, int], List[Dict[str, Any]]],
     records_by_cell: Dict[str, List[Dict[str, Any]]],
     kernels: Sequence[str], depths: Sequence[int],
+    *, cpu_source_note: Optional[str] = None,
 ) -> List[str]:
     lines = [
         "## Paired gaps", "",
         "Bootstrap paired-gap intervals (`round2_metrics.bootstrap_paired_gap`: 10,000 resamples, the fixed "
         "recorded seed, grouped by model, since every physical-pilot model is an independent draw). The gap "
         "is the same signed relative gap `quality_outcome` itself computes: negative means the QPU energy is "
-        "lower (better).", "",
+        "lower (better)." + (f" {cpu_source_note}" if cpu_source_note else ""), "",
         "| Cell | Scale | Anneal us | Kernel | Sweeps | Groups | Point | 95% low | 95% high | Descriptive |",
         "| -- | -- | -- | -- | -- | -- | -- | -- | -- | -- |",
     ]
@@ -1714,6 +1717,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
     for cell, records in captured_records_by_cell.items():
         records.extend(derive_cpu_msa_records(records))
+    has_captured_neal_records = any(
+        record.get("requested_kernel") == runner.NEAL_KERNEL
+        for records in captured_records_by_cell.values() for record in records
+    )
+    qpu_cpu_source_note = (
+        f"CPU rows use {args.run} records, except `dwave-neal` rows use the captured run."
+        if has_captured_neal_records else None
+    )
     qpu_records_by_cell = {
         cell: [
             record for record in records
@@ -1772,8 +1783,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     }
     lines += lane_diversity_table(diversity_records_by_cell) + [""]
     lines += cpu_kernel_gap_table(records_by_cell, kernels=args.kernels, depths=depths) + [""]
-    lines += qpu_outcome_table(args.cells, captures_by_arm, qpu_records_by_cell, qpu_kernels, depths) + [""]
-    lines += paired_gaps_table(args.cells, captures_by_arm, qpu_records_by_cell, qpu_kernels, depths) + [""]
+    lines += qpu_outcome_table(
+        args.cells, captures_by_arm, qpu_records_by_cell, qpu_kernels, depths,
+        cpu_source_note=qpu_cpu_source_note,
+    ) + [""]
+    lines += paired_gaps_table(
+        args.cells, captures_by_arm, qpu_records_by_cell, qpu_kernels, depths,
+        cpu_source_note=qpu_cpu_source_note,
+    ) + [""]
     matched_records_by_cell = captured_records_by_cell if captured_records_by_cell else records_by_cell
     captured_records = [record for records in captured_records_by_cell.values() for record in records]
     captured_model_count = len({
