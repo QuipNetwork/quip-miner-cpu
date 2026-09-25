@@ -1704,7 +1704,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
     for cell, records in captured_records_by_cell.items():
         records.extend(derive_cpu_msa_records(records))
-    qpu_records_by_cell = {cell: list(records) for cell, records in records_by_cell.items()}
+    qpu_records_by_cell = {
+        cell: [
+            record for record in records
+            if not captured_records_by_cell or record.get("requested_kernel") != runner.NEAL_KERNEL
+        ]
+        for cell, records in records_by_cell.items()
+    }
     qpu_kernels = list(args.kernels)
     if captured_records_by_cell:
         if runner.NEAL_KERNEL not in qpu_kernels:
@@ -1759,9 +1765,24 @@ def main(argv: Optional[List[str]] = None) -> int:
     lines += qpu_outcome_table(args.cells, captures_by_arm, qpu_records_by_cell, qpu_kernels, depths) + [""]
     lines += paired_gaps_table(args.cells, captures_by_arm, qpu_records_by_cell, qpu_kernels, depths) + [""]
     matched_records_by_cell = captured_records_by_cell if captured_records_by_cell else records_by_cell
+    captured_records = [record for records in captured_records_by_cell.values() for record in records]
+    captured_model_count = len({
+        record["model_hash"] for record in captured_records if isinstance(record.get("model_hash"), str)
+    })
+    captured_worker_counts = sorted({
+        record["concurrent_workers"] for record in captured_records
+        if isinstance(record.get("concurrent_workers"), int)
+    })
+    if len(captured_worker_counts) == 1:
+        captured_worker_label = f"{captured_worker_counts[0]} worker"
+    elif captured_worker_counts:
+        captured_worker_label = f"{captured_worker_counts[0]} to {captured_worker_counts[-1]} workers"
+    else:
+        captured_worker_label = "worker count unavailable"
     matched_description = (
         "QPU time is charged access time for 64 reads, with end-to-end time also shown. CPU energy and time "
-        "come from the captured run: 24 models, one worker per physical core, single-threaded BLAS. Energy "
+        f"come from the captured run: {captured_model_count} distinct model"
+        f"{'s' if captured_model_count != 1 else ''}, {captured_worker_label}. Energy "
         "outcomes use the same strict, numeric-tolerance, and material rules as the equal-sweep tables. Equal "
         "budget uses the deepest CPU depth completed within that capture's access-time budget. Time to QPU "
         "energy uses the quickest CPU depth that reached the capture's best energy."

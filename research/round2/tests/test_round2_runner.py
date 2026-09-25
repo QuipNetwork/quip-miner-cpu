@@ -1159,6 +1159,7 @@ def test_child_subprocesses_receive_single_threaded_blas_environment(monkeypatch
 
     exit_ok, _wall_s = runner.run_subprocess_with_hard_deadline(
         [sys.executable, "-c", "pass"], hard_deadline_s=10.0,
+        env={"PYTHONPATH": "/caller/python/path"},
     )
 
     assert exit_ok is True
@@ -1173,6 +1174,7 @@ def test_child_subprocesses_receive_single_threaded_blas_environment(monkeypatch
         "NUMEXPR_NUM_THREADS": "1",
     }
     assert spawned_envs[0]["PATH"] == os.environ["PATH"]
+    assert spawned_envs[0]["PYTHONPATH"] == "/caller/python/path"
 
 
 # --------------------------------------------------------- select_worker_cpus

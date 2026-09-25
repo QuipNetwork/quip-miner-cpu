@@ -1098,6 +1098,10 @@ def test_captured_root_adds_captured_neal_comparisons_and_uses_captured_matched_
     campaign_record = _cpu_record(cell, "campaign-model", "cpu-sa", 512, best_energy=-9.0, wall_s=9.0)
     campaign_record["model_hash"] = model_hash
     _write_attempt(cpu_root / "campaign" / cell, "campaign-model", "cpu-sa", 512, 0, campaign_record)
+    campaign_neal = _cpu_record(
+        cell, "campaign-neal-model", "dwave-neal", 512, best_energy=-99.0, wall_s=99.0,
+    )
+    _write_attempt(cpu_root / "campaign" / cell, "campaign-neal-model", "dwave-neal", 512, 0, campaign_neal)
 
     captured_root = tmp_path / "captured-input"
     captured_specs = (
@@ -1108,7 +1112,11 @@ def test_captured_root_adds_captured_neal_comparisons_and_uses_captured_matched_
     )
     for kernel, energy, sampling_s in captured_specs:
         record = _cpu_record(cell, "captured-model", kernel, 512, best_energy=energy, wall_s=sampling_s)
-        record.update(model_hash=model_hash, elapsed_sampling_s=sampling_s, timing_mode="serial", concurrent_workers=1)
+        worker_count = 2 if kernel == "cpu-msa-f64" else 1
+        record.update(
+            model_hash=model_hash, elapsed_sampling_s=sampling_s, timing_mode="serial",
+            concurrent_workers=worker_count,
+        )
         _write_attempt(captured_root / "captured" / cell, "captured-model", kernel, 512, 0, record)
 
     qpu_root = tmp_path / "qpu"
@@ -1118,9 +1126,17 @@ def test_captured_root_adds_captured_neal_comparisons_and_uses_captured_matched_
         cell=cell, nonce="captured-model", model_hash=model_hash, capture_key=capture_key,
         requested_scale=1.0, anneal_us=20, energies=[-2.0], access_us=500_000, end_to_end_s=0.6,
     )
+    campaign_neal_key = "campaign-neal-key"
+    _write_qpu_capture(
+        qpu_root / cell / "scale-100" / "qpu-20" / "campaign-neal.npz",
+        cell=cell, nonce="campaign-neal-model", model_hash="campaign-neal-model",
+        capture_key=campaign_neal_key, requested_scale=1.0, anneal_us=20,
+        energies=[-2.0], access_us=500_000, end_to_end_s=0.6,
+    )
     manifest_path = tmp_path / "physical-capture-manifest.json"
     manifest_path.write_text(json.dumps({"jobs": [
         _manifest_job(cell, "captured-model", model_hash, capture_key, 1.0, 20),
+        _manifest_job(cell, "campaign-neal-model", "campaign-neal-model", campaign_neal_key, 1.0, 20),
     ]}), encoding="utf-8")
 
     out_dir = tmp_path / "report-captured"
@@ -1140,18 +1156,23 @@ def test_captured_root_adds_captured_neal_comparisons_and_uses_captured_matched_
     depth_quality = draft.split("## Depth, quality, and time")[1].split("## ")[0]
 
     assert "captured run" in matched
-    assert "24 models" in matched
-    assert "one worker per physical core" in matched
-    assert "single-threaded BLAS" in matched
-    assert "| `native-pm1` | 1 | 20 | `cpu-sa` | 1 | 0.5 | 0.6 |" in matched
-    assert "| `native-pm1` | 1 | 20 | `cpu-msa (unit)` | 1 |" in matched
-    assert "| `native-pm1` | 1 | 20 | `dwave-neal` | 1 | 0.5 | 0.6 |" in matched
-    for kernel, _energy, sampling_s in captured_specs:
-        assert f"| `native-pm1` | 1 | 20 | `{kernel}` | 1 |" in matched
-        assert f"| {sampling_s} |" in matched
-    assert "| `native-pm1` | 1 | 20 | `dwave-neal` | 512 | 1 | 0/0/1 |" in outcome
+    assert "1 distinct model" in matched
+    assert "1 to 2 workers" in matched
+    assert "single-threaded BLAS" not in matched
+    matched_rows = [line for line in matched.splitlines() if line.startswith("| `native-pm1` |")]
+    assert matched_rows == [
+        "| `native-pm1` | 1 | 20 | `cpu-msa (unit)` | 1 | 0.5 | 0.6 | 0/0/1 / 0/0/1 / 0/0/1 | 0 | 1 of 1 | 0 | 0.3 | 0.6 |",
+        "| `native-pm1` | 1 | 20 | `cpu-msa-f64` | 1 | 0.5 | 0.6 | 0/0/1 / 0/0/1 / 0/0/1 | 0 | 1 of 1 | 0 | 0.35 | 0.7 |",
+        "| `native-pm1` | 1 | 20 | `cpu-msa-unit` | 1 | 0.5 | 0.6 | 0/0/1 / 0/0/1 / 0/0/1 | 0 | 1 of 1 | 0 | 0.3 | 0.6 |",
+        "| `native-pm1` | 1 | 20 | `cpu-sa` | 1 | 0.5 | 0.6 | 0/0/1 / 0/0/1 / 0/0/1 | 0 | 1 of 1 | 0 | 0.25 | 0.5 |",
+        "| `native-pm1` | 1 | 20 | `dwave-neal` | 1 | 0.5 | 0.6 | 0/0/1 / 0/0/1 / 0/0/1 | 0 | 1 of 1 | 0 | 0.4 | 0.8 |",
+    ]
+    neal_outcome = next(line for line in outcome.splitlines() if "`dwave-neal`" in line)
+    assert neal_outcome == "| `native-pm1` | 1 | 20 | `dwave-neal` | 512 | 1 | 0/0/1 | 0/0/1 | 0/0/1 |"
     assert "| `native-pm1` | 1 | 20 | `cpu-sa` | 512 | 1 | 0/1/0 |" in outcome
     assert "| `native-pm1` | 1 | 20 | `dwave-neal` | 512 | 1 |" in gaps
+    neal_gap = next(line for line in gaps.splitlines() if "`dwave-neal`" in line)
+    assert neal_gap.startswith("| `native-pm1` | 1 | 20 | `dwave-neal` | 512 | 1 |")
     campaign_row = next(
         line for line in depth_quality.splitlines()
         if line.startswith("| `native-pm1` | `cpu-sa` | 512 |")
