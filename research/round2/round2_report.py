@@ -786,15 +786,19 @@ def _route_label(routed: Iterable[str]) -> str:
 
 def matched_runtime_table(
     captures: Sequence[Dict[str, Any]], cpu_records: Sequence[Dict[str, Any]], kernels: Sequence[str],
+    *, source_description: Optional[str] = None,
 ) -> List[str]:
     results = matched_runtime_comparison(captures, cpu_records, kernels)
-    lines = [
-        "## QPU against CPU at matched run time", "",
+    lead = source_description or (
         "QPU time is charged access time for 64 reads, with end-to-end time also shown. CPU time is sampling "
         "time for 64 reads from the campaign, using the fastest successful attempt on a loaded host with "
         "parallel workers. Energy outcomes use the same strict, numeric-tolerance, and material rules as "
         "the equal-sweep tables. Equal budget uses the deepest CPU depth completed within that capture's "
-        "access-time budget. Time to QPU energy uses the quickest CPU depth that reached the capture's best energy.", "",
+        "access-time budget. Time to QPU energy uses the quickest CPU depth that reached the capture's best energy."
+    )
+    lines = [
+        "## QPU against CPU at matched run time", "",
+        lead, "",
         "| Cell | Scale | Anneal us | Kernel | Models | Median QPU access s | Median QPU end-to-end s | "
         "Equal budget: strict / numeric / material qpu/cpu/tie | Over budget | Reached QPU energy (n of Models) | "
         "Not reached | Median CPU s to QPU energy | Median ratio to QPU access |",
@@ -1630,6 +1634,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cpu-root", required=True, help="Root of the CPU comparison output (contains pilot/, campaign/).")
     parser.add_argument("--run", default="pilot", choices=("pilot", "campaign"))
     parser.add_argument(
+        "--captured-root", default=None,
+        help="Root containing captured/ CPU records for the matched-runtime and captured Neal comparisons.",
+    )
+    parser.add_argument(
         "--timing-subset-root", default=None,
         help="Timing source for campaign quality reports; defaults to cpu-root/timing-subset.",
     )
@@ -1687,6 +1695,28 @@ def main(argv: Optional[List[str]] = None) -> int:
     capture_proposal = load_capture_proposal(Path(args.capture_proposal)) if args.capture_proposal else None
     expected_per_arm = expected_per_arm_for(args.run)
 
+    captured_records_by_cell = (
+        {
+            cell: load_cpu_records(Path(args.captured_root) / "captured", cell)
+            for cell in args.cells
+        }
+        if args.captured_root else {}
+    )
+    for cell, records in captured_records_by_cell.items():
+        records.extend(derive_cpu_msa_records(records))
+    qpu_records_by_cell = {cell: list(records) for cell, records in records_by_cell.items()}
+    qpu_kernels = list(args.kernels)
+    if captured_records_by_cell:
+        if runner.NEAL_KERNEL not in qpu_kernels:
+            qpu_kernels.append(runner.NEAL_KERNEL)
+        for cell, records in captured_records_by_cell.items():
+            qpu_records_by_cell[cell].extend(
+                record for record in records if record.get("requested_kernel") == runner.NEAL_KERNEL
+            )
+    matched_kernels = list(args.kernels)
+    if captured_records_by_cell and runner.NEAL_KERNEL not in matched_kernels:
+        matched_kernels.append(runner.NEAL_KERNEL)
+
     captures: List[Dict[str, Any]] = []
     captures_by_arm: Dict[Tuple[str, float, int], List[Dict[str, Any]]] = {}
     spend_summary: Optional[Dict[str, Any]] = None
@@ -1726,9 +1756,21 @@ def main(argv: Optional[List[str]] = None) -> int:
     }
     lines += lane_diversity_table(diversity_records_by_cell) + [""]
     lines += cpu_kernel_gap_table(records_by_cell, kernels=args.kernels, depths=depths) + [""]
-    lines += qpu_outcome_table(args.cells, captures_by_arm, records_by_cell, args.kernels, depths) + [""]
-    lines += paired_gaps_table(args.cells, captures_by_arm, records_by_cell, args.kernels, depths) + [""]
-    lines += matched_runtime_table(captures, [record for records in records_by_cell.values() for record in records], args.kernels) + [""]
+    lines += qpu_outcome_table(args.cells, captures_by_arm, qpu_records_by_cell, qpu_kernels, depths) + [""]
+    lines += paired_gaps_table(args.cells, captures_by_arm, qpu_records_by_cell, qpu_kernels, depths) + [""]
+    matched_records_by_cell = captured_records_by_cell if captured_records_by_cell else records_by_cell
+    matched_description = (
+        "QPU time is charged access time for 64 reads, with end-to-end time also shown. CPU energy and time "
+        "come from the captured run: 24 models, one worker per physical core, single-threaded BLAS. Energy "
+        "outcomes use the same strict, numeric-tolerance, and material rules as the equal-sweep tables. Equal "
+        "budget uses the deepest CPU depth completed within that capture's access-time budget. Time to QPU "
+        "energy uses the quickest CPU depth that reached the capture's best energy."
+        if captured_records_by_cell else None
+    )
+    lines += matched_runtime_table(
+        captures, [record for records in matched_records_by_cell.values() for record in records], matched_kernels,
+        source_description=matched_description,
+    ) + [""]
     if seeded_by_cell:
         lines += seed_lane_table(seeded_by_cell) + [""]
     lines += physical_scale_table(capture_proposal, args.cells, captured_regimes=captured_regimes) + [""]

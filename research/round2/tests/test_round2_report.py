@@ -1063,6 +1063,102 @@ def test_main_computes_a_real_missing_count_from_the_run_type(tmp_path, monkeypa
     assert cells[5] == "14"  # Missing: 15 expected, 1 observed
 
 
+def test_captured_root_defaults_to_none_and_omitting_it_preserves_report_bytes(tmp_path, monkeypatch):
+    cpu_root = Path(report.__file__).parent / "tests" / "fixtures" / "empty-cpu-root"
+    captured_root = tmp_path / "captured-input"
+    _write_attempt(
+        captured_root / "captured" / "native-pm1", "captured-model", "dwave-neal", 512, 0,
+        _cpu_record("native-pm1", "captured-model", "dwave-neal", 512, best_energy=-99.0, wall_s=0.01),
+    )
+    common_args = [
+        "round2_report.py", "--cpu-root", str(cpu_root), "--run", "campaign",
+        "--cells", "native-pm1", "--kernels", "cpu-sa", "--depths", "512",
+    ]
+
+    args = report.build_parser().parse_args([*common_args[1:], "--out-dir", str(tmp_path / "parsed")])
+    assert args.captured_root is None
+
+    output_bytes = []
+    for name in ("first", "second"):
+        out_dir = tmp_path / name
+        monkeypatch.setattr("sys.argv", [*common_args, "--out-dir", str(out_dir)])
+        assert report.main() == 0
+        output_bytes.append({path.name: path.read_bytes() for path in out_dir.iterdir() if path.is_file()})
+
+    assert output_bytes[0] == output_bytes[1]
+    assert output_bytes[0]["REPORT.md"] == (
+        Path(report.__file__).parent / "tests" / "fixtures" / "report-captured-root-omitted.md"
+    ).read_bytes()
+
+
+def test_captured_root_adds_captured_neal_comparisons_and_uses_captured_matched_runtime(tmp_path, monkeypatch):
+    cell = "native-pm1"
+    model_hash = "same-model"
+    cpu_root = tmp_path / "cpu"
+    campaign_record = _cpu_record(cell, "campaign-model", "cpu-sa", 512, best_energy=-9.0, wall_s=9.0)
+    campaign_record["model_hash"] = model_hash
+    _write_attempt(cpu_root / "campaign" / cell, "campaign-model", "cpu-sa", 512, 0, campaign_record)
+
+    captured_root = tmp_path / "captured-input"
+    captured_specs = (
+        ("cpu-sa", -2.0, 0.25),
+        ("cpu-msa-f64", -2.0, 0.35),
+        ("cpu-msa-unit", -2.0, 0.30),
+        ("dwave-neal", -2.0, 0.40),
+    )
+    for kernel, energy, sampling_s in captured_specs:
+        record = _cpu_record(cell, "captured-model", kernel, 512, best_energy=energy, wall_s=sampling_s)
+        record.update(model_hash=model_hash, elapsed_sampling_s=sampling_s, timing_mode="serial", concurrent_workers=1)
+        _write_attempt(captured_root / "captured" / cell, "captured-model", kernel, 512, 0, record)
+
+    qpu_root = tmp_path / "qpu"
+    capture_key = "capture-key"
+    _write_qpu_capture(
+        qpu_root / cell / "scale-100" / "qpu-20" / "capture.npz",
+        cell=cell, nonce="captured-model", model_hash=model_hash, capture_key=capture_key,
+        requested_scale=1.0, anneal_us=20, energies=[-2.0], access_us=500_000, end_to_end_s=0.6,
+    )
+    manifest_path = tmp_path / "physical-capture-manifest.json"
+    manifest_path.write_text(json.dumps({"jobs": [
+        _manifest_job(cell, "captured-model", model_hash, capture_key, 1.0, 20),
+    ]}), encoding="utf-8")
+
+    out_dir = tmp_path / "report-captured"
+    monkeypatch.setattr("sys.argv", [
+        "round2_report.py", "--cpu-root", str(cpu_root), "--run", "campaign",
+        "--captured-root", str(captured_root), "--qpu-root", str(qpu_root),
+        "--physical-capture-manifest", str(manifest_path), "--out-dir", str(out_dir),
+        "--cells", cell, "--kernels", "cpu-sa", "cpu-msa-f64", "cpu-msa-unit", "cpu-msa",
+        "--depths", "512",
+    ])
+
+    assert report.main() == 0
+    draft = (out_dir / "REPORT.md").read_text(encoding="utf-8")
+    matched = draft.split("## QPU against CPU at matched run time")[1].split("## ")[0]
+    outcome = draft.split("## Quantum processing unit wins, ties, and losses")[1].split("## ")[0]
+    gaps = draft.split("## Paired gaps")[1].split("## ")[0]
+    depth_quality = draft.split("## Depth, quality, and time")[1].split("## ")[0]
+
+    assert "captured run" in matched
+    assert "24 models" in matched
+    assert "one worker per physical core" in matched
+    assert "single-threaded BLAS" in matched
+    assert "| `native-pm1` | 1 | 20 | `cpu-sa` | 1 | 0.5 | 0.6 |" in matched
+    assert "| `native-pm1` | 1 | 20 | `cpu-msa (unit)` | 1 |" in matched
+    assert "| `native-pm1` | 1 | 20 | `dwave-neal` | 1 | 0.5 | 0.6 |" in matched
+    for kernel, _energy, sampling_s in captured_specs:
+        assert f"| `native-pm1` | 1 | 20 | `{kernel}` | 1 |" in matched
+        assert f"| {sampling_s} |" in matched
+    assert "| `native-pm1` | 1 | 20 | `dwave-neal` | 512 | 1 | 0/0/1 |" in outcome
+    assert "| `native-pm1` | 1 | 20 | `cpu-sa` | 512 | 1 | 0/1/0 |" in outcome
+    assert "| `native-pm1` | 1 | 20 | `dwave-neal` | 512 | 1 |" in gaps
+    campaign_row = next(
+        line for line in depth_quality.splitlines()
+        if line.startswith("| `native-pm1` | `cpu-sa` | 512 |")
+    )
+    assert [value.strip() for value in campaign_row.split("|")][10] == "-9"
+
+
 # ==================================================================== figures
 
 
