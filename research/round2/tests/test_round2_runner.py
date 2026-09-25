@@ -1147,6 +1147,34 @@ def test_run_subprocess_with_hard_deadline_passes_a_custom_env(tmp_path):
     assert marker.read_text() == "custom-value"
 
 
+def test_child_subprocesses_receive_single_threaded_blas_environment(monkeypatch):
+    spawned_envs = []
+    popen = subprocess.Popen
+
+    def capture_spawn_env(*args, **kwargs):
+        spawned_envs.append(kwargs["env"])
+        return popen(*args, **kwargs)
+
+    monkeypatch.setattr(runner.subprocess, "Popen", capture_spawn_env)
+
+    exit_ok, _wall_s = runner.run_subprocess_with_hard_deadline(
+        [sys.executable, "-c", "pass"], hard_deadline_s=10.0,
+    )
+
+    assert exit_ok is True
+    assert len(spawned_envs) == 1
+    assert {
+        name: spawned_envs[0][name]
+        for name in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS")
+    } == {
+        "OPENBLAS_NUM_THREADS": "1",
+        "OMP_NUM_THREADS": "1",
+        "MKL_NUM_THREADS": "1",
+        "NUMEXPR_NUM_THREADS": "1",
+    }
+    assert spawned_envs[0]["PATH"] == os.environ["PATH"]
+
+
 # --------------------------------------------------------- select_worker_cpus
 
 

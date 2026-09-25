@@ -1035,7 +1035,16 @@ def _kill_process_group(proc: "subprocess.Popen[bytes]") -> None:
 
 
 def _spawn(cmd: Sequence[str], env: Optional[Mapping[str, str]]) -> "subprocess.Popen[bytes]":
-    return subprocess.Popen(cmd, start_new_session=True, env=dict(env) if env is not None else None)
+    child_env = dict(os.environ)
+    if env is not None:
+        child_env.update(env)
+    child_env.update({
+        "OPENBLAS_NUM_THREADS": "1",
+        "OMP_NUM_THREADS": "1",
+        "MKL_NUM_THREADS": "1",
+        "NUMEXPR_NUM_THREADS": "1",
+    })
+    return subprocess.Popen(cmd, start_new_session=True, env=child_env)
 
 
 def _wait_with_timeout(proc: "subprocess.Popen[bytes]", hard_deadline_s: float) -> Tuple[bool, float]:
@@ -1072,10 +1081,9 @@ def run_subprocess_with_hard_deadline(
     never be called from a worker thread of a parallel run -- see
     :func:`run_subprocess_tracked` for that case.
 
-    ``env``, if given, replaces the child's environment outright (the caller is
-    responsible for including anything the child needs, e.g. this parent's own
-    ``PYTHONPATH`` when the child runs under a different interpreter, such as P's
-    pinned venv, that would not otherwise see it). ``on_spawn``, if given, is
+    ``env``, if given, overrides values in the inherited environment. BLAS and
+    OpenMP thread-pool variables are then set to one for every child process.
+    ``on_spawn``, if given, is
     called once with the child's pid right after it starts -- a testing hook,
     never used by production callers.
     """
