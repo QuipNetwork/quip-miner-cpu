@@ -1629,6 +1629,16 @@ def write_figures(
 # ---------------------------------------------------------------------- main
 
 
+def worker_label(worker_counts: Sequence[int]) -> str:
+    """``concurrent_workers`` values, sorted, as prose: one count or a range."""
+    if not worker_counts:
+        return "worker count unavailable"
+    if len(worker_counts) == 1:
+        count = worker_counts[0]
+        return f"{count} worker{'s' if count != 1 else ''}"
+    return f"{worker_counts[0]} to {worker_counts[-1]} workers"
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=(__doc__ or "").split("\n\n")[0])
     parser.add_argument("--cpu-root", required=True, help="Root of the CPU comparison output (contains pilot/, campaign/).")
@@ -1773,12 +1783,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         record["concurrent_workers"] for record in captured_records
         if isinstance(record.get("concurrent_workers"), int)
     })
-    if len(captured_worker_counts) == 1:
-        captured_worker_label = f"{captured_worker_counts[0]} worker"
-    elif captured_worker_counts:
-        captured_worker_label = f"{captured_worker_counts[0]} to {captured_worker_counts[-1]} workers"
-    else:
-        captured_worker_label = "worker count unavailable"
+    captured_worker_label = worker_label(captured_worker_counts)
     matched_description = (
         "QPU time is charged access time for 64 reads, with end-to-end time also shown. CPU energy and time "
         f"come from the captured run: {captured_model_count} distinct model"

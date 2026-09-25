@@ -1657,3 +1657,10 @@ def test_cpu_kernel_gap_table_excludes_models_missing_from_either_kernel():
 def test_cpu_kernel_gap_table_states_no_comparable_pairs_when_none_exist():
     lines = report.cpu_kernel_gap_table({"native-pm1": []}, kernels=("cpu-msa-f64",), depths=(512,))
     assert "No comparable pairs" in "\n".join(lines)
+
+
+def test_worker_label_pluralizes_a_single_worker_count() -> None:
+    assert report.worker_label([1]) == "1 worker"
+    assert report.worker_label([14]) == "14 workers"
+    assert report.worker_label([1, 2]) == "1 to 2 workers"
+    assert report.worker_label([]) == "worker count unavailable"
