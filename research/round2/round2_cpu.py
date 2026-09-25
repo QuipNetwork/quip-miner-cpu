@@ -63,6 +63,7 @@ import round2_runner as runner
 SCRIPT_PATH = Path(__file__).resolve()
 DEFAULT_BUNDLES_ROOT = Path("/home/carback1/quip-data/regimes/round2/bundles")
 DEFAULT_CPU_ROOT = Path("/home/carback1/quip-data/regimes/round2/cpu")
+DEFAULT_CAPTURE_MANIFEST = Path("/home/carback1/quip-data/regimes/round2/physical-capture-manifest.json")
 ROUND1 = Path("/home/carback1/quip-data/regimes/round1")
 #: P's pinned reference checkout (task-3 report; unchanged here).
 DEFAULT_P_PYTHON = "/home/carback1/quip-data/regimes/round2/reference/qportfolio/.venv/bin/python"
@@ -606,6 +607,21 @@ def cmd_campaign(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_captured(args: argparse.Namespace) -> int:
+    bundles_root = Path(args.bundles_root)
+    index = _load_index(bundles_root)
+    capture_manifest = json.loads(Path(args.capture_manifest).read_text(encoding="utf-8"))
+    jobs = runner.build_captured_jobs(index, capture_manifest)
+    out_dir = Path(args.out_root) / "captured"
+    cpus = runner.select_worker_cpus(args.workers, cpus=args.cpus)
+    records = _run_jobs(
+        jobs, bundles_root, out_dir, cpus,
+        hard_deadline_s=args.hard_deadline_s, repeat_contaminated=args.repeat_contaminated,
+    )
+    _summarize(records)
+    return 0
+
+
 def cmd_estimate(args: argparse.Namespace) -> int:
     pilot_root = Path(args.pilot_root)
     pilot_wall_s: Dict[Tuple[str, int], List[float]] = {}
@@ -844,6 +860,22 @@ def build_parser() -> argparse.ArgumentParser:
         "depth, every eligible kernel, in its own output directory.",
     )
     campaign.set_defaults(func=cmd_campaign)
+
+    captured = sub.add_parser("captured", help="The captured-model four-kernel comparison.")
+    captured.add_argument("--bundles-root", default=str(DEFAULT_BUNDLES_ROOT))
+    captured.add_argument("--capture-manifest", default=str(DEFAULT_CAPTURE_MANIFEST))
+    captured.add_argument("--out-root", default=str(DEFAULT_CPU_ROOT))
+    captured.add_argument("--workers", type=int, default=1, help="Concurrent workers, one physical core each.")
+    captured.add_argument(
+        "--cpus", type=_parse_cpu_list, default=None,
+        help="Comma-separated logical CPUs, one per physical core (overrides --workers's count).",
+    )
+    captured.add_argument("--hard-deadline-s", type=float, default=None, help="Override the size-scaled default.")
+    captured.add_argument(
+        "--repeat-contaminated", action="store_true",
+        help="Only add one new attempt for jobs whose latest attempt was contaminated.",
+    )
+    captured.set_defaults(func=cmd_captured)
 
     estimate = sub.add_parser("estimate", help="Print a campaign cost estimate from pilot records.")
     estimate.add_argument("--pilot-root", default=str(DEFAULT_CPU_ROOT / "pilot"))

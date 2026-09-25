@@ -680,3 +680,36 @@ def test_timing_subset_runs_on_every_named_cpu(monkeypatch: pytest.MonkeyPatch, 
     assert args.func(args) == 0
     assert seen["cpus"] == [1, 2, 3]
     assert seen["out_dir"] == tmp_path / "timing-subset"
+
+
+def test_captured_command_loads_manifest_and_uses_captured_output_directory(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    bundles_root = tmp_path / "bundles"
+    capture_manifest = tmp_path / "physical-capture-manifest.json"
+    capture_payload = {"jobs": [{"cell": "native-pm1", "nonce": _nonce(0), "model_hash": "captured-hash"}]}
+    capture_manifest.write_text(json.dumps(capture_payload), encoding="utf-8")
+    seen: Dict[str, Any] = {}
+    monkeypatch.setattr(cpu, "_load_index", lambda root: {"rows": []})
+
+    def build_jobs(index: Dict[str, Any], manifest: Dict[str, Any]) -> list:
+        seen["manifest"] = manifest
+        return []
+
+    monkeypatch.setattr(runner, "build_captured_jobs", build_jobs)
+    monkeypatch.setattr(runner, "select_worker_cpus", lambda workers, cpus=None: list(cpus or []))
+
+    def fake_run_jobs(jobs: Any, root: Path, out_dir: Path, cpus: Any, **kwargs: Any) -> list:
+        seen["out_dir"], seen["cpus"] = out_dir, list(cpus)
+        return []
+
+    monkeypatch.setattr(cpu, "_run_jobs", fake_run_jobs)
+    args = cpu.build_parser().parse_args([
+        "captured", "--bundles-root", str(bundles_root), "--capture-manifest", str(capture_manifest),
+        "--cpus", "15", "--out-root", str(tmp_path),
+    ])
+
+    assert args.func(args) == 0
+    assert seen["manifest"] == capture_payload
+    assert seen["cpus"] == [15]
+    assert seen["out_dir"] == tmp_path / "captured"

@@ -66,6 +66,10 @@ PILOT_SWEEP_DEPTHS: Tuple[int, ...] = (512, 2048)
 #: Round-2 auto-routed one -- never pool the two rounds by that bare kernel name.
 CONTROLLED_KERNELS: Tuple[str, ...] = ("cpu-sa", "cpu-msa-f64", "cpu-msa-unit")
 
+#: The reference simulated annealing kernel used only by the captured-model set.
+NEAL_KERNEL = "dwave-neal"
+CAPTURED_KERNELS: Tuple[str, ...] = (*CONTROLLED_KERNELS, NEAL_KERNEL)
+
 #: The kernel whose eligibility is a per-model, empirically-checked outcome.
 UNIT_KERNEL = "cpu-msa-unit"
 
@@ -564,6 +568,38 @@ def build_timing_subset_jobs(index: Dict[str, Any], cells: Sequence[str]) -> Lis
     return jobs
 
 
+def build_captured_jobs(index: Dict[str, Any], capture_manifest: Dict[str, Any]) -> List[CpuJob]:
+    """Build the four-arm comparison for each model with a physical-pilot capture."""
+    indexed_rows = {(row["cell"], row["nonce"]): row for row in index["rows"]}
+    captured_models: Dict[Tuple[str, str], str] = {}
+    for capture in capture_manifest["jobs"]:
+        key = (capture["cell"], capture["nonce"])
+        model_hash = capture["model_hash"]
+        prior_hash = captured_models.setdefault(key, model_hash)
+        if prior_hash != model_hash:
+            raise RunnerError(f"{key[0]}/{key[1]} has conflicting captured model hashes")
+
+    jobs: List[CpuJob] = []
+    for (cell, nonce), model_hash in captured_models.items():
+        row = indexed_rows.get((cell, nonce))
+        if row is None:
+            raise RunnerError(f"{cell}/{nonce} from the capture manifest is missing from the bundle index")
+        if row["model_hash"] != model_hash:
+            raise RunnerError(f"{cell}/{nonce} capture model hash disagrees with the bundle index")
+        for sweeps in SWEEP_DEPTHS:
+            for kernel in CAPTURED_KERNELS:
+                variant = "timing"
+                seed, seed_input_hash = seed_for(model_hash, kernel, sweeps, CAMPAIGN_READS, variant)
+                jobs.append(
+                    CpuJob(
+                        cell=cell, nonce=nonce, kernel=kernel, sweeps=sweeps,
+                        reads=CAMPAIGN_READS, repetition_id=0, repetition_kind=REPETITION_TIMING,
+                        variant=variant, seed=seed, seed_input_hash=seed_input_hash,
+                    )
+                )
+    return jobs
+
+
 # -------------------------------------------------------------- job execution
 
 
@@ -715,7 +751,6 @@ def execute_cpu_job(
     ineligible unit kernel comes back with ``unsupported=True`` and no
     samples, not a different kernel's answer.
     """
-    quip_msa = _msa()
     identity = solver_identity()
     t_start = time.perf_counter()
 
@@ -723,8 +758,16 @@ def execute_cpu_job(
     h, edges, j = arrays["h"], arrays["edges"], arrays["j"]
 
     t_setup_start = time.perf_counter()
-    sampler = quip_msa.Msa()
-    beta_range = quip_msa.default_beta_range(h, edges, j)
+    sampler: Any
+    if job.kernel == NEAL_KERNEL:
+        from dwave.samplers import SimulatedAnnealingSampler
+
+        sampler = SimulatedAnnealingSampler()
+        beta_range = None
+    else:
+        quip_msa = _msa()
+        sampler = quip_msa.Msa()
+        beta_range = quip_msa.default_beta_range(h, edges, j)
     t_setup_end = time.perf_counter()
 
     record: Dict[str, Any] = {
@@ -736,7 +779,7 @@ def execute_cpu_job(
         "requested_kernel": job.kernel,
         "reads": job.reads,
         "sweeps": job.sweeps,
-        "beta_range": [float(beta_range[0]), float(beta_range[1])],
+        "beta_range": None if beta_range is None else [float(beta_range[0]), float(beta_range[1])],
         "seed": job.seed,
         "seed_input_hash": job.seed_input_hash,
         "repetition_id": job.repetition_id,
@@ -779,10 +822,17 @@ def execute_cpu_job(
         if reason is not None:
             return _unsupported(reason)
 
-    try:
-        kernel_input = kernel_input_for(job.cell, job.kernel, h, edges, j, beta_range)
-    except KernelIneligible as exc:
-        return _unsupported(str(exc))
+    if job.kernel == NEAL_KERNEL:
+        kernel_input = {
+            "h": h, "edges": edges, "j": j, "beta_range": None,
+            "energy_scale": 1.0, "input_hash": _array_input_hash(h, edges, j),
+        }
+    else:
+        assert beta_range is not None
+        try:
+            kernel_input = kernel_input_for(job.cell, job.kernel, h, edges, j, beta_range)
+        except KernelIneligible as exc:
+            return _unsupported(str(exc))
 
     bundle_unit_hash = manifest.get("unit_kernel_input_hash")
     if job.kernel == UNIT_KERNEL and bundle_unit_hash is not None and bundle_unit_hash != kernel_input["input_hash"]:
@@ -791,17 +841,41 @@ def execute_cpu_job(
             f"{kernel_input['input_hash']!r}, and the bundle records {bundle_unit_hash!r}; refusing "
             "to submit an input that does not match round2_export.py's own reconstruction"
         )
-    record["submitted_beta_range"] = [float(kernel_input["beta_range"][0]), float(kernel_input["beta_range"][1])]
+    record["submitted_beta_range"] = (
+        None if kernel_input["beta_range"] is None else
+        [float(kernel_input["beta_range"][0]), float(kernel_input["beta_range"][1])]
+    )
     record["kernel_energy_scale"] = kernel_input["energy_scale"]
     record["kernel_input_hash"] = kernel_input["input_hash"]
 
     try:
         t_sample_start = time.perf_counter()
-        spins, energies, meta = sampler.sample_research(
-            kernel_input["h"], kernel_input["edges"], kernel_input["j"], kernel=job.kernel,
-            num_sweeps=job.sweeps, num_reads=job.reads, seed=job.seed, beta_range=kernel_input["beta_range"],
-        )
-        t_sample_end = time.perf_counter()
+        if job.kernel == NEAL_KERNEL:
+            quadratic: Dict[Tuple[Any, Any], float] = {}
+            for edge, coupling in zip(edges, j):
+                pair = (int(edge[0]), int(edge[1]))
+                quadratic[pair] = quadratic.get(pair, 0.0) + float(coupling)
+            response = sampler.sample_ising(
+                {i: float(bias) for i, bias in enumerate(h)}, quadratic,
+                num_sweeps=job.sweeps, num_reads=job.reads, seed=job.seed % (1 << 31),
+            )
+            t_sample_end = time.perf_counter()
+            column = {variable: i for i, variable in enumerate(response.variables)}
+            spins = np.asarray(response.record.sample, dtype=np.int8)[:, [column[i] for i in range(len(h))]]
+            energies = np.asarray(response.record.energy, dtype=np.float64)
+            meta = {
+                "observed_kernel": NEAL_KERNEL, "representation": "spin",
+                "workspace_bytes": None, "rng_scheme": None,
+            }
+            beta_range = response.info["beta_range"]
+            record["beta_range"] = [float(beta_range[0]), float(beta_range[1])]
+        else:
+            spins, energies, meta = sampler.sample_research(
+                kernel_input["h"], kernel_input["edges"], kernel_input["j"], kernel=job.kernel,
+                num_sweeps=job.sweeps, num_reads=job.reads, seed=job.seed,
+                beta_range=kernel_input["beta_range"],
+            )
+            t_sample_end = time.perf_counter()
     except ValueError as exc:
         # Past the pre-check, ANY ValueError here is an unanticipated defect -- a
         # "failed" record, never "unsupported" (review finding 8).

@@ -300,6 +300,45 @@ def test_timing_subset_reuses_the_campaigns_seed_for_the_same_arm(tmp_path):
     assert subset_job.seed == matching_campaign_job.seed
 
 
+def test_captured_jobs_cover_unique_manifest_models_with_all_captured_arms():
+    rows = []
+    captured = []
+    for cell, count in (
+        ("clique-portfolio", 12), ("native-pm1", 4), ("diamond-pm1", 4), ("native-125", 4),
+    ):
+        for i in range(count):
+            row = {"cell": cell, "nonce": _nonce(i), "model_hash": f"hash-{cell}-{i}"}
+            rows.append(row)
+            captured.extend([dict(row), dict(row)])
+    rows.append({"cell": "native-pm1", "nonce": _nonce(99), "model_hash": "not-captured"})
+
+    jobs = runner.build_captured_jobs({"rows": rows}, {"jobs": captured})
+
+    assert len(jobs) == 480
+    assert {job.kernel for job in jobs} == {
+        "cpu-sa", "cpu-msa-f64", "cpu-msa-unit", "dwave-neal",
+    }
+    assert {job.sweeps for job in jobs} == set(runner.SWEEP_DEPTHS)
+    assert {job.reads for job in jobs} == {64}
+    assert {job.repetition_id for job in jobs} == {0}
+    assert {job.repetition_kind for job in jobs} == {runner.REPETITION_TIMING}
+    assert {job.variant for job in jobs} == {"timing"}
+    assert len({(job.cell, job.nonce) for job in jobs}) == 24
+    assert sum(job.kernel == runner.UNIT_KERNEL for job in jobs if job.cell == "clique-portfolio") == 60
+    assert all(job.nonce != _nonce(99) for job in jobs)
+    neal_job = next(job for job in jobs if job.kernel == "dwave-neal")
+    assert (neal_job.seed, neal_job.seed_input_hash) == runner.seed_for(
+        f"hash-{neal_job.cell}-{int(neal_job.nonce, 16)}", "dwave-neal", neal_job.sweeps, 64, "timing",
+    )
+
+
+def test_captured_jobs_reject_a_manifest_model_hash_that_disagrees_with_the_bundle_index():
+    row = {"cell": "native-pm1", "nonce": _nonce(0), "model_hash": "bundle-hash"}
+
+    with pytest.raises(runner.RunnerError, match="model hash"):
+        runner.build_captured_jobs({"rows": [row]}, {"jobs": [{**row, "model_hash": "capture-hash"}]})
+
+
 # ---------------------------------------------------------------- execute_cpu_job
 
 
@@ -351,6 +390,41 @@ def test_a_completed_run_is_rescored_independently(tmp_path, monkeypatch):
     assert record["observed_kernel"] == "cpu-sa"
     assert samples is not None
     assert samples["spins"].shape == (4, 3)
+
+
+def test_dwave_neal_uses_its_default_schedule_and_records_its_actual_beta_range(tmp_path, monkeypatch):
+    _write_bundle(tmp_path, "native-pm1", _nonce(0))
+    monkeypatch.setattr(runner, "_msa", lambda: _fake_msa_module(_FakeSampler()))
+    captured = {}
+    spins = np.array([[1, 1, 1], [-1, -1, -1]], dtype=np.int8)
+    energies = runner.regimes.energy(spins, np.zeros(3), BUNDLE_EDGES, np.array([1.0, -1.0]))
+    response = types.SimpleNamespace(
+        variables=[0, 1, 2],
+        record=types.SimpleNamespace(sample=spins, energy=energies),
+        info={"beta_range": (0.123, 3.456)},
+    )
+
+    class FakeNealSampler:
+        def sample_ising(self, h, j, **kwargs):
+            captured.update(h=h, j=j, kwargs=kwargs)
+            return response
+
+    monkeypatch.setattr("dwave.samplers.SimulatedAnnealingSampler", FakeNealSampler)
+    job = _job("native-pm1", _nonce(0), kernel="dwave-neal", sweeps=8, reads=2)
+    job = runner.CpuJob(**{**job.to_dict(), "seed": (1 << 40) + 17})
+
+    record, samples = runner.execute_cpu_job(job, tmp_path)
+
+    assert captured["kwargs"] == {
+        "num_reads": 2, "num_sweeps": 8, "seed": 17,
+    }
+    assert record["requested_kernel"] == record["observed_kernel"] == "dwave-neal"
+    assert record["beta_range"] == [0.123, 3.456]
+    assert record["submitted_beta_range"] is None
+    assert record["elapsed_sampling_s"] >= 0.0
+    assert samples is not None
+    np.testing.assert_array_equal(samples["spins"], spins)
+    np.testing.assert_array_equal(samples["energies"], energies)
 
 
 def test_wrong_observed_kernel_is_never_recorded_as_a_completed_run(tmp_path, monkeypatch):
