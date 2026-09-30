@@ -248,6 +248,11 @@ fn validate(
         .unwrap_or_else(|| default_ising_beta_range(graph));
     check_beta("hot", hot)?;
     check_beta("cold", cold)?;
+    if hot > cold {
+        return invalid(format!(
+            "beta_range runs backwards: hot {hot} is above cold {cold}"
+        ));
+    }
     if let Some(s) = start {
         if let Some(beta) = s.start_beta {
             check_beta("start", beta)?;
@@ -819,6 +824,11 @@ mod tests {
                 "non-finite beta",
                 chain(vec![0.0; 3], vec![0.5, -0.25], two.clone()),
                 with(Some((0.1, f64::INFINITY))),
+            ),
+            (
+                "beta range backwards",
+                chain(vec![0.0; 3], vec![0.5, -0.25], two.clone()),
+                with(Some((5.0, 0.1))),
             ),
         ];
         for (name, graph, params) in cases {

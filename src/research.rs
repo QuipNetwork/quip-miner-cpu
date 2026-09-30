@@ -204,6 +204,22 @@ fn validate_common(
     {
         return invalid(format!("edge {k} has an endpoint outside 0..{nodes}"));
     }
+    // The float kernel refuses these, and the protocol graphs drop them, so
+    // every kernel must see the same refusal first.
+    if let Some(k) = graph.edges.iter().position(|&(u, v)| u == v) {
+        let node = graph.edges[k].0;
+        return invalid(format!("edge {k} is a self-loop on node {node}"));
+    }
+    let mut pairs: Vec<(usize, usize)> = graph
+        .edges
+        .iter()
+        .map(|&(u, v)| (u.min(v), u.max(v)))
+        .collect();
+    pairs.sort_unstable();
+    if let Some(w) = pairs.windows(2).find(|w| w[0] == w[1]) {
+        let (u, v) = w[0];
+        return invalid(format!("edge ({u}, {v}) is repeated"));
+    }
     Ok(())
 }
 
@@ -769,6 +785,8 @@ mod tests {
         let out_of_range = IsingGraph::new(vec![0.0, 0.0], vec![1.0], vec![(0, 2)]);
         let short_j = IsingGraph::new(vec![0.0, 0.0], vec![], vec![(0, 1)]);
         let empty = IsingGraph::new(vec![], vec![], vec![]);
+        let self_loop = IsingGraph::new(vec![0.0, 0.0], vec![1.0, 1.0], vec![(0, 1), (1, 1)]);
+        let repeated = IsingGraph::new(vec![0.0, 0.0], vec![1.0, -1.0], vec![(0, 1), (1, 0)]);
         let good = unit_graph(6, 1);
         for kernel in ResearchKernel::ALL {
             for (name, graph) in [
@@ -776,6 +794,8 @@ mod tests {
                 ("endpoint out of range", &out_of_range),
                 ("fewer couplings than edges", &short_j),
                 ("no nodes", &empty),
+                ("self-loop", &self_loop),
+                ("repeated edge", &repeated),
             ] {
                 let err =
                     sample_research(graph, &params(4, 8, 1), kernel, None, None).expect_err(name);
