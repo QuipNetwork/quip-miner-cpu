@@ -356,11 +356,35 @@ pub(crate) fn sample_ising_cancellable(
             crate::gibbs_parallel::DEFAULT_GIBBS_WORKERS,
         ));
     }
+    sample_sa_scalar(graph, params, cancel).map(|(results, _)| results)
+}
+
+/// Which arithmetic the scalar SA kernel ran a job with. The two produce
+/// identical spins (see [`crate::sa_int`]); a benchmark still records which
+/// one it timed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ScalarArithmetic {
+    /// Packed integer adjacency with a tabulated acceptance table.
+    Int,
+    /// General `f64` adjacency and `exp()` per uphill candidate.
+    F64,
+}
+
+/// The scalar SA kernel, with the arithmetic its dispatch selected.
+pub(crate) fn sample_sa_scalar(
+    graph: &IsingGraph,
+    params: &SampleParams,
+    cancel: Option<(&CancelToken, Option<u64>)>,
+) -> Result<(Vec<SamplerResult>, ScalarArithmetic), SampleCancelled> {
     let num_reads = params.num_reads.max(1);
     let beta_schedule = build_beta_schedule(graph, params);
     let sweeps_per = params.sweeps_per_beta.max(1);
     let base_seed = params.seed;
     let kernel = Kernel::for_problem(graph, &beta_schedule);
+    let arithmetic = match &kernel {
+        Kernel::Int(..) => ScalarArithmetic::Int,
+        Kernel::Float(_) => ScalarArithmetic::F64,
+    };
 
     let mut results = Vec::with_capacity(num_reads);
     for read_idx in 0..num_reads {
@@ -383,7 +407,7 @@ pub(crate) fn sample_ising_cancellable(
         };
         results.push(score_spins(&spins, graph));
     }
-    Ok(results)
+    Ok((results, arithmetic))
 }
 
 #[cfg(test)]

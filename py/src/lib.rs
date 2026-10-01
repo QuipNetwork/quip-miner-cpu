@@ -1,15 +1,21 @@
 //! Python binding to the multi-spin coded annealing kernel.
 //!
-//! One class, [`Msa`], with one method. A call builds the graph, runs the
-//! anneal with the GIL released, and hands back numpy arrays. The kernel runs
-//! one job on one core, so a Python caller gets parallelism by calling from
-//! several threads.
+//! One class, [`Msa`], with two methods: `sample`, the protocol surface with
+//! its fallbacks and milli-unit energies, and `sample_research`, which runs
+//! exactly the kernel it is given and reports float64 energies. A call builds
+//! the graph, runs the anneal with the GIL released, and hands back numpy
+//! arrays. The kernel runs one job on one core, so a Python caller gets
+//! parallelism by calling from several threads.
 
 use numpy::ndarray::Array2;
 use numpy::{IntoPyArray, PyArray1, PyArray2, PyReadonlyArray1, PyReadonlyArray2};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use quip_miner_cpu::{IsingGraph, SaSampler, SaVariant, SampleParams, Sampler, SeededStart};
+use pyo3::types::PyDict;
+use quip_miner_cpu::{
+    sample_research, IsingGraph, ResearchKernel, SaSampler, SaVariant, SampleParams, Sampler,
+    SeededStart,
+};
 
 /// A multi-spin annealing sampler. It caches the graph colouring between
 /// calls, so keep one instance per topology and share it across threads.
@@ -20,6 +26,14 @@ struct Msa {
 
 /// `(spins, energy_milli)`: int8 `(reads, nodes)` and int64 `(reads,)`.
 type SampleOutput<'py> = (Bound<'py, PyArray2<i8>>, Bound<'py, PyArray1<i64>>);
+
+/// `(spins, energies, metadata)`: int8 `(reads, nodes)`, float64 `(reads,)`
+/// and the identity dict of `Msa.sample_research`.
+type ResearchOutput<'py> = (
+    Bound<'py, PyArray2<i8>>,
+    Bound<'py, PyArray1<f64>>,
+    Bound<'py, PyDict>,
+);
 
 /// `(h, j)`, both float64, in energy units.
 type IsingDraw<'py> = (Bound<'py, PyArray1<f64>>, Bound<'py, PyArray1<f64>>);
@@ -182,6 +196,103 @@ impl Msa {
         let spins = Array2::from_shape_vec((results.len(), nodes), flat)
             .map_err(|e| PyValueError::new_err(e.to_string()))?;
         Ok((spins.into_pyarray(py), energies.into_pyarray(py)))
+    }
+
+    /// Anneal on exactly `kernel` and report what ran.
+    ///
+    /// `kernel` is `cpu-sa`, `cpu-msa-unit`, `cpu-msa-f64` or `cpu-msa`. A
+    /// model the named kernel cannot run raises `ValueError` instead of
+    /// falling back, which is the difference from `sample`. `cpu-msa` is the
+    /// one exception by design: it runs the unit arm when the model fits it
+    /// and the float arm otherwise, and `observed_kernel` names the arm.
+    /// Seeds work as in `sample`: row
+    /// `r` seeds read `r`, later reads start cold, and no rows is a cold run.
+    /// More seed rows than reads is an error and `cpu-sa` takes no seeds.
+    /// Returns `(spins, energies, metadata)`: int8 of shape
+    /// `(num_reads, len(h))`, float64 energies of the original model of shape
+    /// `(num_reads,)`, and a dict with `requested_kernel`, `observed_kernel`,
+    /// `representation`, `rng_scheme`, `seeded_reads` and `workspace_bytes`
+    /// (`None` unless the float kernel counted it).
+    #[pyo3(signature = (h, edges, j, *, kernel, num_sweeps, num_reads=64, seed=0,
+                        beta_range=None, initial_spins=None, start_beta=None))]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one Python keyword per SampleParams field reads better than a dict"
+    )]
+    fn sample_research<'py>(
+        &self,
+        py: Python<'py>,
+        h: PyReadonlyArray1<'py, f64>,
+        edges: PyReadonlyArray2<'py, i64>,
+        j: PyReadonlyArray1<'py, f64>,
+        kernel: &str,
+        num_sweeps: usize,
+        num_reads: usize,
+        seed: u64,
+        beta_range: Option<(f64, f64)>,
+        initial_spins: Option<PyReadonlyArray2<'py, i8>>,
+        start_beta: Option<f64>,
+    ) -> PyResult<ResearchOutput<'py>> {
+        let kernel = ResearchKernel::parse(kernel).ok_or_else(|| {
+            PyValueError::new_err(format!(
+                "unknown kernel {kernel:?}; expected cpu-sa, cpu-msa-unit, cpu-msa-f64 or cpu-msa"
+            ))
+        })?;
+        let graph = build_graph(&h, &edges, &j)?;
+        let nodes = graph.h.len();
+        let seeds: Vec<Vec<i8>> = match &initial_spins {
+            None => Vec::new(),
+            Some(states) => {
+                let states = states.as_array();
+                if states.ncols() != nodes {
+                    return Err(PyValueError::new_err(format!(
+                        "initial_spins must have shape (rows, {nodes}); got ({}, {})",
+                        states.nrows(),
+                        states.ncols()
+                    )));
+                }
+                states.rows().into_iter().map(|r| r.to_vec()).collect()
+            }
+        };
+        let seeded = !seeds.is_empty();
+        if start_beta.is_some() && !seeded {
+            return Err(PyValueError::new_err(
+                "start_beta applies to a seeded run; pass initial_spins with at least one row",
+            ));
+        }
+        let params = SampleParams {
+            num_reads,
+            num_sweeps,
+            seed,
+            beta_range,
+            ..Default::default()
+        };
+
+        let out = py
+            .detach(move || {
+                let start = seeded.then_some(SeededStart {
+                    spins: &seeds,
+                    start_beta,
+                });
+                sample_research(&graph, &params, kernel, start, None)
+            })
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+
+        let reads = out.spins.len();
+        let mut flat = Vec::with_capacity(reads * nodes);
+        for state in &out.spins {
+            flat.extend_from_slice(state);
+        }
+        let spins = Array2::from_shape_vec((reads, nodes), flat)
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        let meta = PyDict::new(py);
+        meta.set_item("requested_kernel", out.metadata.requested_kernel)?;
+        meta.set_item("observed_kernel", out.metadata.observed_kernel)?;
+        meta.set_item("representation", out.metadata.representation)?;
+        meta.set_item("rng_scheme", out.metadata.rng_scheme)?;
+        meta.set_item("seeded_reads", out.metadata.seeded_reads)?;
+        meta.set_item("workspace_bytes", out.metadata.workspace_bytes)?;
+        Ok((spins.into_pyarray(py), out.energies.into_pyarray(py), meta))
     }
 }
 
