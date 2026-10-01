@@ -12,9 +12,11 @@ use numpy::{IntoPyArray, PyArray1, PyArray2, PyReadonlyArray1, PyReadonlyArray2}
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
+pyo3::create_exception!(quip_msa, MemoryLimitError, PyValueError);
+
 use quip_miner_cpu::{
-    sample_research, IsingGraph, ResearchKernel, SaSampler, SaVariant, SampleParams, Sampler,
-    SeededStart,
+    sample_research, IsingGraph, ResearchError, ResearchKernel, SaSampler, SaVariant, SampleParams,
+    Sampler, SeededStart,
 };
 
 /// A multi-spin annealing sampler. It caches the graph colouring between
@@ -211,8 +213,8 @@ impl Msa {
     /// Returns `(spins, energies, metadata)`: int8 of shape
     /// `(num_reads, len(h))`, float64 energies of the original model of shape
     /// `(num_reads,)`, and a dict with `requested_kernel`, `observed_kernel`,
-    /// `representation`, `rng_scheme`, `seeded_reads` and `workspace_bytes`
-    /// (`None` unless the float kernel counted it).
+    /// `representation`, `rng_scheme`, `seeded_reads`, `workspace_bytes` and
+    /// `beta_ladder` (the exact beta values as a list of floats).
     #[pyo3(signature = (h, edges, j, *, kernel, num_sweeps, num_reads=64, seed=0,
                         beta_range=None, initial_spins=None, start_beta=None))]
     #[expect(
@@ -276,7 +278,16 @@ impl Msa {
                 });
                 sample_research(&graph, &params, kernel, start, None)
             })
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+            .map_err(|error| {
+                let message = error.to_string();
+                match error {
+                    ResearchError::MemoryLimit { .. } => MemoryLimitError::new_err(message),
+                    ResearchError::InvalidInput(_)
+                    | ResearchError::UnsupportedUnitModel(_)
+                    | ResearchError::SeededScalarUnsupported
+                    | ResearchError::Cancelled => PyValueError::new_err(message),
+                }
+            })?;
 
         let reads = out.spins.len();
         let mut flat = Vec::with_capacity(reads * nodes);
@@ -292,6 +303,7 @@ impl Msa {
         meta.set_item("rng_scheme", out.metadata.rng_scheme)?;
         meta.set_item("seeded_reads", out.metadata.seeded_reads)?;
         meta.set_item("workspace_bytes", out.metadata.workspace_bytes)?;
+        meta.set_item("beta_ladder", out.metadata.beta_ladder)?;
         Ok((spins.into_pyarray(py), out.energies.into_pyarray(py), meta))
     }
 }
@@ -344,6 +356,7 @@ fn default_beta_range(
 /// Python module `quip_msa`.
 #[pymodule]
 fn quip_msa(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add("MemoryLimitError", m.py().get_type::<MemoryLimitError>())?;
     m.add_class::<Msa>()?;
     m.add_function(wrap_pyfunction!(draw_ising, m)?)?;
     m.add_function(wrap_pyfunction!(default_beta_range, m)?)?;

@@ -209,6 +209,8 @@ pub(crate) fn anneal_words(
     let mut row = vec![0; draw_row()];
     let mut cut = vec![0; graph.max_field() + 1];
     let mut rng = SmallRng::seed_from_u64(params.seed ^ 0x5341_5F54_424C_4531);
+    let sweeps_per_beta =
+        crate::sampler_core::effective_sweeps_per_beta(params.num_sweeps, params.sweeps_per_beta);
     for (beta_idx, &beta) in betas.iter().enumerate() {
         if let Some((guard, watermark)) = cancel {
             if guard.is_cancelled(watermark) {
@@ -216,7 +218,7 @@ pub(crate) fn anneal_words(
             }
         }
         fill_threshold_row(beta, &mut cut, &mut rng, &mut row);
-        for sweep in 0..params.sweeps_per_beta.max(1) {
+        for sweep in 0..sweeps_per_beta {
             if let Some((guard, watermark)) = cancel {
                 if guard.is_cancelled(watermark) {
                     return Err(SampleCancelled);
@@ -726,9 +728,13 @@ mod tests {
         let mut row = vec![0; draw_row()];
         let mut cut = vec![0; int.max_field() + 1];
         let mut table_rng = SmallRng::seed_from_u64(params.seed ^ 0x5341_5F54_424C_4531);
+        let sweeps_per_beta = crate::sampler_core::effective_sweeps_per_beta(
+            params.num_sweeps,
+            params.sweeps_per_beta,
+        );
         for (beta_idx, &beta) in betas.iter().enumerate() {
             fill_threshold_row(beta, &mut cut, &mut table_rng, &mut row);
-            for sweep in 0..params.sweeps_per_beta.max(1) {
+            for sweep in 0..sweeps_per_beta {
                 let off = sweep_offset(params.seed, beta_idx, sweep);
                 for class in colors.classes() {
                     for state in replay.iter_mut() {

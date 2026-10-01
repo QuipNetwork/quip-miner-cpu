@@ -69,6 +69,8 @@ def test_every_accepted_kernel_reports_its_own_identity():
         assert meta["observed_kernel"] == kernel
         assert meta["representation"] == expected_representation[kernel]
         assert isinstance(meta["rng_scheme"], str) and meta["rng_scheme"]
+        assert isinstance(meta["beta_ladder"], list) and len(meta["beta_ladder"]) == 16
+        assert all(isinstance(beta, float) for beta in meta["beta_ladder"])
         assert meta["seeded_reads"] == 0
         if kernel == "cpu-msa-f64":
             assert isinstance(meta["workspace_bytes"], int) and meta["workspace_bytes"] > 0
@@ -291,3 +293,21 @@ def test_concurrent_calls_match_serial_results():
         np.testing.assert_array_equal(spins, serial[kernel][0])
         np.testing.assert_array_equal(energies, serial[kernel][1])
         assert meta == serial[kernel][2]
+
+
+def test_memory_limit_raises_distinct_error():
+    h = np.zeros(100_000, dtype=np.float64)
+    h[0] = 0.37
+    edges = np.empty((0, 2), dtype=np.int64)
+    j = np.empty(0, dtype=np.float64)
+
+    with pytest.raises(quip_msa.MemoryLimitError):
+        quip_msa.Msa().sample_research(
+            h,
+            edges,
+            j,
+            kernel="cpu-msa-f64",
+            num_sweeps=1,
+            num_reads=4096,
+        )
+    assert issubclass(quip_msa.MemoryLimitError, ValueError)

@@ -62,7 +62,7 @@ impl ResearchKernel {
 }
 
 /// What ran, as the report needs it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ResearchMetadata {
     /// The kernel the caller named.
     pub requested_kernel: &'static str,
@@ -76,9 +76,14 @@ pub struct ResearchMetadata {
     pub rng_scheme: &'static str,
     /// Leading reads that started from a supplied state.
     pub seeded_reads: usize,
-    /// Workspace the kernel counted against its cap. Only the float kernel
-    /// counts; the others report `None`, not zero.
+    /// Estimated persistent workspace counted against the float kernel's cap.
+    /// It excludes caller-owned arrays, validation-pair vectors, the beta
+    /// ladder, CSR/coloring construction buffers, seeded lane-reference
+    /// vectors, and vector headers for states and output rows. Other kernels
+    /// report `None`, not zero.
     pub workspace_bytes: Option<usize>,
+    /// Exact beta values, in order, that the selected kernel annealed with.
+    pub beta_ladder: Vec<f64>,
 }
 
 /// Samples in read order with their float64 energies.
@@ -291,6 +296,7 @@ fn finish(
     representation: &'static str,
     rng_scheme: &'static str,
     seeded_reads: usize,
+    beta_ladder: Vec<f64>,
 ) -> ResearchSamples {
     let spins: Vec<Vec<i8>> = results.into_iter().map(|r| r.spins).collect();
     let energies = spins.iter().map(|s| energy_f64(s, graph)).collect();
@@ -304,6 +310,7 @@ fn finish(
             rng_scheme,
             seeded_reads,
             workspace_bytes: None,
+            beta_ladder,
         },
     }
 }
@@ -317,7 +324,7 @@ fn sample_scalar_research(
     if start.is_some() {
         return Err(ResearchError::SeededScalarUnsupported);
     }
-    let (results, arithmetic) =
+    let (results, arithmetic, beta_ladder) =
         sample_sa_scalar(graph, params, cancel).map_err(|_| ResearchError::Cancelled)?;
     let representation = match arithmetic {
         ScalarArithmetic::Int => "scalar-int",
@@ -330,6 +337,7 @@ fn sample_scalar_research(
         representation,
         "per-attempt-uniform-v1",
         0,
+        beta_ladder,
     ))
 }
 
@@ -357,7 +365,7 @@ fn sample_unit_research(
         Some(s) => validate_seeds(s, graph.h.len(), params.num_reads)?,
         None => 0,
     };
-    let results = sample_unit_packed(graph, params, &int, &counts, start, cancel)
+    let (results, beta_ladder) = sample_unit_packed(graph, params, &int, &counts, start, cancel)
         .map_err(|_| ResearchError::Cancelled)?;
     Ok(finish(
         ResearchKernel::UnitMsa,
@@ -366,6 +374,7 @@ fn sample_unit_research(
         "unit-bit-sliced",
         "shared-threshold-row-v1",
         seeded_reads,
+        beta_ladder,
     ))
 }
 
@@ -390,6 +399,7 @@ fn sample_float_research(
             rng_scheme: crate::sa_msc_f64::RNG_SCHEME,
             seeded_reads: out.seeded_reads,
             workspace_bytes: Some(out.workspace_bytes),
+            beta_ladder: out.beta_ladder,
         },
     })
 }
@@ -583,10 +593,36 @@ mod tests {
         for kernel in ResearchKernel::ALL {
             let out = sample_research(&graph, &params(70, 16, 4), kernel, None, None)
                 .expect("a unit model runs on every kernel");
+            let hot = out.metadata.beta_ladder.first().copied().expect("hot rung");
+            let cold = out.metadata.beta_ladder.last().copied().expect("cold rung");
+            assert!((hot - 0.1).abs() < 1e-14, "{kernel:?}: {hot}");
+            assert!((cold - 5.0).abs() < 1e-14, "{kernel:?}: {cold}");
             for (spins, &e) in out.spins.iter().zip(&out.energies) {
                 assert_eq!(e, energy_f64(spins, &graph), "{kernel:?}");
             }
         }
+    }
+
+    #[test]
+    fn a_seeded_float_run_reports_its_start_beta_and_cold_end() {
+        let graph = fractional_pair();
+        let params = SampleParams {
+            sweeps_per_beta: 1,
+            ..params(2, 8, 17)
+        };
+        let seeds = vec![vec![1, -1]];
+        let start = SeededStart {
+            spins: &seeds,
+            start_beta: Some(1.5),
+        };
+
+        let out = sample_research(&graph, &params, ResearchKernel::FloatMsa, Some(start), None)
+            .expect("seeded float run");
+
+        assert_eq!(out.metadata.beta_ladder.len(), 8);
+        assert_eq!(out.metadata.beta_ladder.first(), Some(&1.5));
+        let cold = out.metadata.beta_ladder.last().copied().expect("cold rung");
+        assert!((cold - 5.0).abs() < 1e-14, "{cold}");
     }
 
     #[test]

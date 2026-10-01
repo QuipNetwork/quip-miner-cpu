@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
-"""Round 2 regime search report: per-regime tables, the portfolio pipeline's
-own tables, and next-test decisions, built from CPU pilot/campaign records,
-the seeded/cold weighted-MSA control, and the portfolio deadline arm's
-results (synthetic fixtures, historical settings -- see the ``PORTFOLIO``
-naming rule below). See ``round2_metrics.py`` for the pure comparison,
-feasibility, and bootstrap primitives this module assembles into a document.
+"""Round 2 regime search report: per-regime tables and next-test decisions.
+
+See ``round2_metrics.py`` for the pure comparison and bootstrap primitives
+this module assembles into a document.
 
 Task 10 of D's ``docs/superpowers/plans/2026-09-22-regime-search-round2.md``
 is the brief this implements. D's own ``scripts/regime_report.py``
@@ -166,14 +164,8 @@ def load_seeded_sweep_records(seeded_root: Path, cell: str) -> List[Dict[str, An
     return records
 
 
-def load_portfolio_deadline(path: Path) -> List[Dict[str, Any]]:
-    """The deadline arm's (synthetic fixtures, historical settings) own ``results.json``."""
-    payload = json.loads(Path(path).read_text(encoding="utf-8"))
-    return list(payload.get("records", []))
-
-
 def load_capture_proposal(path: Path) -> Dict[str, Any]:
-    """The physical-range/portfolio capture proposal, whatever its approval status."""
+    """The physical-range capture proposal, whatever its approval status."""
     return json.loads(Path(path).read_text(encoding="utf-8"))
 
 
@@ -451,6 +443,31 @@ def _timing_cell(summary: Dict[str, Any], label: str) -> str:
     return f"{fmt(info['median_wall_s'])} ({info['n']})"
 
 
+def timing_subset_note(records: Sequence[Dict[str, Any]]) -> str:
+    """How the loaded timing-subset records ran: serially or with parallel workers.
+
+    The counts come from the records themselves, so the note cannot describe a
+    dataset the report did not load.
+    """
+    if not records:
+        return "No timing-subset records were loaded. "
+    serial = [r for r in records if r.get("timing_mode") == "serial"]
+    parallel = [r for r in records if r.get("timing_mode") == "parallel"]
+    unknown = len(records) - len(serial) - len(parallel)
+    parts = []
+    if serial:
+        cpus = {(r.get("host") or {}).get("cpu") for r in serial}
+        cpu = next(iter(cpus)) if len(cpus) == 1 else None
+        parts.append(f"{len(serial)} ran serially" + (f" on CPU {cpu}" if cpu is not None else ""))
+    if parallel:
+        workers = {r.get("concurrent_workers") for r in parallel}
+        count = next(iter(workers)) if len(workers) == 1 else None
+        parts.append(f"{len(parallel)} ran with " + (f"{count} " if count is not None else "") + "parallel workers")
+    if unknown:
+        parts.append(f"{unknown} {'has' if unknown == 1 else 'have'} no recorded timing mode")
+    return f"Of the {len(records)} timing-subset records loaded, {' and '.join(parts)}. "
+
+
 def depth_quality_time_table(
     records_by_cell: Dict[str, List[Dict[str, Any]]],
     *, kernels: Sequence[str], depths: Sequence[int], expected_per_arm: Optional[int] = None,
@@ -463,10 +480,15 @@ def depth_quality_time_table(
         if timing_source == "timing-subset" else "Best energy remains from the selected run. "
     )
     time_records_by_cell = timing_records_by_cell if timing_records_by_cell is not None else records_by_cell
+    timing_host_note = (
+        timing_subset_note([r for cell_records in time_records_by_cell.values() for r in cell_records])
+        if timing_source == "timing-subset" else
+        "Timing records came from a loaded host with parallel workers, one per physical core. "
+    )
     lines = [
         "## Depth, quality, and time", "",
         "Every row is one (cell, kernel, sweep-depth) arm. Energy is the primary comparison. "
-        f"Timing uses `{timing_label}` records from a loaded host with parallel workers, one per physical core. "
+        f"Timing uses `{timing_label}` records. {timing_host_note}"
         "For each job, its fastest successful run is its run speed. The timing columns show the median "
         "sampling and wall times across successful, supported records, regardless of host contamination "
         "or timing mode. The contaminated and parallel wall-time columns remain separate diagnostics. "
@@ -794,8 +816,8 @@ def matched_runtime_table(
     results = matched_runtime_comparison(captures, cpu_records, kernels)
     lead = source_description or (
         "QPU time is charged access time for 64 reads, with end-to-end time also shown. CPU time is sampling "
-        "time for 64 reads from the campaign, using the fastest successful attempt on a loaded host with "
-        "parallel workers. Energy outcomes use the same strict, numeric-tolerance, and material rules as "
+        "time for 64 reads from the campaign, using the fastest successful attempt. "
+        "Energy outcomes use the same strict, numeric-tolerance, and material rules as "
         "the equal-sweep tables. Equal budget uses the deepest CPU depth completed within that capture's "
         "access-time budget. Time to QPU energy uses the quickest CPU depth that reached the capture's best energy."
     )
@@ -925,84 +947,6 @@ def physical_scale_table(
     return lines
 
 
-def feasibility_table(portfolio_records: Sequence[Dict[str, Any]]) -> List[str]:
-    lines = [
-        "## Portfolio feasibility", "",
-        "Feasibility here is the share of raw returned reads that already meet the cardinality constraint "
-        "before repair. P's own repair and weighting happen afterward. See the portfolio pipeline table for "
-        "the repaired, selected answer's own feasibility. `weighting_failed` is a tri-state value. An unknown "
-        "result never counts as success. P's silent equal-weight fallback exposes no flag when it fires. "
-        "Provenance names the market-instance source of every row (review, I5): this report never calls a "
-        "synthetic instance historical.", "",
-        "| Assets | K | Beta label | Provenance | Status | Raw feasible reads | Weighting |",
-        "| -- | -- | -- | -- | -- | -- | -- |",
-    ]
-    for record in portfolio_records:
-        count = record.get("raw_feasible_count")
-        total = record.get("returned_reads")
-        feasibility_text = "n/a" if count is None or not total else metrics.format_feasibility(count, total)
-        weighting_failed = record.get("weighting_failed")
-        if weighting_failed is True:
-            weighting_text = "failed"
-        elif weighting_failed is None:
-            weighting_text = "unknown (not observed to fail)"
-        else:
-            weighting_text = "not observed to fail"
-        lines.append(
-            f"| {record.get('n_assets')} | {record.get('cardinality_k')} | `{record.get('beta_label')}` | "
-            f"{record.get('provenance', 'n/a')} | {record.get('status')} | {feasibility_text} | {weighting_text} |"
-        )
-    return lines
-
-
-def portfolio_pipeline_table(portfolio_records: Sequence[Dict[str, Any]]) -> List[str]:
-    lines = [
-        "## Portfolio pipeline", "",
-        "The deadline arm, synthetic fixtures, historical settings (dwave-neal, 500 reads / 500 sweeps, the "
-        "design's portfolio-replication contract) ran to completion for every basket and beta label.", "",
-        "Sampling s covers only the reference sampler's own call. Repair s covers P's separate repair and "
-        "weighting step. End-to-end s is their sum, and the Status column classifies on end-to-end time, per "
-        "review finding I5, not on sampling time alone. This report has no 10-second kill switch. A slow "
-        "repair phase can still turn a fast sample into a late run.", "",
-        "Repaired feasible and Selected raw cardinality name the outcome of the one selected, winning read "
-        "after P's own repair and weighting. The feasibility table's own raw feasible reads count something "
-        "different: every returned read, before repair. Round 2 has not captured a paired QPU portfolio "
-        "result. The strict-win, material-win, speed-only, and joint quality/time columns stay unavailable "
-        "until it does.", "",
-        "| Assets | K | Beta label | Provenance | Status | Sampling s | Repair s | End-to-end s | Deadline s "
-        "| Objective | Repaired feasible | Selected raw cardinality | Strict/material win | Speed-only outcome "
-        "| Joint quality/time |",
-        "| -- | -- | -- | -- | -- | -- | -- | -- | -- | -- | -- | -- | -- | -- | -- |",
-    ]
-    for record in portfolio_records:
-        feasible = record.get("feasible")
-        feasible_text = "yes" if feasible is True else "no" if feasible is False else "n/a"
-        lines.append(
-            f"| {record.get('n_assets')} | {record.get('cardinality_k')} | `{record.get('beta_label')}` | "
-            f"{record.get('provenance', 'n/a')} | {record.get('status')} | {fmt(record.get('elapsed_s'))} | "
-            f"{fmt(record.get('repair_s'))} | {fmt(record.get('end_to_end_s'))} | {fmt(record.get('deadline_s'))} | "
-            f"{fmt(record.get('objective'), 6)} | {feasible_text} | {fmt(record.get('selected_raw_cardinality'))} | "
-            "unavailable | unavailable | unavailable |"
-        )
-    return lines
-
-
-def historical_context_section() -> List[str]:
-    return [
-        "## Historical context (cited, not recomputed here)", "",
-        "The current portfolio manuscript reports 1,930 comparable races, with 833 QPU quality wins and "
-        "1,097 ties at 0.5% materiality. At zero tolerance it reports 970 QPU wins and 960 ties, and neither "
-        "table contains an SA win. The manuscript reports about 70% faster device access but supplies no joint "
-        "quality/time counts, so these figures do not establish an 80% strict-quality win rate (design doc, "
-        "`docs/superpowers/specs/2026-09-22-regime-search-round2-design.md`).",
-        "The older 2,088-race window overlaps the manuscript's 1,930-race window. This report keeps the two "
-        "separate and never pools them, because a union of overlapping windows would double count shared "
-        "races.",
-        "The 80% portfolio claim stays unresolved. No source used in this report defines that metric together "
-        "with the denominator or joint counts a claim at that scale would need.",
-    ]
-
-
 def next_test_section(
     cells: Sequence[str], records_by_cell: Dict[str, List[Dict[str, Any]]],
     capture_proposal: Optional[Dict[str, Any]], run: str,
@@ -1031,14 +975,24 @@ def next_test_section(
     for cell in cells:
         records = records_by_cell.get(cell, [])
         measured_records = [r for r in records if r.get("requested_kernel") != "cpu-msa"]
+        clean_finite_records = []
+        for record in measured_records:
+            if (
+                not record.get("exit_ok") or record.get("unsupported")
+                or _finite_float(record.get("best_energy")) is None
+                or bool((record.get("host") or {}).get("contaminated"))
+            ):
+                continue
+            # Parallel mode is a timing label, not a quality failure.
+            clean_finite_records.append(record)
         kernels = sorted({
-            str(k) for r in measured_records
-            if r.get("exit_ok") and not r.get("unsupported")
-            and (k := r.get("requested_kernel")) is not None
+            str(k) for r in clean_finite_records
+            if (k := r.get("requested_kernel")) is not None
         })
-        completed = sum(1 for r in measured_records if r.get("exit_ok") and not r.get("unsupported"))
+        kernel_count = len(kernels)
         established = (
-            f"{completed} completed CPU timing/quality records across {len(kernels)} kernels "
+            f"Clean, finite CPU timing/quality records: {len(clean_finite_records)} across "
+            f"{kernel_count} kernel{'s' if kernel_count != 1 else ''} "
             f"({', '.join(f'`{k}`' for k in kernels) or 'none yet'}) from the {run} run."
         )
         if cell in captured:
@@ -1085,15 +1039,6 @@ def next_test_section(
                 "QPU arm belongs in this regime's next round."
             )
         lines.append(f"| `{cell}` | {established} | {unresolved} | {next_control} |")
-    lines.append(
-        "| Portfolio pipeline | The deadline arm (synthetic fixtures, historical settings) ran to "
-        "completion for both baskets and both beta labels, producing repaired objectives and raw "
-        "feasibility counts. | No paired QPU portfolio result exists, so strict and material wins, "
-        "speed-only outcomes, and joint quality/time counts stay unavailable. The 80% portfolio claim "
-        "stays unresolved. | Capture the portfolio pilot (12 frozen market instances, beta-zero and "
-        "positive-beta controls) once its provenance and anneal-setting classification are explicit, per "
-        "the design doc. |"
-    )
     return lines
 
 
@@ -1153,15 +1098,28 @@ def _pad_range(low: float, high: float, fraction: float = 0.12) -> Tuple[float, 
 
 
 def _axis_ticks(low: float, high: float, count: int = 5) -> List[float]:
-    """``count`` evenly spaced values from ``low`` to ``high``, inclusive of both
-    endpoints (fix round 2: "the y axis shows only two end ticks" -- a chart
-    with only its extremes labeled cannot show a reader anything about the
-    values between them).
+    """Nice tick positions that cover the range, using steps of 1, 2, 2.5, or 5
+    times a power of ten. The values use axis coordinates, so log axes round in
+    log space before converting labels back to the data scale.
     """
-    if count < 2 or high <= low:
-        return [low, high]
-    step = (high - low) / (count - 1)
-    return [low + i * step for i in range(count)]
+    if high < low:
+        low, high = high, low
+    elif high == low:
+        padding = max(abs(low), 1.0) * 0.12
+        low, high = low - padding, high + padding
+    count = max(count, 3)
+    rough_step = (high - low) / (count - 1)
+    magnitude = 10.0 ** math.floor(math.log10(rough_step))
+    step = next(
+        multiple * magnitude
+        for multiple in (1.0, 2.0, 2.5, 5.0, 10.0)
+        if multiple * magnitude >= rough_step
+    )
+    start = math.floor(low / step + 1e-12) * step
+    end = math.ceil(high / step - 1e-12) * step
+    intervals = int(round((end - start) / step))
+    ticks = [start + i * step for i in range(intervals + 1)]
+    return [0.0 if math.isclose(tick, 0.0, abs_tol=step * 1e-12) else tick for tick in ticks]
 
 
 def _tick_text(value: float) -> str:
@@ -1251,11 +1209,16 @@ def quality_time_figure(
                 summary["median_best_energy"], summary["completed"], len(sampling_values),
             ))
 
+    timing_host_note = (
+        timing_subset_note(timing_records if timing_records is not None else records)
+        if timing_source == "timing-subset" else
+        "These timings come from a loaded host with parallel workers, one per physical core. "
+    )
     caption = (
         "Energy units: canonical, rescored from the original model, lower is better. The x axis uses "
         f"the median fastest-run elapsed_sampling_s from {timing_source or 'the quality run'}; each job "
-        "contributes its fastest successful run. These timings come from a loaded host with parallel workers, "
-        "one per physical core. End-to-end wall time remains separate in the table and point details."
+        f"contributes its fastest successful run. {timing_host_note}"
+        "End-to-end wall time remains separate in the table and point details."
     )
     body_parts: List[str] = [f'<text x="{margin}" y="24" font-size="16" font-weight="bold">{cell}: quality vs. time (CPU)</text>']
     y_cursor = 42
@@ -1293,6 +1256,10 @@ def quality_time_figure(
         log_wall = [math.log10(max(w, 1e-9)) for w in raw_wall]
         x_min, x_max = _pad_range(min(log_wall), max(log_wall))
         y_min, y_max = _pad_range(min(raw_energy), max(raw_energy))
+        x_ticks = _axis_ticks(x_min, x_max, count=5)
+        y_ticks = _axis_ticks(y_min, y_max, count=5)
+        x_min, x_max = x_ticks[0], x_ticks[-1]
+        y_min, y_max = y_ticks[0], y_ticks[-1]
         x_span = x_max - x_min
         y_span = y_max - y_min
         plot_height = height - margin - plot_top
@@ -1315,7 +1282,8 @@ def quality_time_figure(
         # round 2: "the y axis shows only two end ticks ... show at least 3-5
         # ticks, at a precision that separates them"; "the x axis shows only
         # its end values"), plus the axis titles.
-        for tick in _axis_ticks(x_min, x_max, count=5):
+        # Round positions in log10 space; convert only the labels back to seconds.
+        for tick in x_ticks:
             tick_x = margin + (tick - x_min) / x_span * (width - 2 * margin)
             body_parts.append(
                 f'<text x="{tick_x:.1f}" y="{height - margin + 16}" font-size="10" text-anchor="middle">'
@@ -1325,7 +1293,7 @@ def quality_time_figure(
             f'<text x="{(margin + width - margin) / 2:.0f}" y="{height - margin + 32}" font-size="11" '
             'text-anchor="middle">Median sampling time (s), log scale</text>'
         )
-        for tick in _axis_ticks(y_min, y_max, count=5):
+        for tick in y_ticks:
             tick_y = height - margin - (tick - y_min) / y_span * plot_height
             body_parts.append(
                 f'<text x="{margin - 6}" y="{tick_y + 3:.1f}" font-size="10" text-anchor="end">{_tick_text(tick)}</text>'
@@ -1367,68 +1335,6 @@ def _bar_chart(title: str, subtitle: str, bars: Sequence[Tuple[str, float]], val
         body_parts.append(f'<text x="10" y="{y + 15}" font-size="12">{label}</text>')
         body_parts.append(f'<rect x="{margin_left}" y="{y}" width="{bar_width:.1f}" height="20" fill="#445a86"/>')
         body_parts.append(f'<text x="{margin_left + bar_width + 6:.1f}" y="{y + 15}" font-size="12">{value_text}</text>')
-    return _svg_document(width, height, header + "".join(body_parts))
-
-
-#: The signed-bar colors (task brief, step 9's graphical-integrity requirement;
-#: review, Important item 6: a negative objective must never draw like a
-#: positive one just because a magnitude-only bar chart lost its sign).
-_POSITIVE_COLOR = "#217a69"
-_NEGATIVE_COLOR = "#a33a3a"
-
-
-def _signed_bar_chart(title: str, subtitle: str, bars: Sequence[Tuple[str, float]], value_label: str) -> str:
-    """A bar chart around a zero baseline: a negative value draws to the LEFT of
-    the baseline in :data:`_NEGATIVE_COLOR`, a positive one to the right in
-    :data:`_POSITIVE_COLOR`, and the printed value always carries an explicit
-    sign (``+`` or ``-``). Never draws ``abs(value)`` as an unsigned magnitude.
-
-    ``margin_left`` is sized from the WIDEST category label plus the WIDEST
-    negative value label, not a fixed constant: a negative bar's own value
-    label sits at its tip, to the left of the zero baseline, and at a large
-    enough bar width that label's left edge can reach back past a fixed
-    margin into the category column (fix round 2: "a negative-value label
-    collides with the category label"). Sizing the margin from both widths
-    together guarantees the two can never overlap, at any bar width.
-    """
-    half_width = 200
-    if not bars:
-        width = 260 + 2 * half_width + 100
-        header, top = _chart_header(title, subtitle, width)
-        height = top + 30
-        return _svg_document(width, height, header + f'<text x="10" y="{top + 10}" font-size="14">No data available.</text>')
-    value_texts = [f"{value:+.4g} {value_label}" for _, value in bars]
-    category_width = int(max(_text_width_estimate(label) for label, _ in bars))
-    negative_value_width = int(max(
-        (_text_width_estimate(text) for (_, value), text in zip(bars, value_texts) if value < 0), default=0,
-    ))
-    margin_left = max(120, 40 + category_width + negative_value_width)
-    positive_value_width = int(max(
-        (_text_width_estimate(text) for (_, value), text in zip(bars, value_texts) if value >= 0), default=0,
-    ))
-    label_margin = positive_value_width + 20
-    width = margin_left + 2 * half_width + label_margin
-    header, top = _chart_header(title, subtitle, width)
-    height = top + 34 * len(bars) + 20
-    max_abs = max(abs(value) for _, value in bars) or 1.0
-    baseline_x = margin_left + half_width
-    body_parts = [
-        f'<line x1="{baseline_x}" y1="{top - 10}" x2="{baseline_x}" y2="{top + 34 * len(bars) - 4}" '
-        'stroke="#999999" stroke-dasharray="3,3"/>',
-        f'<text x="{baseline_x}" y="{top - 14}" font-size="10" text-anchor="middle">0</text>',
-    ]
-    for i, ((label, value), value_text) in enumerate(zip(bars, value_texts)):
-        y = top + i * 34
-        bar_width = abs(value) / max_abs * half_width
-        color = _POSITIVE_COLOR if value >= 0 else _NEGATIVE_COLOR
-        x = baseline_x if value >= 0 else baseline_x - bar_width
-        text_x = baseline_x + bar_width + 6 if value >= 0 else baseline_x - bar_width - 6
-        anchor = "start" if value >= 0 else "end"
-        body_parts.append(f'<text x="10" y="{y + 15}" font-size="12">{label}</text>')
-        body_parts.append(f'<rect x="{x:.1f}" y="{y}" width="{bar_width:.1f}" height="20" fill="{color}"/>')
-        body_parts.append(
-            f'<text x="{text_x:.1f}" y="{y + 15}" font-size="12" text-anchor="{anchor}">{value_text}</text>'
-        )
     return _svg_document(width, height, header + "".join(body_parts))
 
 
@@ -1509,6 +1415,10 @@ def physical_scale_effect_figure(cell: str, captures: Sequence[Dict[str, Any]]) 
     energies = [c["best_energy"] for c in captures]
     x_min, x_max = _pad_range(min(scales), max(scales))
     y_min, y_max = _pad_range(min(energies), max(energies))
+    x_ticks = _axis_ticks(x_min, x_max, count=5)
+    y_ticks = _axis_ticks(y_min, y_max, count=5)
+    x_min, x_max = x_ticks[0], x_ticks[-1]
+    y_min, y_max = y_ticks[0], y_ticks[-1]
     x_span = x_max - x_min
     y_span = y_max - y_min
     plot_height = height - margin - plot_top
@@ -1521,7 +1431,7 @@ def physical_scale_effect_figure(cell: str, captures: Sequence[Dict[str, Any]]) 
             f'<title>model {capture["model_hash"][:8]}, scale {capture["requested_scale"]:g}, '
             f'{capture["anneal_us"]} us: best energy {capture["best_energy"]:.6g}</title></circle>'
         )
-    for tick in _axis_ticks(x_min, x_max, count=5):
+    for tick in x_ticks:
         tick_x = margin + (tick - x_min) / x_span * (width - 2 * margin)
         body_parts.append(
             f'<text x="{tick_x:.1f}" y="{height - margin + 16}" font-size="10" text-anchor="middle">'
@@ -1531,7 +1441,7 @@ def physical_scale_effect_figure(cell: str, captures: Sequence[Dict[str, Any]]) 
         f'<text x="{(margin + width - margin) / 2:.0f}" y="{height - margin + 32}" font-size="11" '
         'text-anchor="middle">Requested scale (share of the audited legal ceiling)</text>'
     )
-    for tick in _axis_ticks(y_min, y_max, count=5):
+    for tick in y_ticks:
         tick_y = height - margin - (tick - y_min) / y_span * plot_height
         body_parts.append(
             f'<text x="{margin - 6}" y="{tick_y + 3:.1f}" font-size="10" text-anchor="end">{_tick_text(tick)}</text>'
@@ -1546,50 +1456,9 @@ def physical_scale_effect_figure(cell: str, captures: Sequence[Dict[str, Any]]) 
     return _svg_document(width, height, "".join(body_parts))
 
 
-def portfolio_figure(portfolio_records: Sequence[Dict[str, Any]]) -> str:
-    """The portfolio quality panel (task brief, step 7): the repaired final
-    objective per basket x beta-label arm, in the portfolio pipeline's own final
-    objective units -- not spin-model energy units. Signed around zero (review,
-    Important item 6): a negative objective never draws as if it were positive.
-    """
-    bars = [
-        (f"n={record.get('n_assets')} k={record.get('cardinality_k')} {record.get('beta_label')}", float(record["objective"]))
-        for record in portfolio_records if record.get("objective") is not None
-    ]
-    subtitle = (
-        "Deadline arm, synthetic fixtures, historical settings (dwave-neal, 500 reads / 500 sweeps), repaired "
-        "final objective, original "
-        "units. No paired QPU portfolio result yet."
-    )
-    return _signed_bar_chart("Portfolio pipeline: repaired objective per basket", subtitle, bars, "objective")
-
-
-def portfolio_repair_figure(portfolio_records: Sequence[Dict[str, Any]]) -> str:
-    """The portfolio repair panel (task brief, step 7): raw feasible reads (exact
-    cardinality, before repair) per basket, labeled with whether P's repaired,
-    selected answer ended feasible (review, Important item 6: "add a repair
-    panel that shows raw feasible against repaired counts").
-    """
-    bars = []
-    for record in portfolio_records:
-        count = record.get("raw_feasible_count")
-        total = record.get("returned_reads")
-        if count is None or not total:
-            continue
-        repaired = "repaired: feasible" if record.get("feasible") else "repaired: infeasible"
-        label = f"n={record.get('n_assets')} k={record.get('cardinality_k')} {record.get('beta_label')} ({repaired})"
-        bars.append((label, float(count)))
-    subtitle = (
-        "Raw feasible reads (exact cardinality, before repair) per basket, out of returned_reads (see the "
-        "feasibility table for the denominator). The label states the repaired, selected answer's own "
-        "feasibility."
-    )
-    return _bar_chart("Portfolio repair: raw feasible reads vs. the repaired answer", subtitle, bars, "raw feasible reads")
-
-
 def write_figures(
     out_dir: Path, records_by_cell: Dict[str, List[Dict[str, Any]]], kernels: Sequence[str], depths: Sequence[int],
-    capture_proposal: Optional[Dict[str, Any]], portfolio_records: Sequence[Dict[str, Any]],
+    capture_proposal: Optional[Dict[str, Any]],
     captures_by_arm: Optional[Dict[Tuple[str, float, int], List[Dict[str, Any]]]] = None,
     timing_records_by_cell: Optional[Dict[str, List[Dict[str, Any]]]] = None,
     timing_source: Optional[str] = None,
@@ -1620,12 +1489,6 @@ def write_figures(
         effect_path = out_dir / f"physical-scale-effect-{cell}.svg"
         effect_path.write_text(physical_scale_effect_figure(cell, captures), encoding="utf-8")
         paths.append(effect_path)
-    portfolio_path = out_dir / "portfolio-objective.svg"
-    portfolio_path.write_text(portfolio_figure(portfolio_records), encoding="utf-8")
-    paths.append(portfolio_path)
-    repair_path = out_dir / "portfolio-repair.svg"
-    repair_path.write_text(portfolio_repair_figure(portfolio_records), encoding="utf-8")
-    paths.append(repair_path)
     return paths
 
 
@@ -1661,7 +1524,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="Defaults to the pilot depths for --run pilot, the full ladder otherwise.",
     )
     parser.add_argument("--seeded-root", default=None, help="cpu-root's seeded-sweep-v2 directory; omit to skip the seed-lane table.")
-    parser.add_argument("--portfolio-results", default=None, help="portfolio-deadline/results.json; omit to skip the portfolio tables.")
     parser.add_argument("--capture-proposal", default=None, help="capture-proposal.json; omit to mark physical scale unavailable.")
     parser.add_argument(
         "--qpu-root", default=None,
@@ -1704,7 +1566,6 @@ def main(argv: Optional[List[str]] = None) -> int:
         {cell: load_seeded_sweep_records(Path(args.seeded_root), cell) for cell in args.cells}
         if args.seeded_root else {}
     )
-    portfolio_records = load_portfolio_deadline(Path(args.portfolio_results)) if args.portfolio_results else []
     capture_proposal = load_capture_proposal(Path(args.capture_proposal)) if args.capture_proposal else None
     expected_per_arm = expected_per_arm_for(args.run)
 
@@ -1826,10 +1687,6 @@ def main(argv: Optional[List[str]] = None) -> int:
             f"{'reconcile' if spend_summary['reconciled'] else 'do not reconcile'}.",
             "",
         ]
-    if portfolio_records:
-        lines += feasibility_table(portfolio_records) + [""]
-        lines += portfolio_pipeline_table(portfolio_records) + [""]
-    lines += historical_context_section() + [""]
     lines += next_test_section(args.cells, records_by_cell, capture_proposal, args.run, captured_regimes) + [""]
 
     out_dir = Path(args.out_dir)
@@ -1837,7 +1694,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     report_path = out_dir / "REPORT.md"
     report_path.write_text("\n".join(lines), encoding="utf-8")
     write_figures(
-        out_dir, records_by_cell, args.kernels, depths, capture_proposal, portfolio_records, captures_by_arm,
+        out_dir, records_by_cell, args.kernels, depths, capture_proposal, captures_by_arm,
         timing_records_by_cell=timing_records_by_cell, timing_source=timing_source,
     )
     print(f"wrote {report_path}")

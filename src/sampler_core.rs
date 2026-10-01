@@ -110,9 +110,21 @@ impl CpuGraph {
     }
 }
 
+/// The per-rung count, capped by a positive total sweep budget.
+///
+/// Zero sweeps keep the legacy `max(1)` count for protocol compatibility.
+pub(crate) fn effective_sweeps_per_beta(num_sweeps: usize, sweeps_per_beta: usize) -> usize {
+    let sweeps_per_beta = sweeps_per_beta.max(1);
+    if num_sweeps == 0 {
+        sweeps_per_beta
+    } else {
+        sweeps_per_beta.min(num_sweeps)
+    }
+}
+
 /// Geometric beta schedule for one sample request (f64 for CPU precision).
 pub(crate) fn build_beta_schedule(graph: &IsingGraph, params: &SampleParams) -> Vec<f64> {
-    let sweeps_per = params.sweeps_per_beta.max(1);
+    let sweeps_per = effective_sweeps_per_beta(params.num_sweeps, params.sweeps_per_beta);
     let num_betas = (params.num_sweeps / sweeps_per).max(1);
     let (hot, cold) = params
         .beta_range
@@ -132,7 +144,7 @@ pub(crate) fn build_seeded_beta_schedule(
     params: &SampleParams,
     start_beta: Option<f64>,
 ) -> Vec<f64> {
-    let sweeps_per = params.sweeps_per_beta.max(1);
+    let sweeps_per = effective_sweeps_per_beta(params.num_sweeps, params.sweeps_per_beta);
     let num_betas = (params.num_sweeps / sweeps_per).max(1);
     let (hot, cold) = params
         .beta_range
@@ -356,7 +368,7 @@ pub(crate) fn sample_ising_cancellable(
             crate::gibbs_parallel::DEFAULT_GIBBS_WORKERS,
         ));
     }
-    sample_sa_scalar(graph, params, cancel).map(|(results, _)| results)
+    sample_sa_scalar(graph, params, cancel).map(|(results, _, _)| results)
 }
 
 /// Which arithmetic the scalar SA kernel ran a job with. The two produce
@@ -375,10 +387,10 @@ pub(crate) fn sample_sa_scalar(
     graph: &IsingGraph,
     params: &SampleParams,
     cancel: Option<(&CancelToken, Option<u64>)>,
-) -> Result<(Vec<SamplerResult>, ScalarArithmetic), SampleCancelled> {
+) -> Result<(Vec<SamplerResult>, ScalarArithmetic, Vec<f64>), SampleCancelled> {
     let num_reads = params.num_reads.max(1);
     let beta_schedule = build_beta_schedule(graph, params);
-    let sweeps_per = params.sweeps_per_beta.max(1);
+    let sweeps_per = effective_sweeps_per_beta(params.num_sweeps, params.sweeps_per_beta);
     let base_seed = params.seed;
     let kernel = Kernel::for_problem(graph, &beta_schedule);
     let arithmetic = match &kernel {
@@ -407,7 +419,7 @@ pub(crate) fn sample_sa_scalar(
         };
         results.push(score_spins(&spins, graph));
     }
-    Ok((results, arithmetic))
+    Ok((results, arithmetic, beta_schedule))
 }
 
 #[cfg(test)]
@@ -785,6 +797,41 @@ mod tests {
         let mut short = vec![1i8, -1];
         polish_from(&mut short, &cpu, 8);
         assert_eq!(short, vec![1i8, -1], "a length mismatch must be a no-op");
+    }
+
+    #[test]
+    fn beta_schedule_uses_one_sweep_when_sweeps_are_below_sweeps_per_beta() {
+        let graph = ferro2();
+        let params = SampleParams {
+            num_sweeps: 1,
+            sweeps_per_beta: 4,
+            beta_range: Some((0.1, 10.0)),
+            ..Default::default()
+        };
+        let sweeps_per_beta = effective_sweeps_per_beta(params.num_sweeps, params.sweeps_per_beta);
+        let total_sweeps = build_beta_schedule(&graph, &params).len() * sweeps_per_beta;
+        assert_eq!(
+            total_sweeps, params.num_sweeps,
+            "the beta schedule must not expand the requested sweep budget"
+        );
+    }
+
+    #[test]
+    fn seeded_beta_schedule_uses_one_sweep_when_sweeps_are_below_sweeps_per_beta() {
+        let graph = ferro2();
+        let params = SampleParams {
+            num_sweeps: 1,
+            sweeps_per_beta: 4,
+            beta_range: Some((0.1, 10.0)),
+            ..Default::default()
+        };
+        let sweeps_per_beta = effective_sweeps_per_beta(params.num_sweeps, params.sweeps_per_beta);
+        let total_sweeps =
+            build_seeded_beta_schedule(&graph, &params, Some(0.5)).len() * sweeps_per_beta;
+        assert_eq!(
+            total_sweeps, params.num_sweeps,
+            "the seeded beta schedule must not expand the requested sweep budget"
+        );
     }
 
     #[test]

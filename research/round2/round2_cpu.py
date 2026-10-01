@@ -29,16 +29,6 @@ Subcommands:
               Step 9: the seeded/cold weighted-MSA comparison at 32,768
               sweeps, 32 seed lanes plus 32 cold lanes, against the saved
               Round 1 QPU seeds and CPU-lite seeds.
-``portfolio-deadline``
-              The portfolio historical-deadline arm (design's portfolio-
-              replication contract): dwave-neal, 500 reads/500 sweeps, one
-              basket x beta-label combination per fresh subprocess under
-              P's pinned venv, with a hard-kill safety net. Writes
-              ``results.json`` from committed code, not an ad hoc command.
-``portfolio-deadline-run-one``
-              Runs exactly one basket x beta-label combination. This is
-              what ``portfolio-deadline`` spawns as a subprocess; requires
-              P's pinned environment (``qpo``, ``dimod``, ``dwave.samplers``).
 
 No QPU calls happen anywhere in this script.
 """
@@ -66,20 +56,9 @@ DEFAULT_CPU_ROOT = Path("/home/carback1/quip-data/regimes/round2/cpu")
 DEFAULT_CAPTURED_CPU_ROOT = Path("/home/carback1/quip-data/regimes/round3/cpu")
 DEFAULT_CAPTURE_MANIFEST = Path("/home/carback1/quip-data/regimes/round2/physical-capture-manifest.json")
 ROUND1 = Path("/home/carback1/quip-data/regimes/round1")
-#: P's pinned reference checkout (task-3 report; unchanged here).
-DEFAULT_P_PYTHON = "/home/carback1/quip-data/regimes/round2/reference/qportfolio/.venv/bin/python"
-#: D on the path (quip_miner_dwave), plus this package's own directory (round2_runner,
-#: round2_cpu) -- P's venv has qpo/dimod/dwave.samplers but neither of those on its own.
-DEFAULT_PORTFOLIO_PYTHONPATH = f"/home/carback1/quip-miner-dwave:{Path(__file__).resolve().parent}"
+
 
 DEFAULT_CELLS = ["clique-portfolio", "cubic-dimer-pm1", "diamond-pm1", "native-125", "native-pm1"]
-
-#: Crash protection for the portfolio-deadline arm's own subprocess (finding 7:
-#: "a real subprocess deadline, with timeout and cleanup, like the CPU arms").
-#: 500 reads / 500 sweeps on at most 28 assets normally finishes in well under a
-#: second; this only ever catches a genuinely hung reference sampler.
-PORTFOLIO_HARD_DEADLINE_S = 300.0
-
 
 def _load_index(bundles_root: Path) -> Dict[str, Any]:
     return json.loads((bundles_root / "index.json").read_text(encoding="utf-8"))
@@ -725,79 +704,6 @@ def cmd_seeded_sweep(args: argparse.Namespace) -> int:
     return 0
 
 
-# ------------------------------------------------------------- portfolio deadline arm
-
-
-def cmd_portfolio_deadline_run_one(args: argparse.Namespace) -> int:
-    """Run exactly one basket x beta-label combination, in this process. Needs P's
-    pinned environment; this is what ``portfolio-deadline`` spawns as a subprocess.
-    """
-    seed, _ = runner.seed_for(
-        f"{args.n}-{args.k}-{args.beta_label}", "neal-500-500",
-        runner.PORTFOLIO_NEAL_SWEEPS, runner.PORTFOLIO_NEAL_READS, "portfolio-deadline",
-    )
-    record = runner.run_portfolio_deadline_arm(args.n, args.k, args.beta_label, seed)
-    out_path = Path(args.out_path)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    regime_io.atomic_write_json(out_path, record)
-    return 0 if record.get("exit_ok") else 1
-
-
-def cmd_portfolio_deadline(args: argparse.Namespace) -> int:
-    """The portfolio historical-deadline arm: every basket x beta-label combination,
-    each in a fresh subprocess under P's pinned venv, with a hard-kill safety net
-    (review finding 7). Writes ``results.json`` from committed code (review finding
-    6), never from an ad hoc command.
-    """
-    out_dir = Path(args.out_root) / "portfolio-deadline"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    # P's venv has qpo/dimod/dwave.samplers but not quip_miner_dwave or this
-    # package; the child needs both on its PYTHONPATH (task-3 report's own
-    # invocation pattern), which P's interpreter does not supply on its own.
-    child_env = {**os.environ, "PYTHONPATH": args.pythonpath}
-    records: List[Dict[str, Any]] = []
-    for n, k in runner.PORTFOLIO_DEADLINE_BASKETS:
-        for beta_label in runner.PORTFOLIO_BETA_LABELS:
-            out_path = out_dir / f"n{n}-k{k}-{beta_label}.json"
-            cmd = [
-                args.p_python, str(SCRIPT_PATH), "portfolio-deadline-run-one",
-                "--n", str(n), "--k", str(k), "--beta-label", beta_label,
-                "--out-path", str(out_path),
-            ]
-            exit_ok, wall_s = runner.run_subprocess_with_hard_deadline(
-                cmd, args.hard_deadline_s, env=child_env,
-            )
-            if out_path.exists():
-                record = json.loads(out_path.read_text(encoding="utf-8"))
-            else:
-                timed_out = wall_s >= args.hard_deadline_s
-                provenance = runner._portfolio_deadline_provenance()
-                unavailable = provenance["p_head"] is None or any(
-                    provenance["package_versions"].get(name) is None
-                    for name in ("qpo", "dimod", "dwave-samplers")
-                )
-                record = {
-                    "schema": "round2-portfolio-deadline-v1", "n_assets": n, "cardinality_k": k,
-                    "beta_label": beta_label, "provenance": runner.PORTFOLIO_PROVENANCE, "exit_ok": False,
-                    "error": (
-                        f"hard subprocess deadline exceeded ({args.hard_deadline_s:.1f}s); exit_ok={exit_ok}"
-                        if timed_out else f"child exited without writing a record; exit_ok={exit_ok}"
-                    ),
-                    "elapsed_s": wall_s, "repair_s": None, "end_to_end_s": wall_s,
-                    "status": "timeout" if timed_out else "failed",
-                    "p_head": provenance["p_head"], "package_versions": provenance["package_versions"],
-                    "provenance_error": "parent could not resolve all P provenance fields" if unavailable else None,
-                }
-                regime_io.atomic_write_json(out_path, record)
-            records.append(record)
-            print(
-                f"n={n} k={k} {beta_label}: exit_ok={record.get('exit_ok')} status={record.get('status')} "
-                f"raw_feasible_count={record.get('raw_feasible_count')} weighting_failed={record.get('weighting_failed')}"
-            )
-    results_path = out_dir / "results.json"
-    regime_io.atomic_write_json(results_path, {"records": records})
-    print(f"\nwrote {results_path}")
-    return 0
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -892,24 +798,6 @@ def build_parser() -> argparse.ArgumentParser:
     seeded.add_argument("--cells", nargs="+", default=list(DEFAULT_CELLS))
     seeded.add_argument("--models", type=int, default=5)
     seeded.set_defaults(func=cmd_seeded_sweep)
-
-    portfolio_run_one = sub.add_parser(
-        "portfolio-deadline-run-one", help="Run one basket x beta-label combination. Needs P's venv.",
-    )
-    portfolio_run_one.add_argument("--n", type=int, required=True)
-    portfolio_run_one.add_argument("--k", type=int, required=True)
-    portfolio_run_one.add_argument("--beta-label", required=True, choices=("beta-zero", "beta-nonzero"))
-    portfolio_run_one.add_argument("--out-path", required=True)
-    portfolio_run_one.set_defaults(func=cmd_portfolio_deadline_run_one)
-
-    portfolio = sub.add_parser(
-        "portfolio-deadline", help="The portfolio historical-deadline arm. Spawns subprocesses under P's venv.",
-    )
-    portfolio.add_argument("--out-root", default=str(DEFAULT_CPU_ROOT))
-    portfolio.add_argument("--p-python", default=DEFAULT_P_PYTHON)
-    portfolio.add_argument("--pythonpath", default=DEFAULT_PORTFOLIO_PYTHONPATH)
-    portfolio.add_argument("--hard-deadline-s", type=float, default=PORTFOLIO_HARD_DEADLINE_S)
-    portfolio.set_defaults(func=cmd_portfolio_deadline)
 
     return parser
 

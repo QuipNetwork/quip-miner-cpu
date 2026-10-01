@@ -42,7 +42,7 @@ import threading
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple, cast
 
 import numpy as np
 
@@ -107,10 +107,9 @@ REPETITION_TIMING_SUBSET = "timing-subset"
 def deadline_status(elapsed_s: float, deadline_s: float, exit_ok: bool) -> str:
     """"failed" / "timeout" / "completed" -- the rule the task brief pins down verbatim.
 
-    A good, late answer is a timeout, not a win: never reclassify it (the
-    design's portfolio-replication contract says exactly this about the
-    historical 10-second deadline). A bad exit is "failed" even if it would
-    have been on time -- lateness is not the only way a run can fail.
+    A good, late answer is a timeout, not a win: never reclassify it. A bad
+    exit is "failed" even if it would have been on time -- lateness is not
+    the only way a run can fail.
     """
     if not exit_ok:
         return "failed"
@@ -1082,9 +1081,7 @@ def run_subprocess_with_hard_deadline(
 ) -> Tuple[bool, float]:
     """Run ``cmd`` to completion, or kill its whole process group after ``hard_deadline_s``.
 
-    Crash protection only, shared by the CPU-job and portfolio-deadline-arm
-    subprocess wrappers (task brief, step 5, and step 6's "a real subprocess
-    deadline, with timeout and cleanup, like the CPU arms"). Returns
+    Crash protection only for CPU-job subprocesses. Returns
     ``(exit_ok, wall_s)`` -- ``exit_ok`` is only ever the process's own exit
     code, never an application-level judgment about the answer it produced.
 
@@ -1403,184 +1400,6 @@ def estimate_campaign(
         "estimated_wall_hours": total_core_s / workers / 3600.0,
     }
 
-
-# ------------------------------------------------------- portfolio deadline arm
-
-#: The historical portfolio SA deadline (design's "Portfolio replication contract").
-PORTFOLIO_DEADLINE_S = 10.0
-#: The reference provider's own settings (design: "500 reads and 500 sweeps, as specified
-#: by the reference provider").
-PORTFOLIO_NEAL_READS = 500
-PORTFOLIO_NEAL_SWEEPS = 500
-#: The 18- and 28-asset baskets the design's initial campaign proposal and Task 3's
-#: fixtures already share (``scripts/portfolio_replication.py``'s ``FIXTURES``).
-PORTFOLIO_DEADLINE_BASKETS: Tuple[Tuple[int, int], ...] = ((18, 6), (28, 9))
-PORTFOLIO_BETA_LABELS: Tuple[str, ...] = ("beta-zero", "beta-nonzero")
-#: This arm's instance source: a synthetic, deterministically-seeded portfolio, never
-#: a captured historical or production one (review finding I5: the report must never
-#: call this arm "historical").
-PORTFOLIO_PROVENANCE = "synthetic-test"
-
-
-def build_portfolio_deadline_problem(n: int, k: int, beta_label: str) -> Any:
-    """One in-memory ``qpo.problem.PortfolioProblem`` for the deadline arm.
-
-    Requires P's pinned environment (``qpo``) on the path; import
-    :mod:`quip_miner_dwave.portfolio_replication` lazily, and run this only
-    under P's interpreter (see the module docstring / task-8 report for the
-    exact invocation). Never persisted as a Round 2 bundle: Task 3's fixture
-    contract has no "beta zero" mode at 18 or 28 assets (both are above
-    ``qpo.config.CARDINALITY_BETA_N_MIN``, so its own ramps are never zero
-    there), and this arm does not need a persisted bundle -- it scores
-    directly against a freshly-built ``PortfolioProblem``, the same
-    deterministic, seeded synthetic instance Task 3's own fixture script
-    builds (``synthetic_one_factor_problem(n, k, seed=n)``).
-    """
-    from quip_miner_dwave import portfolio_replication as pr
-
-    if beta_label not in PORTFOLIO_BETA_LABELS:
-        raise ValueError(f"beta_label must be one of {PORTFOLIO_BETA_LABELS}, got {beta_label!r}")
-    problem = pr.synthetic_one_factor_problem(n, k, seed=n)
-    problem.frustration_beta = 0.0 if beta_label == "beta-zero" else pr.repository_default_beta(problem)
-    problem.invalidate_cache()
-    return problem
-
-
-def _portfolio_deadline_provenance() -> Dict[str, Any]:
-    """P's HEAD commit and the versions of the packages this arm imports.
-
-    Degrades to ``None``s rather than raising, like :func:`solver_identity`:
-    provenance-gathering must never crash an otherwise-successful, or
-    otherwise-failing, run. Not gated on any tree being clean -- unlike a
-    fixture bundle's own manifest (``portfolio_replication.export_provenance``),
-    this arm builds nothing that must be reproduced bit-for-bit from a
-    committed checkout; it only needs to name, on every record, exactly what
-    ran it (review finding I5).
-    """
-    import importlib.metadata
-
-    p_head: Optional[str] = None
-    try:
-        import qpo  # pyright: ignore[reportMissingImports]
-
-        if qpo.__file__ is not None:
-            p_root = Path(qpo.__file__).resolve().parents[2]
-            head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=p_root, capture_output=True, text=True)
-            if head.returncode == 0:
-                p_head = head.stdout.strip()
-    except Exception:
-        p_head = None
-    versions: Dict[str, Optional[str]] = {}
-    for name in ("qpo", "dimod", "dwave-samplers"):
-        try:
-            versions[name] = importlib.metadata.version(name)
-        except importlib.metadata.PackageNotFoundError:
-            versions[name] = None
-    return {"p_head": p_head, "package_versions": versions}
-
-
-def run_portfolio_deadline_arm(n: int, k: int, beta_label: str, seed: int) -> Dict[str, Any]:
-    """The historical-settings neal arm (500 reads / 500 sweeps) under the 10 s application deadline.
-
-    dwave-neal (``dwave.samplers.SimulatedAnnealingSampler``) has no internal
-    deadline concept at all -- "the reference SA provider itself does not
-    enforce it" (design's portfolio-replication contract) -- so this is the
-    orchestration that contract calls for: run to completion, never killed
-    at 10 seconds, classify with :func:`deadline_status` from the measured
-    END-TO-END time (sampling plus P's own repair and weighting, review
-    finding I5 -- a slow repair phase must be able to push a run late even
-    when sampling alone was fast), and KEEP a late-but-good record for
-    diagnosis rather than reclassify it as an on-time win. The instance is
-    always synthetic (``PORTFOLIO_PROVENANCE``), never a captured historical
-    one; every record says so. Requires P's pinned environment.
-    """
-    import dimod
-    from dwave.samplers import SimulatedAnnealingSampler
-
-    from quip_miner_dwave import portfolio_replication as pr
-
-    problem = build_portfolio_deadline_problem(n, k, beta_label)
-    qubo, _h, _edges, _j, _offset = pr.encode_to_ising(problem)
-    bqm = dimod.BinaryQuadraticModel.from_qubo(qubo.to_dict())
-    sampler = SimulatedAnnealingSampler()
-
-    # dwave-neal's seed must fit a SIGNED 32-bit int, 0 to 2**31 - 1: verified directly
-    # (its own error message claims "0 and 2^32 - 1", which is wrong -- 2**31 itself,
-    # and every value up to 2**32 - 1, is rejected). quip_msa's own seeds (what
-    # seed_for() produces) can be up to 63 bits. The value actually used is what gets
-    # recorded, so the record always reflects what really seeded the reference sampler.
-    neal_seed = seed % (1 << 31)
-
-    t_start = time.perf_counter()
-    exit_ok = True
-    error: Optional[str] = None
-    response = None
-    try:
-        response = sampler.sample(
-            bqm, num_reads=PORTFOLIO_NEAL_READS, num_sweeps=PORTFOLIO_NEAL_SWEEPS, seed=neal_seed
-        )
-    except Exception as exc:  # a real, observed failure of the reference sampler
-        exit_ok = False
-        error = f"{type(exc).__name__}: {exc}"
-    sampling_s = time.perf_counter() - t_start
-
-    repair_s: Optional[float] = None
-    extra: Dict[str, Any] = {}
-    if response is not None:
-        t_repair_start = time.perf_counter()
-        column = {var: idx for idx, var in enumerate(response.variables)}
-        order = [column[i] for i in range(qubo.n)]
-        bits = np.asarray(response.record.sample, dtype=np.float64)[:, order]
-        spins = bits * 2.0 - 1.0
-        scored = pr.score_reads(problem, qubo, spins)
-        extra["objective"] = float(scored["objective"])
-        extra["feasible"] = bool(scored["feasible"])
-        extra["raw_feasible_count"] = scored["raw_feasible_count"]
-        extra["returned_reads"] = int(scored["returned_reads"])
-
-        # "feasible" above comes entirely from P's own repair and weighting; a raw read
-        # rarely satisfies the cardinality constraint on its own (raw_feasible_count is
-        # commonly 0). Report the WINNING read's own weighting status too, so a reader
-        # never mistakes a repaired-feasible answer for a raw one (review finding 6).
-        # weighting_failed is P's own tri-state: None means "not observed to fail,"
-        # never "succeeded" -- an unknown weighting result is recorded as unknown.
-        diagnostics = pr.per_read_diagnostics(problem, spins)
-        selected_bits = np.asarray(scored["selected_bits"], dtype=np.int8)
-        match = np.all(bits.astype(np.int8) == selected_bits, axis=1)
-        if match.any():
-            selected_record = diagnostics["records"][int(np.argmax(match))]
-            extra["weighting_failed"] = selected_record["weighting_failed"]
-            extra["selected_raw_cardinality"] = selected_record["raw_cardinality"]
-        else:
-            # Should not happen (selected_bits always comes from one of the input
-            # reads); recorded as unknown rather than silently assumed one way or
-            # the other if it ever does.
-            extra["weighting_failed"] = None
-            extra["selected_raw_cardinality"] = None
-        repair_s = time.perf_counter() - t_repair_start
-
-    end_to_end_s = time.perf_counter() - t_start
-    provenance = _portfolio_deadline_provenance()  # bookkeeping only; excluded from the timed budget above
-    record: Dict[str, Any] = {
-        "schema": "round2-portfolio-deadline-v1",
-        "n_assets": n, "cardinality_k": k, "beta_label": beta_label,
-        "frustration_beta": float(problem.frustration_beta),
-        "reads": PORTFOLIO_NEAL_READS, "sweeps": PORTFOLIO_NEAL_SWEEPS, "seed": neal_seed,
-        "deadline_s": PORTFOLIO_DEADLINE_S,
-        "provenance": PORTFOLIO_PROVENANCE,
-        "elapsed_s": sampling_s,
-        "repair_s": repair_s,
-        "end_to_end_s": end_to_end_s,
-        "exit_ok": exit_ok,
-        "error": error,
-        "p_head": provenance["p_head"],
-        "package_versions": provenance["package_versions"],
-        "status": deadline_status(end_to_end_s, PORTFOLIO_DEADLINE_S, exit_ok),
-    }
-    record.update(extra)
-    return record
-
-
 # ---------------------------------------------------- seeded/cold weighted MSA (step 9)
 
 
@@ -1719,8 +1538,6 @@ def execute_seeded_sweep_job(
     hot, cold = beta_range
     seeded_start_beta = math.sqrt(hot * cold)
     cold_start_beta = hot  # the unseeded call's own default: the full ladder starts hot.
-    seeded_beta_ladder = np.geomspace(seeded_start_beta, cold, sweeps)
-    cold_beta_ladder = np.geomspace(cold_start_beta, cold, sweeps)
     record: Dict[str, Any] = {
         "schema": "round2-seeded-sweep-v2",
         "cell": cell, "nonce": nonce, "model_hash": manifest["hash"], "seed_source": seed_source,
@@ -1730,7 +1547,7 @@ def execute_seeded_sweep_job(
         "unique_seed_lanes": lanes["unique_lanes"], "duplicate_seed_lanes": lanes["duplicate_lanes"],
         "beta_range": [float(hot), float(cold)],
         "seeded_start_beta": float(seeded_start_beta), "cold_start_beta": float(cold_start_beta),
-        "seeded_beta_ladder": seeded_beta_ladder.tolist(), "cold_beta_ladder": cold_beta_ladder.tolist(),
+        "seeded_beta_ladder": None, "cold_beta_ladder": None,
         "solver_identity": identity, "run_key": run_key,
     }
 
@@ -1763,6 +1580,9 @@ def execute_seeded_sweep_job(
     cold_energies = rescored[SEED_LANES:]
     record.update(
         unsupported=False, unsupported_reason=None, exit_ok=True, error=None,
+        # The read-only companion stub predates the new binding metadata key.
+        seeded_beta_ladder=cast(Dict[str, Any], seeded_meta)["beta_ladder"],
+        cold_beta_ladder=cast(Dict[str, Any], cold_meta)["beta_ladder"],
         observed_kernel="cpu-msa-f64", representation=seeded_meta["representation"],
         best_seeded_energy=float(seeded_energies.min()), best_cold_energy=float(cold_energies.min()),
         unique_reads=int(len(np.unique(spins, axis=0))),

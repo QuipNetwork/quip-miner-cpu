@@ -16,7 +16,10 @@
 //! `Δ = -2 s_i (h_i + Σ_j J_ij s_j)`. The neighbour sum is accumulated per
 //! lane by adding `J_ij` with its sign bit flipped where the neighbour's lane
 //! bit is set (bit set means `s = -1`). Multiplying by `±1` is exact, so this
-//! is the same value the scalar kernel's `J * s` produces, in the same order.
+//! matches a from-scratch [`crate::sampler_core::effective_field`]
+//! recomputation for the same CSR neighbour order. The scalar hot loop instead
+//! reads an incrementally updated field cache, which can drift from that
+//! recomputation due to IEEE rounding.
 //! A lane accepts when `Δ ≤ 0`, or when `ln u < -β Δ` for one uniform `u`
 //! drawn per node visit. Accepted lanes come back as a mask and the flip is
 //! one XOR into the node's word.
@@ -52,7 +55,9 @@ use rand::{Rng, SeedableRng};
 use crate::coloring::Coloring;
 use crate::sa_msc::{MscState, LANES};
 use crate::sa_sampler::{read_rng, SeededStart};
-use crate::sampler_core::{build_beta_schedule, build_seeded_beta_schedule, CpuGraph};
+use crate::sampler_core::{
+    build_beta_schedule, build_seeded_beta_schedule, effective_sweeps_per_beta, CpuGraph,
+};
 use crate::{DEFAULT_MAX_EDGES, DEFAULT_MAX_NODES};
 
 /// Most reads one call may ask for.
@@ -112,8 +117,13 @@ pub(crate) struct FloatMsaSamples {
     pub(crate) energies: Vec<f64>,
     /// How many leading reads started from a supplied state.
     pub(crate) seeded_reads: usize,
-    /// Workspace the run allocated, as counted against the cap.
+    /// Estimated persistent workspace counted against [`WORKSPACE_CAP_BYTES`].
+    /// It excludes caller-owned arrays, validation-pair vectors, the beta
+    /// ladder, CSR/coloring construction buffers, seeded lane-reference
+    /// vectors, and vector headers for states and output rows.
     pub(crate) workspace_bytes: usize,
+    /// Exact beta values, in order, that this run annealed with.
+    pub(crate) beta_ladder: Vec<f64>,
 }
 
 /// `Σ h_i s_i + Σ_k J_k s_u s_v` in float64, in node then edge order.
@@ -348,7 +358,15 @@ pub(crate) fn sample_float_msa(
     }
 
     if params.num_sweeps > 0 {
-        anneal(&cpu, &colors, &plan.betas, params, &mut states, cancel)?;
+        anneal(
+            &cpu,
+            &colors,
+            &plan.betas,
+            params,
+            &mut states,
+            cancel,
+            || {},
+        )?;
     }
 
     let mut spins = Vec::with_capacity(reads);
@@ -366,6 +384,7 @@ pub(crate) fn sample_float_msa(
         energies,
         seeded_reads: seeds.len(),
         workspace_bytes: plan.workspace_bytes,
+        beta_ladder: plan.betas,
     })
 }
 
@@ -378,8 +397,9 @@ fn anneal(
     params: &SampleParams,
     states: &mut [MscState],
     cancel: Option<(&CancelToken, Option<u64>)>,
+    mut after_sweep: impl FnMut(),
 ) -> Result<(), FloatMsaError> {
-    let sweeps_per = params.sweeps_per_beta.max(1);
+    let sweeps_per = effective_sweeps_per_beta(params.num_sweeps, params.sweeps_per_beta);
     let mut rng = SmallRng::seed_from_u64(params.seed ^ THRESHOLD_SALT);
     for &beta in betas {
         for _ in 0..sweeps_per {
@@ -399,6 +419,7 @@ fn anneal(
                     }
                 }
             }
+            after_sweep();
         }
     }
     Ok(())
@@ -408,7 +429,7 @@ fn anneal(
 ///
 /// The neighbour's lane bit, set for `s = -1`, is shifted into the coupling's
 /// sign bit. That is exactly `J * s` for `s = ±1`, accumulated in CSR order
-/// from the bias, the same association the scalar kernel uses.
+/// from the bias, as in `effective_field`'s from-scratch sum.
 #[inline]
 fn local_fields(spins: &[u64], nbrs: &[u32], coups: &[f64], bias: f64) -> [f64; LANES] {
     let mut local = [bias; LANES];
@@ -449,6 +470,7 @@ fn flip_mask(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::research::{sample_research, ResearchKernel};
     use crate::sa_sampler::SeededStart;
     use crate::sampler_core::{effective_field, CpuGraph};
     use quip_solver_core::{CancelToken, IsingGraph, SampleParams};
@@ -594,6 +616,57 @@ mod tests {
     }
 
     #[test]
+    fn one_threshold_per_node_visit_is_shared_across_replica_words() {
+        let graph = IsingGraph::new(
+            vec![0.25, -0.375, 0.5],
+            vec![0.75, -0.625, 0.5],
+            vec![(0, 1), (0, 2), (1, 2)],
+        );
+        let params = SampleParams {
+            sweeps_per_beta: 1,
+            beta_range: Some((0.05, 3.0)),
+            ..params(128, 1, 0x5A17)
+        };
+        let cpu = CpuGraph::from_base(&graph);
+        let colors = Coloring::new(&cpu);
+        let betas = build_beta_schedule(&graph, &params);
+        let sweeps_per_beta = effective_sweeps_per_beta(params.num_sweeps, params.sweeps_per_beta);
+        let mut expected: Vec<Vec<i8>> = (0..params.num_reads)
+            .step_by(LANES)
+            .flat_map(|read| {
+                let mut rng = read_rng(params.seed, read);
+                let state = MscState::random(graph.h.len(), &mut rng);
+                (0..LANES.min(params.num_reads - read)).map(move |lane| state.lane(lane))
+            })
+            .collect();
+        let mut thresholds = SmallRng::seed_from_u64(params.seed ^ THRESHOLD_SALT);
+
+        for &beta in &betas {
+            for _ in 0..sweeps_per_beta {
+                for class in colors.classes() {
+                    for &var in class {
+                        let uniform: f64 = thresholds.sample(Open01);
+                        let log_uniform = uniform.ln();
+                        for spins in &mut expected {
+                            let field = effective_field(var as usize, spins, &cpu);
+                            let delta = -2.0 * f64::from(spins[var as usize]) * field;
+                            if delta <= 0.0 || log_uniform < -beta * delta {
+                                spins[var as usize] = -spins[var as usize];
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let actual = sample_float_msa(&graph, &params, None, None).expect("valid request");
+        assert_eq!(actual.spins.len(), 128);
+        for (read, (actual, expected)) in actual.spins.iter().zip(&expected).enumerate() {
+            assert_eq!(actual, expected, "read {read}");
+        }
+    }
+
+    #[test]
     fn every_listed_read_count_returns_that_many_rows_in_seed_order() {
         let graph = weighted_graph(12, 0.5, 5);
         for reads in [1usize, 63, 64, 65, 129] {
@@ -717,6 +790,79 @@ mod tests {
             .expect_err("cancelled");
         assert_eq!(err, FloatMsaError::Cancelled);
         assert!(sample_float_msa(&graph, &params(4, 16, 1), None, Some((&token, Some(8)))).is_ok());
+    }
+
+    #[test]
+    fn cancellation_after_allocation_stops_at_a_later_sweep_checkpoint() {
+        let graph = weighted_graph(8, 0.5, 1);
+        let cpu = CpuGraph::from_base(&graph);
+        let colors = Coloring::new(&cpu);
+        let params = SampleParams {
+            sweeps_per_beta: 1,
+            ..params(64, 2, 1)
+        };
+        let mut rng = read_rng(params.seed, 0);
+        let mut states = vec![MscState::random(graph.h.len(), &mut rng)];
+        let token = CancelToken::default();
+        let mut completed_sweeps = 0;
+
+        let result = anneal(
+            &cpu,
+            &colors,
+            &[0.1, 1.0],
+            &params,
+            &mut states,
+            Some((&token, Some(7))),
+            || {
+                completed_sweeps += 1;
+                if completed_sweeps == 1 {
+                    token.cancel_through(7);
+                }
+            },
+        );
+
+        assert_eq!(result, Err(FloatMsaError::Cancelled));
+        assert_eq!(completed_sweeps, 1);
+    }
+
+    #[test]
+    fn a_seeded_local_minimum_survives_a_sweep_at_a_cold_start_beta() {
+        let graph = IsingGraph::new(vec![0.2, 0.2], vec![-1.0], vec![(0, 1)]);
+        let seeds = vec![vec![1, 1]];
+        let params = SampleParams {
+            num_reads: 1,
+            num_sweeps: 1,
+            sweeps_per_beta: 1,
+            seed: 19,
+            beta_range: Some((0.1, 10.0)),
+        };
+        let start = SeededStart {
+            spins: &seeds,
+            start_beta: Some(MAX_BETA),
+        };
+
+        let out = sample_float_msa(&graph, &params, Some(start), None).expect("valid request");
+        assert_eq!(out.spins, seeds);
+        assert_eq!(out.seeded_reads, 1);
+        let ground_state = [-1, -1];
+        assert!(out.energies[0] > energy_f64(&ground_state, &graph));
+    }
+
+    #[test]
+    fn cold_float_lanes_match_cold_unit_lanes_on_a_pm_one_model() {
+        let graph = IsingGraph::new(vec![0.0, 0.0], vec![-1.0], vec![(0, 1)]);
+        let params = SampleParams {
+            num_reads: 128,
+            num_sweeps: 1,
+            sweeps_per_beta: 1,
+            seed: 0xC01D,
+            beta_range: Some((MAX_BETA, MAX_BETA)),
+        };
+
+        let float = sample_float_msa(&graph, &params, None, None).expect("valid float request");
+        let unit = sample_research(&graph, &params, ResearchKernel::UnitMsa, None, None)
+            .expect("valid unit request");
+        assert_eq!(float.spins, unit.spins);
     }
 
     #[test]

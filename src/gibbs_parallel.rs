@@ -314,7 +314,8 @@ pub fn sample_gibbs_with(
         }
     }
     let betas = crate::sampler_core::build_beta_schedule(graph, params);
-    let sweeps_per_beta = params.sweeps_per_beta.max(1);
+    let sweeps_per_beta =
+        crate::sampler_core::effective_sweeps_per_beta(params.num_sweeps, params.sweeps_per_beta);
     let n = cpu.num_nodes();
     let num_reads = params.num_reads.max(1);
 
