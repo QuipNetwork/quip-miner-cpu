@@ -602,6 +602,57 @@ mod tests {
     }
 
     #[test]
+    fn one_threshold_per_node_visit_is_shared_across_replica_words() {
+        let graph = IsingGraph::new(
+            vec![0.25, -0.375, 0.5],
+            vec![0.75, -0.625, 0.5],
+            vec![(0, 1), (0, 2), (1, 2)],
+        );
+        let params = SampleParams {
+            sweeps_per_beta: 1,
+            beta_range: Some((0.05, 3.0)),
+            ..params(128, 1, 0x5A17)
+        };
+        let cpu = CpuGraph::from_base(&graph);
+        let colors = Coloring::new(&cpu);
+        let betas = build_beta_schedule(&graph, &params);
+        let sweeps_per_beta = effective_sweeps_per_beta(params.num_sweeps, params.sweeps_per_beta);
+        let mut expected: Vec<Vec<i8>> = (0..params.num_reads)
+            .step_by(LANES)
+            .flat_map(|read| {
+                let mut rng = read_rng(params.seed, read);
+                let state = MscState::random(graph.h.len(), &mut rng);
+                (0..LANES.min(params.num_reads - read)).map(move |lane| state.lane(lane))
+            })
+            .collect();
+        let mut thresholds = SmallRng::seed_from_u64(params.seed ^ THRESHOLD_SALT);
+
+        for &beta in &betas {
+            for _ in 0..sweeps_per_beta {
+                for class in colors.classes() {
+                    for &var in class {
+                        let uniform: f64 = thresholds.sample(Open01);
+                        let log_uniform = uniform.ln();
+                        for spins in &mut expected {
+                            let field = effective_field(var as usize, spins, &cpu);
+                            let delta = -2.0 * f64::from(spins[var as usize]) * field;
+                            if delta <= 0.0 || log_uniform < -beta * delta {
+                                spins[var as usize] = -spins[var as usize];
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let actual = sample_float_msa(&graph, &params, None, None).expect("valid request");
+        assert_eq!(actual.spins.len(), 128);
+        for (read, (actual, expected)) in actual.spins.iter().zip(&expected).enumerate() {
+            assert_eq!(actual, expected, "read {read}");
+        }
+    }
+
+    #[test]
     fn every_listed_read_count_returns_that_many_rows_in_seed_order() {
         let graph = weighted_graph(12, 0.5, 5);
         for reads in [1usize, 63, 64, 65, 129] {
