@@ -45,8 +45,8 @@ use crate::{run_stream_pump, CPU_ADAPT, DEFAULT_MAX_EDGES, DEFAULT_MAX_NODES};
 /// this backend: it isolates the acceptance-table trick from the multi-spin
 /// packing.
 pub const CPU_FSA_IDENTITY: BackendIdentity = BackendIdentity {
-    backend: "cpu",
-    algorithm: "fsa",
+    backend: quip_proto::v1::Backend::Cpu,
+    algorithm: quip_proto::v1::Algorithm::Fsa,
     max_nodes: DEFAULT_MAX_NODES,
     max_edges: DEFAULT_MAX_EDGES,
     features: &[],
@@ -60,8 +60,8 @@ pub const CPU_FSA_IDENTITY: BackendIdentity = BackendIdentity {
 /// natural read count — 64 reads cost what one read costs — so the pinned
 /// read count is two replica words rather than the scalar [`CPU_ADAPT`] range.
 pub const CPU_MSA_IDENTITY: BackendIdentity = BackendIdentity {
-    backend: "cpu",
-    algorithm: "msa",
+    backend: quip_proto::v1::Backend::Cpu,
+    algorithm: quip_proto::v1::Algorithm::Msa,
     max_nodes: DEFAULT_MAX_NODES,
     max_edges: DEFAULT_MAX_EDGES,
     features: &[],
@@ -177,7 +177,7 @@ pub enum SaVariant {
 #[derive(Debug)]
 struct CachedColoring {
     nodes: usize,
-    edges: Vec<(usize, usize)>,
+    edges: Arc<[(usize, usize)]>,
     colors: Coloring,
 }
 
@@ -1239,10 +1239,10 @@ mod tests {
 
     #[test]
     fn identities_advertise_their_algorithms() {
-        assert_eq!(CPU_FSA_IDENTITY.backend, "cpu");
-        assert_eq!(CPU_FSA_IDENTITY.algorithm, "fsa");
-        assert_eq!(CPU_MSA_IDENTITY.backend, "cpu");
-        assert_eq!(CPU_MSA_IDENTITY.algorithm, "msa");
+        assert_eq!(CPU_FSA_IDENTITY.backend, quip_proto::v1::Backend::Cpu);
+        assert_eq!(CPU_FSA_IDENTITY.algorithm, quip_proto::v1::Algorithm::Fsa);
+        assert_eq!(CPU_MSA_IDENTITY.backend, quip_proto::v1::Backend::Cpu);
+        assert_eq!(CPU_MSA_IDENTITY.algorithm, quip_proto::v1::Algorithm::Msa);
         assert_eq!(CPU_FSA_IDENTITY.adapt.min_reads, CPU_ADAPT.min_reads);
         assert_eq!(CPU_FSA_IDENTITY.adapt.min_sweeps, 64);
         assert_eq!(CPU_FSA_IDENTITY.adapt.max_sweeps, 1024);

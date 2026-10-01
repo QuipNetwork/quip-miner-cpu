@@ -81,8 +81,13 @@ async fn quip_cpu_sa_passes_conformance() {
     assert!(report.handshake_ok, "SA handshake failed");
     assert_eq!(
         report.result_job_ids().len(),
-        4,
-        "expected 4 job results (job-1, job-2, job-hash, job-sparse)"
+        5,
+        "expected 5 job results (job-1, job-2, job-hash, job-sparse, job-seeded)"
+    );
+    assert!(
+        report.result_job_ids().iter().any(|id| id == b"job-seeded"),
+        "missing result for seeded job-seeded: {:?}",
+        report.result_job_ids()
     );
     assert!(
         report.result_job_ids().iter().any(|id| id == b"job-1"),
@@ -138,8 +143,13 @@ async fn quip_cpu_gibbs_passes_conformance() {
     assert!(report.handshake_ok, "Gibbs handshake failed");
     assert_eq!(
         report.result_job_ids().len(),
-        4,
-        "expected 4 job results (job-1, job-2, job-hash, job-sparse)"
+        5,
+        "expected 5 job results (job-1, job-2, job-hash, job-sparse, job-seeded)"
+    );
+    assert!(
+        report.result_job_ids().iter().any(|id| id == b"job-seeded"),
+        "missing result for seeded job-seeded: {:?}",
+        report.result_job_ids()
     );
     assert!(report.result_job_ids().iter().any(|id| id == b"job-1"));
     assert!(report.result_job_ids().iter().any(|id| id == b"job-2"));
@@ -167,8 +177,13 @@ async fn quip_cpu_sb_passes_conformance() {
     assert!(report.handshake_ok, "SB handshake failed");
     assert_eq!(
         report.result_job_ids().len(),
-        4,
-        "expected 4 job results (job-1, job-2, job-hash, job-sparse)"
+        5,
+        "expected 5 job results (job-1, job-2, job-hash, job-sparse, job-seeded)"
+    );
+    assert!(
+        report.result_job_ids().iter().any(|id| id == b"job-seeded"),
+        "missing result for seeded job-seeded: {:?}",
+        report.result_job_ids()
     );
     assert!(report.result_job_ids().iter().any(|id| id == b"job-1"));
     assert!(report.result_job_ids().iter().any(|id| id == b"job-2"));
@@ -232,8 +247,13 @@ async fn quip_cpu_bsb_passes_conformance() {
     assert!(report.handshake_ok, "bsb handshake failed");
     assert_eq!(
         report.result_job_ids().len(),
-        4,
-        "expected 4 job results (job-1, job-2, job-hash, job-sparse)"
+        5,
+        "expected 5 job results (job-1, job-2, job-hash, job-sparse, job-seeded)"
+    );
+    assert!(
+        report.result_job_ids().iter().any(|id| id == b"job-seeded"),
+        "missing result for seeded job-seeded: {:?}",
+        report.result_job_ids()
     );
     assert!(
         report.result_job_ids().iter().any(|id| id == b"job-1"),
@@ -348,8 +368,13 @@ async fn quip_cpu_hdsb_passes_conformance() {
     assert!(report.handshake_ok, "HDSB handshake failed");
     assert_eq!(
         report.result_job_ids().len(),
-        4,
-        "expected 4 job results (job-1, job-2, job-hash, job-sparse)"
+        5,
+        "expected 5 job results (job-1, job-2, job-hash, job-sparse, job-seeded)"
+    );
+    assert!(
+        report.result_job_ids().iter().any(|id| id == b"job-seeded"),
+        "missing result for seeded job-seeded: {:?}",
+        report.result_job_ids()
     );
     assert!(
         report.result_job_ids().iter().any(|id| id == b"job-1"),
@@ -410,8 +435,13 @@ async fn quip_cpu_hbsb_passes_conformance() {
     assert!(report.handshake_ok, "HBSB handshake failed");
     assert_eq!(
         report.result_job_ids().len(),
-        4,
-        "expected 4 job results (job-1, job-2, job-hash, job-sparse)"
+        5,
+        "expected 5 job results (job-1, job-2, job-hash, job-sparse, job-seeded)"
+    );
+    assert!(
+        report.result_job_ids().iter().any(|id| id == b"job-seeded"),
+        "missing result for seeded job-seeded: {:?}",
+        report.result_job_ids()
     );
     assert!(
         report.result_job_ids().iter().any(|id| id == b"job-1"),
@@ -471,8 +501,13 @@ async fn quip_cpu_mps_passes_conformance() {
     assert!(report.handshake_ok, "mps handshake failed");
     assert_eq!(
         report.result_job_ids().len(),
-        4,
-        "expected 4 job results (job-1, job-2, job-hash, job-sparse)"
+        5,
+        "expected 5 job results (job-1, job-2, job-hash, job-sparse, job-seeded)"
+    );
+    assert!(
+        report.result_job_ids().iter().any(|id| id == b"job-seeded"),
+        "missing result for seeded job-seeded: {:?}",
+        report.result_job_ids()
     );
     assert!(report.result_job_ids().iter().any(|id| id == b"job-1"));
     assert!(report.result_job_ids().iter().any(|id| id == b"job-2"));
@@ -505,8 +540,13 @@ async fn quip_cpu_flatiron_passes_conformance() {
     assert!(report.handshake_ok, "flatiron handshake failed");
     assert_eq!(
         report.result_job_ids().len(),
-        4,
-        "expected 4 job results (job-1, job-2, job-hash, job-sparse)"
+        5,
+        "expected 5 job results (job-1, job-2, job-hash, job-sparse, job-seeded)"
+    );
+    assert!(
+        report.result_job_ids().iter().any(|id| id == b"job-seeded"),
+        "missing result for seeded job-seeded: {:?}",
+        report.result_job_ids()
     );
     assert!(report.result_job_ids().iter().any(|id| id == b"job-1"));
     assert!(report.result_job_ids().iter().any(|id| id == b"job-2"));
@@ -538,8 +578,13 @@ async fn quip_cpu_mfa_passes_conformance() {
     assert!(report.handshake_ok, "mfa handshake failed");
     assert_eq!(
         report.result_job_ids().len(),
-        4,
-        "expected 4 job results (job-1, job-2, job-hash, job-sparse)"
+        5,
+        "expected 5 job results (job-1, job-2, job-hash, job-sparse, job-seeded)"
+    );
+    assert!(
+        report.result_job_ids().iter().any(|id| id == b"job-seeded"),
+        "missing result for seeded job-seeded: {:?}",
+        report.result_job_ids()
     );
     assert!(report.result_job_ids().iter().any(|id| id == b"job-1"));
     assert!(report.result_job_ids().iter().any(|id| id == b"job-2"));

@@ -85,8 +85,8 @@ const CPU_ADAPT: AdaptBounds = AdaptBounds {
 
 /// Backend identity for `quip-cpu-sa`.
 pub const CPU_SA_IDENTITY: BackendIdentity = BackendIdentity {
-    backend: "cpu",
-    algorithm: "sa",
+    backend: quip_proto::v1::Backend::Cpu,
+    algorithm: quip_proto::v1::Algorithm::Sa,
     max_nodes: DEFAULT_MAX_NODES,
     max_edges: DEFAULT_MAX_EDGES,
     // A real multi-lane `sample_stream` override; no utilization governor.
@@ -96,8 +96,8 @@ pub const CPU_SA_IDENTITY: BackendIdentity = BackendIdentity {
 
 /// Backend identity for `quip-cpu-gibbs`.
 pub const CPU_GIBBS_IDENTITY: BackendIdentity = BackendIdentity {
-    backend: "cpu",
-    algorithm: "gibbs",
+    backend: quip_proto::v1::Backend::Cpu,
+    algorithm: quip_proto::v1::Algorithm::Gibbs,
     max_nodes: DEFAULT_MAX_NODES,
     max_edges: DEFAULT_MAX_EDGES,
     // Same capability set as `CPU_SA_IDENTITY`.

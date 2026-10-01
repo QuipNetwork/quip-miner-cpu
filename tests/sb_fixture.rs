@@ -163,7 +163,7 @@ fn observed() -> Value {
                 "algorithm": c.algorithm,
                 "h": c.graph.h,
                 "j": c.graph.j,
-                "edges": c.graph.edges,
+                "edges": &c.graph.edges[..],
                 "num_reads": c.params.num_reads,
                 "num_sweeps": c.params.num_sweeps,
                 "seed": c.params.seed,
