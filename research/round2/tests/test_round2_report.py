@@ -15,7 +15,7 @@ import json
 import math
 import re
 from pathlib import Path
-from typing import Optional
+from typing import Any, Dict, Optional
 
 import numpy as np
 import pytest
@@ -766,11 +766,30 @@ def test_depth_quality_time_table_limits_timing_subset_worker_claim_to_that_sour
     )
     text = "\n".join(lines)
 
-    assert "Of the 75 timing-subset records, 66 ran serially on CPU 10 before the switch to 14 workers." in text
+    assert "No timing-subset records were loaded." in text
+    assert "66 ran serially" not in text
     other_source = "\n".join(report.depth_quality_time_table(
         records, kernels=("cpu-sa",), depths=(512,), timing_source="pilot",
     ))
-    assert "75 timing-subset records" not in other_source
+    assert "timing-subset records" not in other_source
+
+
+def _timing_record(mode: str, workers: int, cpu: int) -> Dict[str, Any]:
+    return {"timing_mode": mode, "concurrent_workers": workers, "host": {"cpu": cpu}}
+
+
+def test_timing_subset_note_counts_the_loaded_records():
+    records = [
+        _timing_record("serial", 1, 10), _timing_record("serial", 1, 10), _timing_record("parallel", 14, 3),
+    ]
+    assert report.timing_subset_note(records) == (
+        "Of the 3 timing-subset records loaded, 2 ran serially on CPU 10 and 1 ran with 14 parallel workers. "
+    )
+    lines = report.depth_quality_time_table(
+        {"native-pm1": []}, kernels=("cpu-sa",), depths=(512,),
+        timing_records_by_cell={"native-pm1": records}, timing_source="timing-subset",
+    )
+    assert "Of the 3 timing-subset records loaded, 2 ran serially on CPU 10" in "\n".join(lines)
 
 
 def test_campaign_quality_uses_timing_subset_for_sampling_and_wall_time(tmp_path, monkeypatch):
@@ -1296,7 +1315,8 @@ def test_quality_time_figure_identifies_the_timing_subset_worker_transition():
     )
     text = " ".join(element for _, _, element in _svg_text_elements(svg))
 
-    assert "Of the 75 timing-subset records, 66 ran serially on CPU 10 before the switch to 14 workers." in text
+    assert "Of the 1 timing-subset records loaded" in text
+    assert "66 ran serially" not in text
     assert "parallel workers, one per physical core" not in text
 
 

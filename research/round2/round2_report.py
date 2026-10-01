@@ -443,6 +443,25 @@ def _timing_cell(summary: Dict[str, Any], label: str) -> str:
     return f"{fmt(info['median_wall_s'])} ({info['n']})"
 
 
+def timing_subset_note(records: Sequence[Dict[str, Any]]) -> str:
+    """How the loaded timing-subset records ran: serially or with parallel workers.
+
+    The counts come from the records themselves, so the note cannot describe a
+    dataset the report did not load.
+    """
+    if not records:
+        return "No timing-subset records were loaded. "
+    serial = [r for r in records if r.get("timing_mode") == "serial"]
+    parallel = [r for r in records if r.get("timing_mode") == "parallel"]
+    serial_cpus = sorted({str(cpu) for r in serial if (cpu := (r.get("host") or {}).get("cpu")) is not None})
+    workers = sorted({str(w) for r in parallel if (w := r.get("concurrent_workers")) is not None})
+    serial_text = f"{len(serial)} ran serially"
+    if len(serial_cpus) == 1:
+        serial_text += f" on CPU {serial_cpus[0]}"
+    parallel_text = f"{len(parallel)} ran with {' or '.join(workers) or 'an unknown number of'} parallel workers"
+    return f"Of the {len(records)} timing-subset records loaded, {serial_text} and {parallel_text}. "
+
+
 def depth_quality_time_table(
     records_by_cell: Dict[str, List[Dict[str, Any]]],
     *, kernels: Sequence[str], depths: Sequence[int], expected_per_arm: Optional[int] = None,
@@ -450,16 +469,16 @@ def depth_quality_time_table(
     timing_source: Optional[str] = None,
 ) -> List[str]:
     timing_label = timing_source or "quality run"
-    timing_host_note = (
-        "Of the 75 timing-subset records, 66 ran serially on CPU 10 before the switch to 14 workers. "
-        if timing_source == "timing-subset" else
-        "Timing records came from a loaded host with parallel workers, one per physical core. "
-    )
     quality_source_note = (
         "Best energy remains from campaign records. "
         if timing_source == "timing-subset" else "Best energy remains from the selected run. "
     )
     time_records_by_cell = timing_records_by_cell if timing_records_by_cell is not None else records_by_cell
+    timing_host_note = (
+        timing_subset_note([r for cell_records in time_records_by_cell.values() for r in cell_records])
+        if timing_source == "timing-subset" else
+        "Timing records came from a loaded host with parallel workers, one per physical core. "
+    )
     lines = [
         "## Depth, quality, and time", "",
         "Every row is one (cell, kernel, sweep-depth) arm. Energy is the primary comparison. "
@@ -1185,7 +1204,7 @@ def quality_time_figure(
             ))
 
     timing_host_note = (
-        "Of the 75 timing-subset records, 66 ran serially on CPU 10 before the switch to 14 workers. "
+        timing_subset_note(timing_records if timing_records is not None else records)
         if timing_source == "timing-subset" else
         "These timings come from a loaded host with parallel workers, one per physical core. "
     )

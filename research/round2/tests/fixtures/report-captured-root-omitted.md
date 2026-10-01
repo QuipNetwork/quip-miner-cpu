@@ -16,7 +16,7 @@ Status: draft, campaign data, incomplete. This report draws on `campaign` CPU re
 
 ## Depth, quality, and time
 
-Every row is one (cell, kernel, sweep-depth) arm. Energy is the primary comparison. Timing uses `timing-subset` records. Of the 75 timing-subset records, 66 ran serially on CPU 10 before the switch to 14 workers. For each job, its fastest successful run is its run speed. The timing columns show the median sampling and wall times across successful, supported records, regardless of host contamination or timing mode. The contaminated and parallel wall-time columns remain separate diagnostics. Best energy uses every successful record. Best energy remains from campaign records. Sampling time is `elapsed_sampling_s`. Wall time is end-to-end.
+Every row is one (cell, kernel, sweep-depth) arm. Energy is the primary comparison. Timing uses `timing-subset` records. No timing-subset records were loaded. For each job, its fastest successful run is its run speed. The timing columns show the median sampling and wall times across successful, supported records, regardless of host contamination or timing mode. The contaminated and parallel wall-time columns remain separate diagnostics. Best energy uses every successful record. Best energy remains from campaign records. Sampling time is `elapsed_sampling_s`. Wall time is end-to-end.
 
 | Cell | Kernel | Sweeps | Observed | Missing | Completed | Failed | Unsupported | Nonfinite | Median best energy | Sampling s, fastest run from timing-subset (n) | Wall s, fastest run from timing-subset (n) | Wall s, contaminated (n) | Wall s, parallel (n) |
 | -- | -- | -- | -- | -- | -- | -- | -- | -- | -- | -- | -- | -- | -- |
