@@ -1,9 +1,9 @@
 """Tests for the Round 2 controlled CPU comparison runner.
 
 Task 8 of docs/superpowers/plans/2026-09-22-regime-search-round2.md: the
-controlled CPU comparison runner, the portfolio deadline arm, and the
-five-model CPU pilot. See ``quip_miner_dwave.round2_runner`` for the module
-under test. Tests that need a solver double never call the real ``quip_msa``
+controlled CPU comparison runner and the five-model CPU pilot. See
+``quip_miner_dwave.round2_runner`` for the module under test. Tests that need
+a solver double never call the real ``quip_msa``
 kernel: they exercise the runner's own invariant checks (wrong observed
 kernel, nonfinite score, unsupported unit arm) against a scripted fake, which
 is the only way to force those specific failure paths deterministically.
@@ -942,130 +942,6 @@ def test_cpu_lite_seed_lanes_rejects_the_wrong_observed_kernel(monkeypatch):
     with pytest.raises(runner.RunnerError, match="observed"):
         runner.cpu_lite_seed_lanes(h, edges, j, seed=0)
 
-
-# ------------------------------------------------------------ portfolio deadline arm
-#
-# These need P's pinned environment (qpo, dimod, dwave.samplers) on the path, unlike
-# every other test in this file: they importorskip per-test, not at module level, so
-# the rest of the suite still runs (and does) under D's own venv, which lacks qpo.
-
-
-def test_portfolio_deadline_problem_beta_zero_and_nonzero_are_distinct():
-    pytest.importorskip("qpo")
-    zero = runner.build_portfolio_deadline_problem(18, 6, "beta-zero")
-    nonzero = runner.build_portfolio_deadline_problem(18, 6, "beta-nonzero")
-    assert zero.frustration_beta == 0.0
-    assert nonzero.frustration_beta > 0.0
-
-
-def test_portfolio_deadline_arm_masks_the_seed_to_32_bits(monkeypatch):
-    pytest.importorskip("qpo")
-    pytest.importorskip("dwave.samplers")
-    from quip_miner_dwave import portfolio_replication as pr
-
-    problem = runner.build_portfolio_deadline_problem(4, 2, "beta-zero")
-    n_vars = pr.encode_to_ising(problem)[0].n
-    captured = {}
-
-    class FakeResponse:
-        variables = list(range(n_vars))
-        record = types.SimpleNamespace(sample=np.ones((1, n_vars), dtype=np.int8))
-
-    class FakeSampler:
-        def sample(self, bqm, *, num_reads, num_sweeps, seed):
-            captured["seed"] = seed
-            captured["num_reads"] = num_reads
-            captured["num_sweeps"] = num_sweeps
-            return FakeResponse()
-
-    monkeypatch.setattr(
-        "dwave.samplers.SimulatedAnnealingSampler", lambda: FakeSampler(), raising=False,
-    )
-    huge_seed = 796362028114473239  # > 2**32 - 1; exactly what tripped this once
-    record = runner.run_portfolio_deadline_arm(4, 2, "beta-zero", huge_seed)
-    assert record["seed"] == huge_seed % (1 << 31)
-    assert 0 <= captured["seed"] < (1 << 31)
-    assert captured["num_reads"] == runner.PORTFOLIO_NEAL_READS
-    assert captured["num_sweeps"] == runner.PORTFOLIO_NEAL_SWEEPS
-
-
-def test_portfolio_deadline_arm_labels_its_provenance_as_synthetic_test(monkeypatch):
-    # review finding I5: the instance is a synthetic, deterministically-seeded
-    # portfolio, never a captured historical one -- every record must say so.
-    pytest.importorskip("qpo")
-    pytest.importorskip("dwave.samplers")
-    seed, _ = runner.seed_for("4-2-beta-zero", "neal-500-500", 500, 500, "portfolio-deadline")
-    record = runner.run_portfolio_deadline_arm(4, 2, "beta-zero", seed)
-    assert record["provenance"] == "synthetic-test"
-
-
-def test_portfolio_deadline_arm_records_p_head_and_package_versions(monkeypatch):
-    pytest.importorskip("qpo")
-    pytest.importorskip("dwave.samplers")
-    seed, _ = runner.seed_for("4-2-beta-zero", "neal-500-500", 500, 500, "portfolio-deadline")
-    record = runner.run_portfolio_deadline_arm(4, 2, "beta-zero", seed)
-    assert record["p_head"] is None or isinstance(record["p_head"], str)
-    assert record["package_versions"]["dwave-samplers"]
-    assert record["package_versions"]["dimod"]
-
-
-def test_portfolio_deadline_arm_times_repair_separately_from_sampling(monkeypatch):
-    pytest.importorskip("qpo")
-    pytest.importorskip("dwave.samplers")
-    from quip_miner_dwave import portfolio_replication as pr
-
-    problem = runner.build_portfolio_deadline_problem(4, 2, "beta-zero")
-    n_vars = pr.encode_to_ising(problem)[0].n
-
-    class FakeResponse:
-        variables = list(range(n_vars))
-        record = types.SimpleNamespace(sample=np.ones((1, n_vars), dtype=np.int8))
-
-    class FakeSampler:
-        def sample(self, bqm, *, num_reads, num_sweeps, seed):
-            return FakeResponse()
-
-    monkeypatch.setattr("dwave.samplers.SimulatedAnnealingSampler", lambda: FakeSampler(), raising=False)
-    seed, _ = runner.seed_for("4-2-beta-zero", "neal-500-500", 500, 500, "portfolio-deadline")
-    record = runner.run_portfolio_deadline_arm(4, 2, "beta-zero", seed)
-    assert record["repair_s"] is not None
-    assert record["repair_s"] >= 0.0
-    assert record["end_to_end_s"] >= record["elapsed_s"] + record["repair_s"]
-
-
-def test_portfolio_deadline_arm_status_comes_from_end_to_end_time_not_sampling_alone(monkeypatch):
-    # review finding I5: a slow repair/weighting phase must be able to push a run past
-    # the deadline even when sampling itself was fast -- status must reflect that, not
-    # silently call it a win because sampling alone was on time.
-    pytest.importorskip("qpo")
-    pytest.importorskip("dwave.samplers")
-    from quip_miner_dwave import portfolio_replication as pr
-
-    problem = runner.build_portfolio_deadline_problem(4, 2, "beta-zero")
-    n_vars = pr.encode_to_ising(problem)[0].n
-
-    class FakeResponse:
-        variables = list(range(n_vars))
-        record = types.SimpleNamespace(sample=np.ones((1, n_vars), dtype=np.int8))
-
-    class FakeSampler:
-        def sample(self, bqm, *, num_reads, num_sweeps, seed):
-            return FakeResponse()  # fast: sampling alone is nowhere near the deadline
-
-    def slow_score_reads(problem, qubo, spins):
-        time.sleep(runner.PORTFOLIO_DEADLINE_S + 0.05)
-        return real_score_reads(problem, qubo, spins)
-
-    real_score_reads = pr.score_reads
-    monkeypatch.setattr("dwave.samplers.SimulatedAnnealingSampler", lambda: FakeSampler(), raising=False)
-    monkeypatch.setattr(pr, "score_reads", slow_score_reads)
-    seed, _ = runner.seed_for("4-2-beta-zero", "neal-500-500", 500, 500, "portfolio-deadline")
-    record = runner.run_portfolio_deadline_arm(4, 2, "beta-zero", seed)
-    assert record["elapsed_s"] < runner.PORTFOLIO_DEADLINE_S
-    assert record["end_to_end_s"] > runner.PORTFOLIO_DEADLINE_S
-    assert record["status"] == "timeout"
-
-
 # ------------------------------------------------------------ hard deadline scaling
 
 
@@ -1140,18 +1016,6 @@ def test_run_subprocess_with_hard_deadline_restores_signal_handlers_afterward():
     runner.run_subprocess_with_hard_deadline([sys.executable, "-c", "pass"], hard_deadline_s=10.0)
     assert signal.getsignal(signal.SIGTERM) == previous_term
     assert signal.getsignal(signal.SIGINT) == previous_int
-def test_portfolio_deadline_arm_records_weighting_status_and_raw_feasible_count():
-    pytest.importorskip("qpo")
-    pytest.importorskip("dwave.samplers")
-    # a real, small basket, run against the real reference sampler (fast: <1s), to
-    # verify the actual weighting-status wiring against P's real implementation
-    # rather than a fake.
-    seed, _ = runner.seed_for("4-2-beta-zero", "neal-500-500", 500, 500, "portfolio-deadline")
-    record = runner.run_portfolio_deadline_arm(4, 2, "beta-zero", seed)
-    assert record["exit_ok"] is True
-    assert "weighting_failed" in record
-    assert record["weighting_failed"] in (None, True, False)
-    assert isinstance(record["raw_feasible_count"], int)
 
 
 def test_run_subprocess_with_hard_deadline_passes_a_custom_env(tmp_path):

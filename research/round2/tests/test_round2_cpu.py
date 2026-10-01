@@ -196,35 +196,6 @@ def test_fallback_record_is_crashed_no_record_when_the_child_exits_before_the_de
     record = cpu._run_one_job(job, bundles_root, out_dir, None, 0, IDENTITY, 5.0)
     assert record["killed_reason"] == "crashed_no_record"
 
-
-def test_portfolio_deadline_fallback_classifies_an_early_child_exit_as_failed_and_records_provenance(
-    tmp_path, monkeypatch,
-):
-    monkeypatch.setattr(
-        cpu.runner, "run_subprocess_with_hard_deadline",
-        lambda cmd, hard_deadline_s, **kwargs: (False, 0.01),
-    )
-    monkeypatch.setattr(
-        cpu.runner, "_portfolio_deadline_provenance",
-        lambda: {"p_head": None, "package_versions": {"qpo": None}},
-    )
-    import argparse
-
-    args = argparse.Namespace(
-        out_root=str(tmp_path / "cpu"), p_python="fake-python", pythonpath="", hard_deadline_s=5.0,
-    )
-    assert cpu.cmd_portfolio_deadline(args) == 0
-    records = [
-        json.loads(path.read_text(encoding="utf-8"))
-        for path in sorted((Path(args.out_root) / "portfolio-deadline").glob("n*-k*-*.json"))
-    ]
-    assert records
-    assert all(record["status"] == "failed" for record in records)
-    assert all(record["p_head"] is None for record in records)
-    assert all(record["package_versions"] == {"qpo": None} for record in records)
-    assert all(record["provenance_error"] for record in records)
-
-
 def test_crashed_no_record_fallback_is_never_terminal(tmp_path):
     bundles_root = tmp_path / "bundles"
     _write_bundle(bundles_root, "native-pm1", _nonce(0))
@@ -633,34 +604,6 @@ def test_seeded_sweep_resume_refuses_a_run_key_mismatch(tmp_path, monkeypatch):
 
     with pytest.raises(SystemExit, match="run key"):
         cpu.cmd_seeded_sweep(args)
-
-
-# --------------------------------------- final review, I5: portfolio-deadline hard kill
-
-
-def test_portfolio_deadline_hard_kill_in_the_parent_is_a_timeout_not_a_failure(tmp_path, monkeypatch):
-    # review finding I5: "a hard kill in the parent is recorded as timeout, not failed" --
-    # the hard deadline (300 s) always exceeds the application deadline (10 s), so by the
-    # time the parent gives up, the run was certainly already late.
-    monkeypatch.setattr(
-        cpu.runner, "run_subprocess_with_hard_deadline",
-        lambda cmd, hard_deadline_s, **kwargs: (False, hard_deadline_s),
-    )
-    import argparse
-
-    args = argparse.Namespace(
-        out_root=str(tmp_path / "cpu"), p_python="fake-python", pythonpath="", hard_deadline_s=0.01,
-    )
-    assert cpu.cmd_portfolio_deadline(args) == 0
-    record_paths = sorted((Path(args.out_root) / "portfolio-deadline").glob("n*-k*-*.json"))
-    assert record_paths
-    for record_path in record_paths:
-        record = json.loads(record_path.read_text(encoding="utf-8"))
-        assert record["status"] == "timeout"
-        assert record["exit_ok"] is False
-        assert "p_head" in record
-        assert "package_versions" in record
-
 
 def test_timing_subset_runs_on_every_named_cpu(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     # The timing subset runs on a loaded host (maintainer, 2026-09-24): it
