@@ -792,6 +792,26 @@ def test_timing_subset_note_counts_the_loaded_records():
     assert "Of the 3 timing-subset records loaded, 2 ran serially on CPU 10" in "\n".join(lines)
 
 
+def test_timing_subset_note_names_a_cpu_or_worker_count_only_when_every_record_shares_it():
+    assert report.timing_subset_note([_timing_record("serial", 1, 10), _timing_record("serial", 1, 4)]) == (
+        "Of the 2 timing-subset records loaded, 2 ran serially. "
+    )
+    missing_cpu = {"timing_mode": "serial", "concurrent_workers": 1, "host": {}}
+    assert report.timing_subset_note([_timing_record("serial", 1, 10), missing_cpu]) == (
+        "Of the 2 timing-subset records loaded, 2 ran serially. "
+    )
+    mixed_workers = [_timing_record("parallel", 14, 1), _timing_record("parallel", 8, 2)]
+    assert report.timing_subset_note(mixed_workers) == (
+        "Of the 2 timing-subset records loaded, 2 ran with parallel workers. "
+    )
+
+
+def test_timing_subset_note_counts_records_without_a_timing_mode():
+    assert report.timing_subset_note([_timing_record("serial", 1, 10), {"host": {"cpu": 3}}]) == (
+        "Of the 2 timing-subset records loaded, 1 ran serially on CPU 10 and 1 has no recorded timing mode. "
+    )
+
+
 def test_campaign_quality_uses_timing_subset_for_sampling_and_wall_time(tmp_path, monkeypatch):
     cpu_root = tmp_path / "cpu"
     campaign_dir = cpu_root / "campaign" / "native-pm1"

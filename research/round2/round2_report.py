@@ -453,13 +453,19 @@ def timing_subset_note(records: Sequence[Dict[str, Any]]) -> str:
         return "No timing-subset records were loaded. "
     serial = [r for r in records if r.get("timing_mode") == "serial"]
     parallel = [r for r in records if r.get("timing_mode") == "parallel"]
-    serial_cpus = sorted({str(cpu) for r in serial if (cpu := (r.get("host") or {}).get("cpu")) is not None})
-    workers = sorted({str(w) for r in parallel if (w := r.get("concurrent_workers")) is not None})
-    serial_text = f"{len(serial)} ran serially"
-    if len(serial_cpus) == 1:
-        serial_text += f" on CPU {serial_cpus[0]}"
-    parallel_text = f"{len(parallel)} ran with {' or '.join(workers) or 'an unknown number of'} parallel workers"
-    return f"Of the {len(records)} timing-subset records loaded, {serial_text} and {parallel_text}. "
+    unknown = len(records) - len(serial) - len(parallel)
+    parts = []
+    if serial:
+        cpus = {(r.get("host") or {}).get("cpu") for r in serial}
+        cpu = next(iter(cpus)) if len(cpus) == 1 else None
+        parts.append(f"{len(serial)} ran serially" + (f" on CPU {cpu}" if cpu is not None else ""))
+    if parallel:
+        workers = {r.get("concurrent_workers") for r in parallel}
+        count = next(iter(workers)) if len(workers) == 1 else None
+        parts.append(f"{len(parallel)} ran with " + (f"{count} " if count is not None else "") + "parallel workers")
+    if unknown:
+        parts.append(f"{unknown} {'has' if unknown == 1 else 'have'} no recorded timing mode")
+    return f"Of the {len(records)} timing-subset records loaded, {' and '.join(parts)}. "
 
 
 def depth_quality_time_table(
