@@ -508,7 +508,7 @@ pub(crate) fn sample_unit_packed(
     counts: &[u8],
     start: Option<SeededStart<'_>>,
     cancel: Option<(&CancelToken, Option<u64>)>,
-) -> Result<Vec<SamplerResult>, SampleCancelled> {
+) -> Result<(Vec<SamplerResult>, Vec<f64>), SampleCancelled> {
     let num_reads = params.num_reads.max(1);
     let betas = match start {
         Some(s) => build_seeded_beta_schedule(graph, params, s.start_beta),
@@ -516,7 +516,8 @@ pub(crate) fn sample_unit_packed(
     };
     let seeds: &[Vec<i8>] = start.map_or(&[], |s| &s.spins[..s.spins.len().min(num_reads)]);
     let colors = Coloring::new(&CpuGraph::from_base(graph));
-    anneal_packed(int, counts, &colors, &betas, params, seeds, graph, cancel)
+    let results = anneal_packed(int, counts, &colors, &betas, params, seeds, graph, cancel)?;
+    Ok((results, betas))
 }
 
 /// Per-read random stream, seeded the same way `cpu-sa` seeds its reads.

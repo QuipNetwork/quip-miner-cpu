@@ -368,7 +368,7 @@ pub(crate) fn sample_ising_cancellable(
             crate::gibbs_parallel::DEFAULT_GIBBS_WORKERS,
         ));
     }
-    sample_sa_scalar(graph, params, cancel).map(|(results, _)| results)
+    sample_sa_scalar(graph, params, cancel).map(|(results, _, _)| results)
 }
 
 /// Which arithmetic the scalar SA kernel ran a job with. The two produce
@@ -387,7 +387,7 @@ pub(crate) fn sample_sa_scalar(
     graph: &IsingGraph,
     params: &SampleParams,
     cancel: Option<(&CancelToken, Option<u64>)>,
-) -> Result<(Vec<SamplerResult>, ScalarArithmetic), SampleCancelled> {
+) -> Result<(Vec<SamplerResult>, ScalarArithmetic, Vec<f64>), SampleCancelled> {
     let num_reads = params.num_reads.max(1);
     let beta_schedule = build_beta_schedule(graph, params);
     let sweeps_per = effective_sweeps_per_beta(params.num_sweeps, params.sweeps_per_beta);
@@ -419,7 +419,7 @@ pub(crate) fn sample_sa_scalar(
         };
         results.push(score_spins(&spins, graph));
     }
-    Ok((results, arithmetic))
+    Ok((results, arithmetic, beta_schedule))
 }
 
 #[cfg(test)]

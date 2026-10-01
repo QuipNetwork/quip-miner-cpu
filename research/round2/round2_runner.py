@@ -42,7 +42,7 @@ import threading
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple, cast
 
 import numpy as np
 
@@ -1538,8 +1538,6 @@ def execute_seeded_sweep_job(
     hot, cold = beta_range
     seeded_start_beta = math.sqrt(hot * cold)
     cold_start_beta = hot  # the unseeded call's own default: the full ladder starts hot.
-    seeded_beta_ladder = np.geomspace(seeded_start_beta, cold, sweeps)
-    cold_beta_ladder = np.geomspace(cold_start_beta, cold, sweeps)
     record: Dict[str, Any] = {
         "schema": "round2-seeded-sweep-v2",
         "cell": cell, "nonce": nonce, "model_hash": manifest["hash"], "seed_source": seed_source,
@@ -1549,7 +1547,7 @@ def execute_seeded_sweep_job(
         "unique_seed_lanes": lanes["unique_lanes"], "duplicate_seed_lanes": lanes["duplicate_lanes"],
         "beta_range": [float(hot), float(cold)],
         "seeded_start_beta": float(seeded_start_beta), "cold_start_beta": float(cold_start_beta),
-        "seeded_beta_ladder": seeded_beta_ladder.tolist(), "cold_beta_ladder": cold_beta_ladder.tolist(),
+        "seeded_beta_ladder": None, "cold_beta_ladder": None,
         "solver_identity": identity, "run_key": run_key,
     }
 
@@ -1582,6 +1580,9 @@ def execute_seeded_sweep_job(
     cold_energies = rescored[SEED_LANES:]
     record.update(
         unsupported=False, unsupported_reason=None, exit_ok=True, error=None,
+        # The read-only companion stub predates the new binding metadata key.
+        seeded_beta_ladder=cast(Dict[str, Any], seeded_meta)["beta_ladder"],
+        cold_beta_ladder=cast(Dict[str, Any], cold_meta)["beta_ladder"],
         observed_kernel="cpu-msa-f64", representation=seeded_meta["representation"],
         best_seeded_energy=float(seeded_energies.min()), best_cold_energy=float(cold_energies.min()),
         unique_reads=int(len(np.unique(spins, axis=0))),

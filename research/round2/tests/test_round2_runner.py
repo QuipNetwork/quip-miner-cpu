@@ -833,8 +833,9 @@ class _SeededSweepFakeSampler:
     call the seeded schedule already shortened).
     """
 
-    def __init__(self, *, fail_on_main: bool):
+    def __init__(self, *, fail_on_main: bool, beta_ladders: dict[str, list[float]] | None = None):
         self._fail_on_main = fail_on_main
+        self._beta_ladders = beta_ladders
         self.calls: list = []
 
     def sample_research(
@@ -848,9 +849,16 @@ class _SeededSweepFakeSampler:
             raise ValueError("unexpected defect")
         spins = np.ones((num_reads, len(h)), dtype=np.int8)
         energies = regimes.energy(spins, h, edges, j)
+        ladder_start = start_beta if start_beta is not None else beta_range[0]
+        beta_ladder = (
+            self._beta_ladders["seeded" if initial_spins is not None else "cold"]
+            if self._beta_ladders is not None
+            else np.geomspace(ladder_start, beta_range[1], num_sweeps).tolist()
+        )
         meta = {
             "observed_kernel": "cpu-msa-f64", "representation": "fake", "rng_scheme": "fake",
             "seeded_reads": 0, "workspace_bytes": None,
+            "beta_ladder": beta_ladder,
         }
         return spins, energies, meta
 
@@ -861,6 +869,8 @@ def test_seeded_sweep_value_error_is_a_failure_not_unsupported(tmp_path, monkeyp
     record, samples = runner.execute_seeded_sweep_job("native-pm1", _nonce(0), tmp_path, tmp_path, "cpu-lite")
     assert record["exit_ok"] is False
     assert record["unsupported"] is False
+    assert record["seeded_beta_ladder"] is None
+    assert record["cold_beta_ladder"] is None
     assert samples is None
 
 
@@ -908,6 +918,18 @@ def test_seeded_sweep_record_carries_start_betas_solver_identity_and_run_key(tmp
     assert record["solver_identity"]["package"] == "quip_msa"
     assert record["cold_seed"] != record["seed"]
     assert isinstance(record["run_key"], str) and record["run_key"]
+
+
+def test_seeded_sweep_record_uses_ladders_returned_by_the_sampler(tmp_path, monkeypatch):
+    _write_bundle(tmp_path, "native-pm1", _nonce(0))
+    ladders = {"seeded": [1.25, 1.75], "cold": [3.5, 4.5]}
+    sampler = _SeededSweepFakeSampler(fail_on_main=False, beta_ladders=ladders)
+    monkeypatch.setattr(runner, "_msa", lambda: _fake_msa_module(sampler))
+
+    record, _samples = runner.execute_seeded_sweep_job("native-pm1", _nonce(0), tmp_path, tmp_path, "cpu-lite")
+
+    assert record["seeded_beta_ladder"] == ladders["seeded"]
+    assert record["cold_beta_ladder"] == ladders["cold"]
 
 
 def test_seeded_sweep_schema_is_versioned_v2(tmp_path, monkeypatch):

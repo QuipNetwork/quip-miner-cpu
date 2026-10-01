@@ -69,6 +69,8 @@ def test_every_accepted_kernel_reports_its_own_identity():
         assert meta["observed_kernel"] == kernel
         assert meta["representation"] == expected_representation[kernel]
         assert isinstance(meta["rng_scheme"], str) and meta["rng_scheme"]
+        assert isinstance(meta["beta_ladder"], list) and len(meta["beta_ladder"]) == 16
+        assert all(isinstance(beta, float) for beta in meta["beta_ladder"])
         assert meta["seeded_reads"] == 0
         if kernel == "cpu-msa-f64":
             assert isinstance(meta["workspace_bytes"], int) and meta["workspace_bytes"] > 0

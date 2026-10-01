@@ -122,6 +122,8 @@ pub(crate) struct FloatMsaSamples {
     /// ladder, CSR/coloring construction buffers, seeded lane-reference
     /// vectors, and vector headers for states and output rows.
     pub(crate) workspace_bytes: usize,
+    /// Exact beta values, in order, that this run annealed with.
+    pub(crate) beta_ladder: Vec<f64>,
 }
 
 /// `Σ h_i s_i + Σ_k J_k s_u s_v` in float64, in node then edge order.
@@ -382,6 +384,7 @@ pub(crate) fn sample_float_msa(
         energies,
         seeded_reads: seeds.len(),
         workspace_bytes: plan.workspace_bytes,
+        beta_ladder: plan.betas,
     })
 }
 
