@@ -356,7 +356,15 @@ pub(crate) fn sample_float_msa(
     }
 
     if params.num_sweeps > 0 {
-        anneal(&cpu, &colors, &plan.betas, params, &mut states, cancel)?;
+        anneal(
+            &cpu,
+            &colors,
+            &plan.betas,
+            params,
+            &mut states,
+            cancel,
+            || {},
+        )?;
     }
 
     let mut spins = Vec::with_capacity(reads);
@@ -386,6 +394,7 @@ fn anneal(
     params: &SampleParams,
     states: &mut [MscState],
     cancel: Option<(&CancelToken, Option<u64>)>,
+    mut after_sweep: impl FnMut(),
 ) -> Result<(), FloatMsaError> {
     let sweeps_per = effective_sweeps_per_beta(params.num_sweeps, params.sweeps_per_beta);
     let mut rng = SmallRng::seed_from_u64(params.seed ^ THRESHOLD_SALT);
@@ -407,6 +416,7 @@ fn anneal(
                     }
                 }
             }
+            after_sweep();
         }
     }
     Ok(())
@@ -457,6 +467,7 @@ fn flip_mask(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::research::{sample_research, ResearchKernel};
     use crate::sa_sampler::SeededStart;
     use crate::sampler_core::{effective_field, CpuGraph};
     use quip_solver_core::{CancelToken, IsingGraph, SampleParams};
@@ -776,6 +787,79 @@ mod tests {
             .expect_err("cancelled");
         assert_eq!(err, FloatMsaError::Cancelled);
         assert!(sample_float_msa(&graph, &params(4, 16, 1), None, Some((&token, Some(8)))).is_ok());
+    }
+
+    #[test]
+    fn cancellation_after_allocation_stops_at_a_later_sweep_checkpoint() {
+        let graph = weighted_graph(8, 0.5, 1);
+        let cpu = CpuGraph::from_base(&graph);
+        let colors = Coloring::new(&cpu);
+        let params = SampleParams {
+            sweeps_per_beta: 1,
+            ..params(64, 2, 1)
+        };
+        let mut rng = read_rng(params.seed, 0);
+        let mut states = vec![MscState::random(graph.h.len(), &mut rng)];
+        let token = CancelToken::default();
+        let mut completed_sweeps = 0;
+
+        let result = anneal(
+            &cpu,
+            &colors,
+            &[0.1, 1.0],
+            &params,
+            &mut states,
+            Some((&token, Some(7))),
+            || {
+                completed_sweeps += 1;
+                if completed_sweeps == 1 {
+                    token.cancel_through(7);
+                }
+            },
+        );
+
+        assert_eq!(result, Err(FloatMsaError::Cancelled));
+        assert_eq!(completed_sweeps, 1);
+    }
+
+    #[test]
+    fn a_seeded_local_minimum_survives_a_sweep_at_a_cold_start_beta() {
+        let graph = IsingGraph::new(vec![0.2, 0.2], vec![-1.0], vec![(0, 1)]);
+        let seeds = vec![vec![1, 1]];
+        let params = SampleParams {
+            num_reads: 1,
+            num_sweeps: 1,
+            sweeps_per_beta: 1,
+            seed: 19,
+            beta_range: Some((0.1, 10.0)),
+        };
+        let start = SeededStart {
+            spins: &seeds,
+            start_beta: Some(MAX_BETA),
+        };
+
+        let out = sample_float_msa(&graph, &params, Some(start), None).expect("valid request");
+        assert_eq!(out.spins, seeds);
+        assert_eq!(out.seeded_reads, 1);
+        let ground_state = [-1, -1];
+        assert!(out.energies[0] > energy_f64(&ground_state, &graph));
+    }
+
+    #[test]
+    fn cold_float_lanes_match_cold_unit_lanes_on_a_pm_one_model() {
+        let graph = IsingGraph::new(vec![0.0, 0.0], vec![-1.0], vec![(0, 1)]);
+        let params = SampleParams {
+            num_reads: 128,
+            num_sweeps: 1,
+            sweeps_per_beta: 1,
+            seed: 0xC01D,
+            beta_range: Some((MAX_BETA, MAX_BETA)),
+        };
+
+        let float = sample_float_msa(&graph, &params, None, None).expect("valid float request");
+        let unit = sample_research(&graph, &params, ResearchKernel::UnitMsa, None, None)
+            .expect("valid unit request");
+        assert_eq!(float.spins, unit.spins);
     }
 
     #[test]
