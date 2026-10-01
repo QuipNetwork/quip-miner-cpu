@@ -16,7 +16,10 @@
 //! `Δ = -2 s_i (h_i + Σ_j J_ij s_j)`. The neighbour sum is accumulated per
 //! lane by adding `J_ij` with its sign bit flipped where the neighbour's lane
 //! bit is set (bit set means `s = -1`). Multiplying by `±1` is exact, so this
-//! is the same value the scalar kernel's `J * s` produces, in the same order.
+//! matches a from-scratch [`crate::sampler_core::effective_field`]
+//! recomputation for the same CSR neighbour order. The scalar hot loop instead
+//! reads an incrementally updated field cache, which can drift from that
+//! recomputation due to IEEE rounding.
 //! A lane accepts when `Δ ≤ 0`, or when `ln u < -β Δ` for one uniform `u`
 //! drawn per node visit. Accepted lanes come back as a mask and the flip is
 //! one XOR into the node's word.
@@ -112,7 +115,10 @@ pub(crate) struct FloatMsaSamples {
     pub(crate) energies: Vec<f64>,
     /// How many leading reads started from a supplied state.
     pub(crate) seeded_reads: usize,
-    /// Workspace the run allocated, as counted against the cap.
+    /// Estimated persistent workspace counted against [`WORKSPACE_CAP_BYTES`].
+    /// It excludes caller-owned arrays, validation-pair vectors, the beta
+    /// ladder, CSR/coloring construction buffers, seeded lane-reference
+    /// vectors, and vector headers for states and output rows.
     pub(crate) workspace_bytes: usize,
 }
 
@@ -408,7 +414,7 @@ fn anneal(
 ///
 /// The neighbour's lane bit, set for `s = -1`, is shifted into the coupling's
 /// sign bit. That is exactly `J * s` for `s = ±1`, accumulated in CSR order
-/// from the bias, the same association the scalar kernel uses.
+/// from the bias, as in `effective_field`'s from-scratch sum.
 #[inline]
 fn local_fields(spins: &[u64], nbrs: &[u32], coups: &[f64], bias: f64) -> [f64; LANES] {
     let mut local = [bias; LANES];

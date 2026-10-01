@@ -76,8 +76,11 @@ pub struct ResearchMetadata {
     pub rng_scheme: &'static str,
     /// Leading reads that started from a supplied state.
     pub seeded_reads: usize,
-    /// Workspace the kernel counted against its cap. Only the float kernel
-    /// counts; the others report `None`, not zero.
+    /// Estimated persistent workspace counted against the float kernel's cap.
+    /// It excludes caller-owned arrays, validation-pair vectors, the beta
+    /// ladder, CSR/coloring construction buffers, seeded lane-reference
+    /// vectors, and vector headers for states and output rows. Other kernels
+    /// report `None`, not zero.
     pub workspace_bytes: Option<usize>,
 }
 
