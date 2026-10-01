@@ -661,6 +661,32 @@ def test_next_test_section_counts_only_supported_kernels():
     assert "cpu-msa-unit" not in row
 
 
+def test_next_test_section_counts_finite_uncontaminated_records():
+    clean = _cpu_record("native-pm1", "clean", "cpu-sa", 512)
+    contaminated = {
+        **_cpu_record("native-pm1", "contaminated", "cpu-sa", 512),
+        "host": {"contaminated": True},
+    }
+    parallel = {
+        **_cpu_record("native-pm1", "parallel", "cpu-sa", 512),
+        "timing_mode": "parallel",
+        "host": {"contaminated": False},
+    }
+    nonfinite = _cpu_record("native-pm1", "nonfinite", "cpu-sa", 512, best_energy=float("nan"))
+    records = {
+        "native-pm1": [
+            clean, contaminated, parallel, nonfinite,
+            _cpu_record("native-pm1", "failed", "cpu-sa", 512, exit_ok=False),
+            _cpu_record("native-pm1", "unsupported", "cpu-sa", 512, unsupported=True),
+        ],
+    }
+
+    lines = report.next_test_section(["native-pm1"], records, None, "pilot")
+    row = next(line for line in lines if line.startswith("| `native-pm1` |"))
+
+    assert "Clean, finite CPU timing/quality records: 2 across 1 kernel (`cpu-sa`)" in row
+
+
 def test_next_test_section_does_not_count_the_derived_router_as_an_extra_measurement():
     measured = [
         _cpu_record("native-pm1", "a", "cpu-sa", 512),
@@ -673,7 +699,7 @@ def test_next_test_section_does_not_count_the_derived_router_as_an_extra_measure
     )
     row = next(line for line in lines if line.startswith("| `native-pm1` |"))
 
-    assert "2 completed CPU timing/quality records across 2 kernels" in row
+    assert "Clean, finite CPU timing/quality records: 2 across 2 kernels" in row
 
 
 def test_next_test_section_campaign_cell_with_no_capture_says_the_campaign_is_done():
@@ -968,6 +994,26 @@ def test_main_labels_the_header_with_the_run_actually_loaded(tmp_path, monkeypat
     assert "pilot data" not in draft
 
 
+def test_main_header_does_not_claim_qpu_comparisons_without_capture_data(tmp_path, monkeypatch):
+    cpu_root = tmp_path / "cpu"
+    (cpu_root / "campaign" / "native-pm1").mkdir(parents=True)
+    out_dir = tmp_path / "report"
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "round2_report.py", "--cpu-root", str(cpu_root), "--run", "campaign",
+            "--out-dir", str(out_dir), "--cells", "native-pm1",
+        ],
+    )
+
+    assert report.main() == 0
+    header = (out_dir / "REPORT.md").read_text(encoding="utf-8").split("\n## ", 1)[0]
+
+    assert "No Round 2 QPU capture is loaded" in header
+    assert "QPU pilot has" not in header
+    assert "See the QPU wins/ties/losses" not in header
+
+
 def test_main_computes_a_real_missing_count_from_the_run_type(tmp_path, monkeypatch):
     cpu_root = tmp_path / "cpu"
     cell_dir = cpu_root / "pilot" / "native-pm1"
@@ -1259,6 +1305,19 @@ def test_axis_ticks_always_includes_both_endpoints():
     assert ticks[0] == 0.0
     assert ticks[-1] == 8.0
     assert len(ticks) == 5
+
+
+def test_axis_ticks_use_nice_steps_and_cover_the_requested_range():
+    low, high = 1.1, 9.2
+    ticks = report._axis_ticks(low, high, count=5)
+
+    assert len(ticks) >= 3
+    assert ticks[0] <= low
+    assert ticks[-1] >= high
+    step = ticks[1] - ticks[0]
+    exponent = math.floor(math.log10(step))
+    normalized_step = step / 10 ** exponent
+    assert any(math.isclose(normalized_step, nice) for nice in (1.0, 2.0, 2.5, 5.0, 10.0))
 
 
 def test_physical_scale_figure_subtitle_wraps_within_the_canvas():

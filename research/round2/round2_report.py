@@ -791,8 +791,8 @@ def matched_runtime_table(
     results = matched_runtime_comparison(captures, cpu_records, kernels)
     lead = source_description or (
         "QPU time is charged access time for 64 reads, with end-to-end time also shown. CPU time is sampling "
-        "time for 64 reads from the campaign, using the fastest successful attempt on a loaded host with "
-        "parallel workers. Energy outcomes use the same strict, numeric-tolerance, and material rules as "
+        "time for 64 reads from the campaign, using the fastest successful attempt. "
+        "Energy outcomes use the same strict, numeric-tolerance, and material rules as "
         "the equal-sweep tables. Equal budget uses the deepest CPU depth completed within that capture's "
         "access-time budget. Time to QPU energy uses the quickest CPU depth that reached the capture's best energy."
     )
@@ -950,14 +950,24 @@ def next_test_section(
     for cell in cells:
         records = records_by_cell.get(cell, [])
         measured_records = [r for r in records if r.get("requested_kernel") != "cpu-msa"]
+        clean_finite_records = []
+        for record in measured_records:
+            if (
+                not record.get("exit_ok") or record.get("unsupported")
+                or _finite_float(record.get("best_energy")) is None
+                or bool((record.get("host") or {}).get("contaminated"))
+            ):
+                continue
+            # Parallel mode is a timing label, not a quality failure.
+            clean_finite_records.append(record)
         kernels = sorted({
-            str(k) for r in measured_records
-            if r.get("exit_ok") and not r.get("unsupported")
-            and (k := r.get("requested_kernel")) is not None
+            str(k) for r in clean_finite_records
+            if (k := r.get("requested_kernel")) is not None
         })
-        completed = sum(1 for r in measured_records if r.get("exit_ok") and not r.get("unsupported"))
+        kernel_count = len(kernels)
         established = (
-            f"{completed} completed CPU timing/quality records across {len(kernels)} kernels "
+            f"Clean, finite CPU timing/quality records: {len(clean_finite_records)} across "
+            f"{kernel_count} kernel{'s' if kernel_count != 1 else ''} "
             f"({', '.join(f'`{k}`' for k in kernels) or 'none yet'}) from the {run} run."
         )
         if cell in captured:
@@ -1063,15 +1073,28 @@ def _pad_range(low: float, high: float, fraction: float = 0.12) -> Tuple[float, 
 
 
 def _axis_ticks(low: float, high: float, count: int = 5) -> List[float]:
-    """``count`` evenly spaced values from ``low`` to ``high``, inclusive of both
-    endpoints (fix round 2: "the y axis shows only two end ticks" -- a chart
-    with only its extremes labeled cannot show a reader anything about the
-    values between them).
+    """Nice tick positions that cover the range, using steps of 1, 2, 2.5, or 5
+    times a power of ten. The values use axis coordinates, so log axes round in
+    log space before converting labels back to the data scale.
     """
-    if count < 2 or high <= low:
-        return [low, high]
-    step = (high - low) / (count - 1)
-    return [low + i * step for i in range(count)]
+    if high < low:
+        low, high = high, low
+    elif high == low:
+        padding = max(abs(low), 1.0) * 0.12
+        low, high = low - padding, high + padding
+    count = max(count, 3)
+    rough_step = (high - low) / (count - 1)
+    magnitude = 10.0 ** math.floor(math.log10(rough_step))
+    step = next(
+        multiple * magnitude
+        for multiple in (1.0, 2.0, 2.5, 5.0, 10.0)
+        if multiple * magnitude >= rough_step
+    )
+    start = math.floor(low / step + 1e-12) * step
+    end = math.ceil(high / step - 1e-12) * step
+    intervals = int(round((end - start) / step))
+    ticks = [start + i * step for i in range(intervals + 1)]
+    return [0.0 if math.isclose(tick, 0.0, abs_tol=step * 1e-12) else tick for tick in ticks]
 
 
 def _tick_text(value: float) -> str:
@@ -1208,6 +1231,10 @@ def quality_time_figure(
         log_wall = [math.log10(max(w, 1e-9)) for w in raw_wall]
         x_min, x_max = _pad_range(min(log_wall), max(log_wall))
         y_min, y_max = _pad_range(min(raw_energy), max(raw_energy))
+        x_ticks = _axis_ticks(x_min, x_max, count=5)
+        y_ticks = _axis_ticks(y_min, y_max, count=5)
+        x_min, x_max = x_ticks[0], x_ticks[-1]
+        y_min, y_max = y_ticks[0], y_ticks[-1]
         x_span = x_max - x_min
         y_span = y_max - y_min
         plot_height = height - margin - plot_top
@@ -1230,7 +1257,8 @@ def quality_time_figure(
         # round 2: "the y axis shows only two end ticks ... show at least 3-5
         # ticks, at a precision that separates them"; "the x axis shows only
         # its end values"), plus the axis titles.
-        for tick in _axis_ticks(x_min, x_max, count=5):
+        # Round positions in log10 space; convert only the labels back to seconds.
+        for tick in x_ticks:
             tick_x = margin + (tick - x_min) / x_span * (width - 2 * margin)
             body_parts.append(
                 f'<text x="{tick_x:.1f}" y="{height - margin + 16}" font-size="10" text-anchor="middle">'
@@ -1240,7 +1268,7 @@ def quality_time_figure(
             f'<text x="{(margin + width - margin) / 2:.0f}" y="{height - margin + 32}" font-size="11" '
             'text-anchor="middle">Median sampling time (s), log scale</text>'
         )
-        for tick in _axis_ticks(y_min, y_max, count=5):
+        for tick in y_ticks:
             tick_y = height - margin - (tick - y_min) / y_span * plot_height
             body_parts.append(
                 f'<text x="{margin - 6}" y="{tick_y + 3:.1f}" font-size="10" text-anchor="end">{_tick_text(tick)}</text>'
@@ -1362,6 +1390,10 @@ def physical_scale_effect_figure(cell: str, captures: Sequence[Dict[str, Any]]) 
     energies = [c["best_energy"] for c in captures]
     x_min, x_max = _pad_range(min(scales), max(scales))
     y_min, y_max = _pad_range(min(energies), max(energies))
+    x_ticks = _axis_ticks(x_min, x_max, count=5)
+    y_ticks = _axis_ticks(y_min, y_max, count=5)
+    x_min, x_max = x_ticks[0], x_ticks[-1]
+    y_min, y_max = y_ticks[0], y_ticks[-1]
     x_span = x_max - x_min
     y_span = y_max - y_min
     plot_height = height - margin - plot_top
@@ -1374,7 +1406,7 @@ def physical_scale_effect_figure(cell: str, captures: Sequence[Dict[str, Any]]) 
             f'<title>model {capture["model_hash"][:8]}, scale {capture["requested_scale"]:g}, '
             f'{capture["anneal_us"]} us: best energy {capture["best_energy"]:.6g}</title></circle>'
         )
-    for tick in _axis_ticks(x_min, x_max, count=5):
+    for tick in x_ticks:
         tick_x = margin + (tick - x_min) / x_span * (width - 2 * margin)
         body_parts.append(
             f'<text x="{tick_x:.1f}" y="{height - margin + 16}" font-size="10" text-anchor="middle">'
@@ -1384,7 +1416,7 @@ def physical_scale_effect_figure(cell: str, captures: Sequence[Dict[str, Any]]) 
         f'<text x="{(margin + width - margin) / 2:.0f}" y="{height - margin + 32}" font-size="11" '
         'text-anchor="middle">Requested scale (share of the audited legal ceiling)</text>'
     )
-    for tick in _axis_ticks(y_min, y_max, count=5):
+    for tick in y_ticks:
         tick_y = height - margin - (tick - y_min) / y_span * plot_height
         body_parts.append(
             f'<text x="{margin - 6}" y="{tick_y + 3:.1f}" font-size="10" text-anchor="end">{_tick_text(tick)}</text>'

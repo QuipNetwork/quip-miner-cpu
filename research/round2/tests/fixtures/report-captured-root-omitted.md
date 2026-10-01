@@ -79,4 +79,4 @@ The physical-range pilot (12 sorted nonces, 3 scales, 2 anneal times -- the desi
 
 | Regime | Established | Unresolved | Next control |
 | -- | -- | -- | -- |
-| `native-pm1` | 0 completed CPU timing/quality records across 0 kernels (none yet) from the campaign run. | No Round 2 QPU capture exists yet, and this cell has no physical-scale plan at all. The CPU comparison alone cannot answer the regime question. | The CPU campaign for this cell is complete. Decide whether a QPU arm belongs in this regime's next round. |
+| `native-pm1` | Clean, finite CPU timing/quality records: 0 across 0 kernels (none yet) from the campaign run. | No Round 2 QPU capture exists yet, and this cell has no physical-scale plan at all. The CPU comparison alone cannot answer the regime question. | The CPU campaign for this cell is complete. Decide whether a QPU arm belongs in this regime's next round. |
