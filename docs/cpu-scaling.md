@@ -35,7 +35,7 @@ The "workers" columns show the worker count that the sampler started. In a conta
 | 28 | 28 | 3.34 | 8.4 | 10 | 1.80 | 4 | 0.86 |
 | 32 | 32 | 3.44 | 9.3 | 10 | 1.90 | 4 | 0.83 |
 
-- Host throughput grows almost linearly up to 14 workers. At 14 workers each job takes 20% longer than a job alone. This measurement does not show the cause.
+- Host throughput grows almost linearly up to 14 workers. At 14 workers each job takes 20% longer than a job alone, for a cause that this run did not measure.
 - From 16 to 32 workers, the second hardware thread on each core adds 36% more throughput. At 32 workers each job takes about twice as long as a job alone.
 - In a container, `std::thread::available_parallelism()` returns the CPU quota: 4 for `--cpus=4` and 10 for `--cpus=10`. The worker count never exceeds the quota.
 - The per-job latency, including queue time, is in the `median_job_s` and `p90_job_s` columns of the CSV files.
