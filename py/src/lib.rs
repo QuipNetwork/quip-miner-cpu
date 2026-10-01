@@ -12,9 +12,11 @@ use numpy::{IntoPyArray, PyArray1, PyArray2, PyReadonlyArray1, PyReadonlyArray2}
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
+pyo3::create_exception!(quip_msa, MemoryLimitError, PyValueError);
+
 use quip_miner_cpu::{
-    sample_research, IsingGraph, ResearchKernel, SaSampler, SaVariant, SampleParams, Sampler,
-    SeededStart,
+    sample_research, IsingGraph, ResearchError, ResearchKernel, SaSampler, SaVariant, SampleParams,
+    Sampler, SeededStart,
 };
 
 /// A multi-spin annealing sampler. It caches the graph colouring between
@@ -276,7 +278,16 @@ impl Msa {
                 });
                 sample_research(&graph, &params, kernel, start, None)
             })
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+            .map_err(|error| {
+                let message = error.to_string();
+                match error {
+                    ResearchError::MemoryLimit { .. } => MemoryLimitError::new_err(message),
+                    ResearchError::InvalidInput(_)
+                    | ResearchError::UnsupportedUnitModel(_)
+                    | ResearchError::SeededScalarUnsupported
+                    | ResearchError::Cancelled => PyValueError::new_err(message),
+                }
+            })?;
 
         let reads = out.spins.len();
         let mut flat = Vec::with_capacity(reads * nodes);
@@ -344,6 +355,7 @@ fn default_beta_range(
 /// Python module `quip_msa`.
 #[pymodule]
 fn quip_msa(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add("MemoryLimitError", m.py().get_type::<MemoryLimitError>())?;
     m.add_class::<Msa>()?;
     m.add_function(wrap_pyfunction!(draw_ising, m)?)?;
     m.add_function(wrap_pyfunction!(default_beta_range, m)?)?;

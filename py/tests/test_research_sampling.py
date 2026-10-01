@@ -291,3 +291,21 @@ def test_concurrent_calls_match_serial_results():
         np.testing.assert_array_equal(spins, serial[kernel][0])
         np.testing.assert_array_equal(energies, serial[kernel][1])
         assert meta == serial[kernel][2]
+
+
+def test_memory_limit_raises_distinct_error():
+    h = np.zeros(100_000, dtype=np.float64)
+    h[0] = 0.37
+    edges = np.empty((0, 2), dtype=np.int64)
+    j = np.empty(0, dtype=np.float64)
+
+    with pytest.raises(quip_msa.MemoryLimitError):
+        quip_msa.Msa().sample_research(
+            h,
+            edges,
+            j,
+            kernel="cpu-msa-f64",
+            num_sweeps=1,
+            num_reads=4096,
+        )
+    assert issubclass(quip_msa.MemoryLimitError, ValueError)
