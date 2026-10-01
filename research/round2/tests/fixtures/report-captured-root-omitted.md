@@ -75,15 +75,8 @@ The physical-range pilot (12 sorted nonces, 3 scales, 2 anneal times -- the desi
 | -- | -- | -- | -- | -- |
 | `native-pm1` | n/a | n/a | n/a | unavailable -- no physical-scale plan for this cell |
 
-## Historical context (cited, not recomputed here)
-
-The current portfolio manuscript reports 1,930 comparable races, with 833 QPU quality wins and 1,097 ties at 0.5% materiality. At zero tolerance it reports 970 QPU wins and 960 ties, and neither table contains an SA win. The manuscript reports about 70% faster device access but supplies no joint quality/time counts, so these figures do not establish an 80% strict-quality win rate (design doc, `docs/superpowers/specs/2026-09-22-regime-search-round2-design.md`).
-The older 2,088-race window overlaps the manuscript's 1,930-race window. This report keeps the two separate and never pools them, because a union of overlapping windows would double count shared races.
-The 80% portfolio claim stays unresolved. No source used in this report defines that metric together with the denominator or joint counts a claim at that scale would need.
-
 ## What each regime establishes, and what runs next
 
 | Regime | Established | Unresolved | Next control |
 | -- | -- | -- | -- |
 | `native-pm1` | 0 completed CPU timing/quality records across 0 kernels (none yet) from the campaign run. | No Round 2 QPU capture exists yet, and this cell has no physical-scale plan at all. The CPU comparison alone cannot answer the regime question. | The CPU campaign for this cell is complete. Decide whether a QPU arm belongs in this regime's next round. |
-| Portfolio pipeline | The deadline arm (synthetic fixtures, historical settings) ran to completion for both baskets and both beta labels, producing repaired objectives and raw feasibility counts. | No paired QPU portfolio result exists, so strict and material wins, speed-only outcomes, and joint quality/time counts stay unavailable. The 80% portfolio claim stays unresolved. | Capture the portfolio pilot (12 frozen market instances, beta-zero and positive-beta controls) once its provenance and anneal-setting classification are explicit, per the design doc. |

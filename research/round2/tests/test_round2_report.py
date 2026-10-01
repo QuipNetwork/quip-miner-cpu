@@ -212,8 +212,7 @@ def test_summarize_arm_treats_a_missing_host_as_clean_serial():
 
 
 def test_bootstrap_paired_gap_is_descriptive_with_too_few_groups():
-    # Two portfolio baskets (n=18, n=28) each contribute two beta-label gaps: four
-    # gaps, but only two independent snapshots (task brief, step 6).
+    # Four paired gaps come from two independent snapshots, with two gaps per snapshot.
     gaps = [0.01, 0.012, 0.03, 0.028]
     groups = ["n18", "n18", "n28", "n28"]
     result = metrics.bootstrap_paired_gap(gaps, groups, seed=0, resamples=200)
@@ -805,46 +804,6 @@ def test_lane_diversity_table_separates_seeded_and_cold_lanes_from_v2_samples(tm
     assert "| 1 | 2 | 1 | 1 |" in cold_row
 
 
-def test_feasibility_table_formats_the_regression_case_and_flags_unknown_weighting():
-    portfolio_records = [
-        {
-            "n_assets": 28, "cardinality_k": 9, "beta_label": "beta-zero", "status": "completed",
-            "raw_feasible_count": 31993, "returned_reads": 32000, "weighting_failed": None,
-        },
-    ]
-    lines = report.feasibility_table(portfolio_records)
-    text = "\n".join(lines)
-    assert "31993 / 32000 (99.978125%)" in text
-    assert "unknown" in text  # weighting_failed=None must read as unknown, never success
-
-
-def test_feasibility_table_prints_provenance_so_synthetic_is_never_mistaken_for_historical():
-    portfolio_records = [
-        {
-            "n_assets": 28, "cardinality_k": 9, "beta_label": "beta-zero", "status": "completed",
-            "raw_feasible_count": 0, "returned_reads": 500, "weighting_failed": None,
-            "provenance": "synthetic-test",
-        },
-    ]
-    lines = report.feasibility_table(portfolio_records)
-    text = "\n".join(lines)
-    assert "synthetic-test" in text
-    assert "historical-deadline" not in text.lower()
-
-
-def test_feasibility_table_reports_a_known_weighting_failure():
-    portfolio_records = [
-        {
-            "n_assets": 18, "cardinality_k": 6, "beta_label": "beta-nonzero", "status": "completed",
-            "raw_feasible_count": 0, "returned_reads": 500, "weighting_failed": True,
-        },
-    ]
-    lines = report.feasibility_table(portfolio_records)
-    text = "\n".join(lines)
-    assert "0 / 500 (0%)" in text
-    assert "failed" in text
-
-
 def _seeded_record(
     cell, nonce, source, *,
     seeded: Optional[float] = -1.0, cold: Optional[float] = -1.0, exit_ok=True, unsupported=False,
@@ -934,47 +893,6 @@ def test_physical_scale_table_shows_captured_only_when_capture_output_is_named()
     assert "| captured |" in text
 
 
-def test_portfolio_pipeline_table_shows_the_repaired_feasibility_the_feasibility_table_cites():
-    # The feasibility table's own text points here for the repaired, selected
-    # answer's feasibility (review, Important item 5): both fields must
-    # actually appear.
-    portfolio_records = [
-        {
-            "n_assets": 18, "cardinality_k": 6, "beta_label": "beta-zero", "status": "completed",
-            "elapsed_s": 0.06, "deadline_s": 10.0, "objective": 0.0001,
-            "feasible": True, "selected_raw_cardinality": 2,
-        },
-        {
-            "n_assets": 28, "cardinality_k": 9, "beta_label": "beta-nonzero", "status": "completed",
-            "elapsed_s": 0.1, "deadline_s": 10.0, "objective": -0.0002,
-            "feasible": False, "selected_raw_cardinality": None,
-        },
-    ]
-    lines = report.portfolio_pipeline_table(portfolio_records)
-    text = "\n".join(lines)
-    assert "| yes | 2 |" in text
-    assert "| no | n/a |" in text
-
-
-def test_portfolio_pipeline_table_shows_provenance_and_classifies_on_end_to_end_time():
-    # elapsed_s is sampling time only; status is decided by end_to_end_s, which
-    # includes repair/weighting time (review, I5). Both must be visible, along
-    # with the arm's own provenance, never silently defaulted to "historical".
-    portfolio_records = [
-        {
-            "n_assets": 18, "cardinality_k": 6, "beta_label": "beta-zero", "status": "completed",
-            "provenance": "synthetic-test", "elapsed_s": 0.06, "repair_s": 0.02, "end_to_end_s": 0.08,
-            "deadline_s": 10.0, "objective": 0.0001, "feasible": True, "selected_raw_cardinality": 2,
-        },
-    ]
-    lines = report.portfolio_pipeline_table(portfolio_records)
-    text = "\n".join(lines)
-    assert "synthetic-test" in text
-    assert "0.08" in text  # end_to_end_s, the time the status is classified on
-    assert "0.02" in text  # repair_s
-    assert "historical-deadline" not in text.lower()  # never call the arm itself historical
-
-
 def test_qpu_outcome_table_and_paired_gaps_table_state_no_comparable_pairs_with_no_captures():
     cells = ["native-pm1", "diamond-pm1"]
     outcome_text = "\n".join(report.qpu_outcome_table(cells, {}, {}, ["cpu-sa"], [512]))
@@ -993,15 +911,6 @@ def test_main_writes_a_draft_report_and_figures_from_a_small_fixture(tmp_path, m
                     cell_dir, f"model{i}", kernel, sweeps, 0,
                     _cpu_record(cell, f"model{i}", kernel, sweeps, best_energy=-10.0 - i, wall_s=0.1 * sweeps),
                 )
-    portfolio_root = tmp_path / "portfolio-deadline"
-    portfolio_root.mkdir(parents=True)
-    (portfolio_root / "results.json").write_text(json.dumps({"records": [
-        {
-            "n_assets": 18, "cardinality_k": 6, "beta_label": "beta-zero", "status": "completed",
-            "raw_feasible_count": 0, "returned_reads": 500, "weighting_failed": None, "objective": 0.01,
-            "elapsed_s": 0.1, "deadline_s": 10.0,
-        },
-    ]}), encoding="utf-8")
     out_dir = tmp_path / "report"
 
     monkeypatch.setattr(
@@ -1009,7 +918,6 @@ def test_main_writes_a_draft_report_and_figures_from_a_small_fixture(tmp_path, m
         [
             "round2_report.py",
             "--cpu-root", str(cpu_root), "--run", "pilot",
-            "--portfolio-results", str(portfolio_root / "results.json"),
             "--out-dir", str(out_dir),
             "--cells", "native-pm1",
         ],
@@ -1215,46 +1123,6 @@ def _canvas_size(svg: str):
     return int(width_match.group(1)), int(height_match.group(1))
 
 
-def test_portfolio_figure_keeps_the_sign_of_a_negative_objective():
-    records = [{"n_assets": 28, "cardinality_k": 9, "beta_label": "beta-zero", "objective": -0.0002212}]
-    svg = report.portfolio_figure(records)
-    texts = " ".join(t for _, _, t in _svg_text_elements(svg))
-    assert "-0.0002212" in texts  # the signed value, never abs()
-
-
-def test_portfolio_figure_draws_negative_and_positive_bars_in_different_colors():
-    records = [
-        {"n_assets": 18, "cardinality_k": 6, "beta_label": "beta-zero", "objective": 0.0002},
-        {"n_assets": 28, "cardinality_k": 9, "beta_label": "beta-zero", "objective": -0.0002},
-    ]
-    svg = report.portfolio_figure(records)
-    assert report._POSITIVE_COLOR in svg
-    assert report._NEGATIVE_COLOR in svg
-
-
-def test_portfolio_repair_figure_shows_raw_feasible_counts_and_the_repair_outcome():
-    records = [
-        {
-            "n_assets": 18, "cardinality_k": 6, "beta_label": "beta-zero",
-            "raw_feasible_count": 3, "returned_reads": 500, "feasible": True,
-        },
-        {
-            "n_assets": 28, "cardinality_k": 9, "beta_label": "beta-nonzero",
-            "raw_feasible_count": 0, "returned_reads": 500, "feasible": False,
-        },
-    ]
-    svg = report.portfolio_repair_figure(records)
-    texts = " ".join(t for _, _, t in _svg_text_elements(svg))
-    assert "repaired: feasible" in texts
-    assert "repaired: infeasible" in texts
-    assert "3 raw feasible reads" in texts
-
-
-def test_portfolio_repair_figure_handles_no_data():
-    svg = report.portfolio_repair_figure([])
-    assert "No data available" in svg
-
-
 def _energy_points(cell, kernel, sweeps_energy_wall):
     return [
         _cpu_record(cell, f"m{i}", kernel, sweeps, best_energy=energy, wall_s=wall)
@@ -1360,23 +1228,6 @@ def test_axis_ticks_always_includes_both_endpoints():
     assert len(ticks) == 5
 
 
-def test_portfolio_figure_negative_label_never_overlaps_the_category_column():
-    # The controller's rendered defect: "beta-zero-0.0002212 objective" reads as
-    # one run of text because the negative label's anchor="end" left edge, at a
-    # near-max bar width, extended back into the category column.
-    records = [
-        {"n_assets": 18, "cardinality_k": 6, "beta_label": "beta-zero", "objective": 0.0001127},
-        {"n_assets": 28, "cardinality_k": 9, "beta_label": "beta-zero", "objective": -0.0002212},
-    ]
-    svg = report.portfolio_figure(records)
-    elements = _svg_text_elements(svg)
-    category_x, _, category_text = next(e for e in elements if e[2] == "n=28 k=9 beta-zero")
-    neg_x, _, neg_text = next(e for e in elements if e[2].startswith("-0.0002212"))
-    category_right_edge = category_x + report._text_width_estimate(category_text)
-    negative_left_edge = neg_x - report._text_width_estimate(neg_text)  # anchor="end": x is the right edge
-    assert negative_left_edge > category_right_edge
-
-
 def test_physical_scale_figure_subtitle_wraps_within_the_canvas():
     proposal = {
         "arms": [{"regime": "diamond-pm1", "anneal_us": 80, "captures": 36, "reads_per_capture": 64}],
@@ -1402,45 +1253,12 @@ def test_physical_scale_figure_never_claims_no_capture_has_run_once_one_has(tmp_
     assert "No physical capture has run yet" not in svg
 
 
-def test_portfolio_repair_figure_subtitle_wraps_within_the_canvas():
-    records = [
-        {
-            "n_assets": 18, "cardinality_k": 6, "beta_label": "beta-zero",
-            "raw_feasible_count": 3, "returned_reads": 500, "feasible": True,
-        },
-    ]
-    svg = report.portfolio_repair_figure(records)
-    width, _ = _canvas_size(svg)
-    for x, _, text in _svg_text_elements(svg):
-        if not text:
-            continue
-        assert x + len(text) * 12 * 0.6 <= width, f"text {text!r} at x={x} overflows a {width}px canvas"
-
-
-def test_portfolio_figure_header_wraps_within_the_canvas():
-    records = [{"n_assets": 18, "cardinality_k": 6, "beta_label": "beta-zero", "objective": 0.0001}]
-    svg = report.portfolio_figure(records)
-    width, _ = _canvas_size(svg)
-    for x, _, text in _svg_text_elements(svg):
-        if x != 10.0 or not text:
-            continue
-        assert x + len(text) * 12 * 0.6 <= width, f"text {text!r} at x={x} overflows a {width}px canvas"
-
-
 def test_bar_chart_value_label_never_overlaps_a_long_category_label():
-    # A real defect found by rendering portfolio-repair.svg: a long category
-    # label (the repair-outcome suffix) plus a zero-width bar (raw_feasible_count
-    # 0) put the value label's start right on top of the category text's tail.
-    records = [
-        {
-            "n_assets": 18, "cardinality_k": 6, "beta_label": "beta-zero",
-            "raw_feasible_count": 0, "returned_reads": 500, "feasible": True,
-        },
-    ]
-    svg = report.portfolio_repair_figure(records)
+    category = "long category label that can overlap the zero-width bar value"
+    svg = report._bar_chart("Example chart", "", [(category, 0.0)], "captures planned")
     elements = _svg_text_elements(svg)
-    category_x, _, category_text = next(e for e in elements if e[2].startswith("n=18 k=6 beta-zero"))
-    value_x, _, value_text = next(e for e in elements if e[2] == "0 raw feasible reads")
+    category_x, _, category_text = next(e for e in elements if e[2] == category)
+    value_x, _, value_text = next(e for e in elements if e[2] == "0 captures planned")
     category_right_edge = category_x + report._text_width_estimate(category_text)
     assert value_x >= category_right_edge
 
