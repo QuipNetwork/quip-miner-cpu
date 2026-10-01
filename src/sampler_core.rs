@@ -48,7 +48,7 @@ impl CpuGraph {
     pub(crate) fn from_base(g: &IsingGraph) -> Self {
         let n = g.h.len();
         let mut deg = vec![0u32; n];
-        for &(u, v) in &g.edges {
+        for &(u, v) in g.edges.iter() {
             // Range guard + self-loop skip: a self-loop double-increments deg[u]
             // and inserts `u` into its own neighbor list, so effective_field(u)
             // would include u's own spin and apply_field_delta would mutate

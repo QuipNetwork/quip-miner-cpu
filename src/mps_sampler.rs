@@ -41,8 +41,8 @@ pub(crate) const CPU_MPS_ADAPT: AdaptBounds = AdaptBounds {
 /// valid configurations is the better failure mode, and it is documented rather
 /// than hidden.
 pub const CPU_MPS_IDENTITY: BackendIdentity = BackendIdentity {
-    backend: "cpu",
-    algorithm: "mps",
+    backend: quip_proto::v1::Backend::Cpu,
+    algorithm: quip_proto::v1::Algorithm::Mps,
     max_nodes: 65_536,
     max_edges: 524_288,
     features: &[],
@@ -58,8 +58,8 @@ pub const CPU_MPS_IDENTITY: BackendIdentity = BackendIdentity {
 /// that regime so a campaign can measure it without inferring the bond
 /// dimension from the results.
 pub const CPU_MFA_IDENTITY: BackendIdentity = BackendIdentity {
-    backend: "cpu",
-    algorithm: "mfa",
+    backend: quip_proto::v1::Backend::Cpu,
+    algorithm: quip_proto::v1::Algorithm::Mfa,
     max_nodes: 65_536,
     max_edges: 524_288,
     features: &[],
@@ -176,8 +176,8 @@ mod tests {
 
     #[test]
     fn mps_identity_advertises_the_documented_envelope() {
-        assert_eq!(CPU_MPS_IDENTITY.backend, "cpu");
-        assert_eq!(CPU_MPS_IDENTITY.algorithm, "mps");
+        assert_eq!(CPU_MPS_IDENTITY.backend, quip_proto::v1::Backend::Cpu);
+        assert_eq!(CPU_MPS_IDENTITY.algorithm, quip_proto::v1::Algorithm::Mps);
         // Memory bounds, not quality bounds: at 65536 nodes a bond-4 model is
         // 16.8 MB, and 16 of them fit in 268 MB.
         assert_eq!(CPU_MPS_IDENTITY.max_nodes, 65_536);
@@ -299,8 +299,8 @@ mod tests {
     }
     #[test]
     fn cpu_mfa_identity_fields() {
-        assert_eq!(CPU_MFA_IDENTITY.backend, "cpu");
-        assert_eq!(CPU_MFA_IDENTITY.algorithm, "mfa");
+        assert_eq!(CPU_MFA_IDENTITY.backend, quip_proto::v1::Backend::Cpu);
+        assert_eq!(CPU_MFA_IDENTITY.algorithm, quip_proto::v1::Algorithm::Mfa);
         assert_eq!(CPU_MFA_IDENTITY.max_nodes, 65_536);
         assert_eq!(CPU_MFA_IDENTITY.max_edges, 524_288);
     }

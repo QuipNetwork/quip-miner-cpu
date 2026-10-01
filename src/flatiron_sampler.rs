@@ -20,8 +20,8 @@ use crate::run_stream_pump;
 /// bounds are the same 64 MB per-model cap. Only the algorithm string
 /// differs, so a campaign can tell the two apart.
 pub const CPU_FLATIRON_IDENTITY: BackendIdentity = BackendIdentity {
-    backend: "cpu",
-    algorithm: "flatiron",
+    backend: quip_proto::v1::Backend::Cpu,
+    algorithm: quip_proto::v1::Algorithm::Flatiron,
     max_nodes: 65_536,
     max_edges: 524_288,
     features: &[],
@@ -125,8 +125,11 @@ mod tests {
 
     #[test]
     fn flatiron_identity_advertises_the_documented_envelope() {
-        assert_eq!(CPU_FLATIRON_IDENTITY.backend, "cpu");
-        assert_eq!(CPU_FLATIRON_IDENTITY.algorithm, "flatiron");
+        assert_eq!(CPU_FLATIRON_IDENTITY.backend, quip_proto::v1::Backend::Cpu);
+        assert_eq!(
+            CPU_FLATIRON_IDENTITY.algorithm,
+            quip_proto::v1::Algorithm::Flatiron
+        );
         assert_eq!(CPU_FLATIRON_IDENTITY.max_nodes, 65_536);
         assert_eq!(CPU_FLATIRON_IDENTITY.max_edges, 524_288);
         assert_eq!(CPU_FLATIRON_IDENTITY.adapt.min_sweeps, 64);

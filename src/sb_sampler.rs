@@ -43,8 +43,8 @@ pub(crate) const CPU_SB_ADAPT: AdaptBounds = AdaptBounds {
 
 /// Backend identity for `quip-cpu-sb` (discrete Simulated Bifurcation).
 pub const CPU_SB_IDENTITY: BackendIdentity = BackendIdentity {
-    backend: "cpu",
-    algorithm: "sb",
+    backend: quip_proto::v1::Backend::Cpu,
+    algorithm: quip_proto::v1::Algorithm::Sb,
     max_nodes: DEFAULT_MAX_NODES,
     max_edges: DEFAULT_MAX_EDGES,
     features: &[],
@@ -56,8 +56,8 @@ pub const CPU_SB_IDENTITY: BackendIdentity = BackendIdentity {
 /// only behind the `experimental` cargo feature. The adapt bounds stay shared
 /// with `quip-cpu-sb` until the benchmark campaign re-tunes them per variant.
 pub const CPU_BSB_IDENTITY: BackendIdentity = BackendIdentity {
-    backend: "cpu",
-    algorithm: "bsb",
+    backend: quip_proto::v1::Backend::Cpu,
+    algorithm: quip_proto::v1::Algorithm::Bsb,
     max_nodes: DEFAULT_MAX_NODES,
     max_edges: DEFAULT_MAX_EDGES,
     features: &[],
@@ -67,8 +67,8 @@ pub const CPU_BSB_IDENTITY: BackendIdentity = BackendIdentity {
 /// Backend identity for `quip-cpu-hdsb` (heated discrete Simulated
 /// Bifurcation: discrete coupling, gamma 0.06). Experimental track.
 pub const CPU_HDSB_IDENTITY: BackendIdentity = BackendIdentity {
-    backend: "cpu",
-    algorithm: "hdsb",
+    backend: quip_proto::v1::Backend::Cpu,
+    algorithm: quip_proto::v1::Algorithm::Hdsb,
     max_nodes: DEFAULT_MAX_NODES,
     max_edges: DEFAULT_MAX_EDGES,
     features: &[],
@@ -81,8 +81,8 @@ pub const CPU_HDSB_IDENTITY: BackendIdentity = BackendIdentity {
 /// invariant is most at risk from; `prop_no_nan_and_walls_hold` and
 /// `hbsb_walls_hold_under_strong_heating` both guard it.
 pub const CPU_HBSB_IDENTITY: BackendIdentity = BackendIdentity {
-    backend: "cpu",
-    algorithm: "hbsb",
+    backend: quip_proto::v1::Backend::Cpu,
+    algorithm: quip_proto::v1::Algorithm::Hbsb,
     max_nodes: DEFAULT_MAX_NODES,
     max_edges: DEFAULT_MAX_EDGES,
     features: &[],
@@ -93,8 +93,8 @@ pub const CPU_HBSB_IDENTITY: BackendIdentity = BackendIdentity {
 /// Bifurcation with edge-of-chaos control; Goto, Hidaka, Tatsumura 2026).
 /// Experimental track.
 pub const CPU_GBSB_IDENTITY: BackendIdentity = BackendIdentity {
-    backend: "cpu",
-    algorithm: "gbsb",
+    backend: quip_proto::v1::Backend::Cpu,
+    algorithm: quip_proto::v1::Algorithm::Gbsb,
     max_nodes: DEFAULT_MAX_NODES,
     max_edges: DEFAULT_MAX_EDGES,
     features: &[],
@@ -105,8 +105,8 @@ pub const CPU_GBSB_IDENTITY: BackendIdentity = BackendIdentity {
 /// coupling. The paper names this form as future work; it is this project's
 /// extension. Experimental track.
 pub const CPU_GDSB_IDENTITY: BackendIdentity = BackendIdentity {
-    backend: "cpu",
-    algorithm: "gdsb",
+    backend: quip_proto::v1::Backend::Cpu,
+    algorithm: quip_proto::v1::Algorithm::Gdsb,
     max_nodes: DEFAULT_MAX_NODES,
     max_edges: DEFAULT_MAX_EDGES,
     features: &[],
@@ -116,8 +116,8 @@ pub const CPU_GDSB_IDENTITY: BackendIdentity = BackendIdentity {
 /// Backend identity for `quip-cpu-tedsb` (tabu-enhanced discrete Simulated
 /// Bifurcation; Tao et al. 2026). Experimental track.
 pub const CPU_TEDSB_IDENTITY: BackendIdentity = BackendIdentity {
-    backend: "cpu",
-    algorithm: "tedsb",
+    backend: quip_proto::v1::Backend::Cpu,
+    algorithm: quip_proto::v1::Algorithm::Tedsb,
     max_nodes: DEFAULT_MAX_NODES,
     max_edges: DEFAULT_MAX_EDGES,
     features: &[],
@@ -127,8 +127,8 @@ pub const CPU_TEDSB_IDENTITY: BackendIdentity = BackendIdentity {
 /// Backend identity for `quip-cpu-sbqa` (Simulated Bifurcation Quantum
 /// Annealing; Pawlowski et al. 2026). Experimental track.
 pub const CPU_SBQA_IDENTITY: BackendIdentity = BackendIdentity {
-    backend: "cpu",
-    algorithm: "sbqa",
+    backend: quip_proto::v1::Backend::Cpu,
+    algorithm: quip_proto::v1::Algorithm::Sbqa,
     max_nodes: DEFAULT_MAX_NODES,
     max_edges: DEFAULT_MAX_EDGES,
     features: &[],
@@ -138,8 +138,8 @@ pub const CPU_SBQA_IDENTITY: BackendIdentity = BackendIdentity {
 /// Backend identity for `quip-cpu-ggdsb` (globally guided discrete Simulated
 /// Bifurcation; Xiao et al. 2026). Experimental track.
 pub const CPU_GGDSB_IDENTITY: BackendIdentity = BackendIdentity {
-    backend: "cpu",
-    algorithm: "ggdsb",
+    backend: quip_proto::v1::Backend::Cpu,
+    algorithm: quip_proto::v1::Algorithm::Ggdsb,
     max_nodes: DEFAULT_MAX_NODES,
     max_edges: DEFAULT_MAX_EDGES,
     features: &[],
@@ -293,8 +293,8 @@ mod tests {
     /// test is the only guard on it.
     #[test]
     fn sb_identity_advertises_the_sb_algorithm_and_adapt_envelope() {
-        assert_eq!(CPU_SB_IDENTITY.backend, "cpu");
-        assert_eq!(CPU_SB_IDENTITY.algorithm, "sb");
+        assert_eq!(CPU_SB_IDENTITY.backend, quip_proto::v1::Backend::Cpu);
+        assert_eq!(CPU_SB_IDENTITY.algorithm, quip_proto::v1::Algorithm::Sb);
         assert_eq!(CPU_SB_IDENTITY.max_nodes, 100_000);
         assert_eq!(CPU_SB_IDENTITY.max_edges, 1_000_000);
         assert_eq!(CPU_SB_IDENTITY.adapt.min_sweeps, 256);
@@ -397,46 +397,52 @@ mod tests {
     }
     #[test]
     fn cpu_hbsb_identity_advertises_hbsb_algorithm() {
-        assert_eq!(CPU_HBSB_IDENTITY.backend, "cpu");
-        assert_eq!(CPU_HBSB_IDENTITY.algorithm, "hbsb");
+        assert_eq!(CPU_HBSB_IDENTITY.backend, quip_proto::v1::Backend::Cpu);
+        assert_eq!(CPU_HBSB_IDENTITY.algorithm, quip_proto::v1::Algorithm::Hbsb);
         assert_eq!(CPU_HBSB_IDENTITY.max_nodes, 100_000);
         assert_eq!(CPU_HBSB_IDENTITY.max_edges, 1_000_000);
     }
 
     #[test]
     fn cpu_gbsb_identity_advertises_gbsb_algorithm() {
-        assert_eq!(CPU_GBSB_IDENTITY.backend, "cpu");
-        assert_eq!(CPU_GBSB_IDENTITY.algorithm, "gbsb");
+        assert_eq!(CPU_GBSB_IDENTITY.backend, quip_proto::v1::Backend::Cpu);
+        assert_eq!(CPU_GBSB_IDENTITY.algorithm, quip_proto::v1::Algorithm::Gbsb);
         assert_eq!(CPU_GBSB_IDENTITY.adapt.max_sweeps, CPU_SB_ADAPT.max_sweeps);
     }
 
     #[test]
     fn cpu_gdsb_identity_advertises_gdsb_algorithm() {
-        assert_eq!(CPU_GDSB_IDENTITY.backend, "cpu");
-        assert_eq!(CPU_GDSB_IDENTITY.algorithm, "gdsb");
+        assert_eq!(CPU_GDSB_IDENTITY.backend, quip_proto::v1::Backend::Cpu);
+        assert_eq!(CPU_GDSB_IDENTITY.algorithm, quip_proto::v1::Algorithm::Gdsb);
         assert_eq!(CPU_GDSB_IDENTITY.adapt.max_sweeps, CPU_SB_ADAPT.max_sweeps);
     }
 
     #[test]
     fn cpu_tedsb_identity_advertises_tedsb_algorithm() {
-        assert_eq!(CPU_TEDSB_IDENTITY.backend, "cpu");
-        assert_eq!(CPU_TEDSB_IDENTITY.algorithm, "tedsb");
+        assert_eq!(CPU_TEDSB_IDENTITY.backend, quip_proto::v1::Backend::Cpu);
+        assert_eq!(
+            CPU_TEDSB_IDENTITY.algorithm,
+            quip_proto::v1::Algorithm::Tedsb
+        );
         let sampler = SbSampler::tabu(DSB, TesbConfig::default());
         assert!(sampler.stream_width() >= 1);
     }
 
     #[test]
     fn cpu_sbqa_identity_advertises_sbqa_algorithm() {
-        assert_eq!(CPU_SBQA_IDENTITY.backend, "cpu");
-        assert_eq!(CPU_SBQA_IDENTITY.algorithm, "sbqa");
+        assert_eq!(CPU_SBQA_IDENTITY.backend, quip_proto::v1::Backend::Cpu);
+        assert_eq!(CPU_SBQA_IDENTITY.algorithm, quip_proto::v1::Algorithm::Sbqa);
         let sampler = SbSampler::ring(SbqaConfig::default());
         assert!(sampler.stream_width() >= 1);
     }
 
     #[test]
     fn cpu_ggdsb_identity_advertises_ggdsb_algorithm() {
-        assert_eq!(CPU_GGDSB_IDENTITY.backend, "cpu");
-        assert_eq!(CPU_GGDSB_IDENTITY.algorithm, "ggdsb");
+        assert_eq!(CPU_GGDSB_IDENTITY.backend, quip_proto::v1::Backend::Cpu);
+        assert_eq!(
+            CPU_GGDSB_IDENTITY.algorithm,
+            quip_proto::v1::Algorithm::Ggdsb
+        );
         let sampler = SbSampler::swarm(DSB, GgsbConfig::default());
         assert!(sampler.stream_width() >= 1);
     }

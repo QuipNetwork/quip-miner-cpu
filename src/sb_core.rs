@@ -173,7 +173,7 @@ impl SbGraph {
     pub(crate) fn from_base(g: &IsingGraph) -> Self {
         let n = g.h.len();
         let mut deg = vec![0u32; n];
-        for &(u, v) in &g.edges {
+        for &(u, v) in g.edges.iter() {
             if u >= n || v >= n || u == v {
                 continue;
             }
