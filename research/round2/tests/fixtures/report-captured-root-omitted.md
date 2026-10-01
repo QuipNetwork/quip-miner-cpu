@@ -16,7 +16,7 @@ Status: draft, campaign data, incomplete. This report draws on `campaign` CPU re
 
 ## Depth, quality, and time
 
-Every row is one (cell, kernel, sweep-depth) arm. Energy is the primary comparison. Timing uses `timing-subset` records from a loaded host with parallel workers, one per physical core. For each job, its fastest successful run is its run speed. The timing columns show the median sampling and wall times across successful, supported records, regardless of host contamination or timing mode. The contaminated and parallel wall-time columns remain separate diagnostics. Best energy uses every successful record. Best energy remains from campaign records. Sampling time is `elapsed_sampling_s`. Wall time is end-to-end.
+Every row is one (cell, kernel, sweep-depth) arm. Energy is the primary comparison. Timing uses `timing-subset` records. Of the 75 timing-subset records, 66 ran serially on CPU 10 before the switch to 14 workers. For each job, its fastest successful run is its run speed. The timing columns show the median sampling and wall times across successful, supported records, regardless of host contamination or timing mode. The contaminated and parallel wall-time columns remain separate diagnostics. Best energy uses every successful record. Best energy remains from campaign records. Sampling time is `elapsed_sampling_s`. Wall time is end-to-end.
 
 | Cell | Kernel | Sweeps | Observed | Missing | Completed | Failed | Unsupported | Nonfinite | Median best energy | Sampling s, fastest run from timing-subset (n) | Wall s, fastest run from timing-subset (n) | Wall s, contaminated (n) | Wall s, parallel (n) |
 | -- | -- | -- | -- | -- | -- | -- | -- | -- | -- | -- | -- | -- | -- |
@@ -59,7 +59,7 @@ No comparable pairs exist because no cell has both a physical-pilot QPU capture 
 
 ## QPU against CPU at matched run time
 
-QPU time is charged access time for 64 reads, with end-to-end time also shown. CPU time is sampling time for 64 reads from the campaign, using the fastest successful attempt on a loaded host with parallel workers. Energy outcomes use the same strict, numeric-tolerance, and material rules as the equal-sweep tables. Equal budget uses the deepest CPU depth completed within that capture's access-time budget. Time to QPU energy uses the quickest CPU depth that reached the capture's best energy.
+QPU time is charged access time for 64 reads, with end-to-end time also shown. CPU time is sampling time for 64 reads from the campaign, using the fastest successful attempt. Energy outcomes use the same strict, numeric-tolerance, and material rules as the equal-sweep tables. Equal budget uses the deepest CPU depth completed within that capture's access-time budget. Time to QPU energy uses the quickest CPU depth that reached the capture's best energy.
 
 | Cell | Scale | Anneal us | Kernel | Models | Median QPU access s | Median QPU end-to-end s | Equal budget: strict / numeric / material qpu/cpu/tie | Over budget | Reached QPU energy (n of Models) | Not reached | Median CPU s to QPU energy | Median ratio to QPU access |
 | -- | -- | -- | -- | -- | -- | -- | -- | -- | -- | -- | -- | -- |

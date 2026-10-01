@@ -450,6 +450,11 @@ def depth_quality_time_table(
     timing_source: Optional[str] = None,
 ) -> List[str]:
     timing_label = timing_source or "quality run"
+    timing_host_note = (
+        "Of the 75 timing-subset records, 66 ran serially on CPU 10 before the switch to 14 workers. "
+        if timing_source == "timing-subset" else
+        "Timing records came from a loaded host with parallel workers, one per physical core. "
+    )
     quality_source_note = (
         "Best energy remains from campaign records. "
         if timing_source == "timing-subset" else "Best energy remains from the selected run. "
@@ -458,7 +463,7 @@ def depth_quality_time_table(
     lines = [
         "## Depth, quality, and time", "",
         "Every row is one (cell, kernel, sweep-depth) arm. Energy is the primary comparison. "
-        f"Timing uses `{timing_label}` records from a loaded host with parallel workers, one per physical core. "
+        f"Timing uses `{timing_label}` records. {timing_host_note}"
         "For each job, its fastest successful run is its run speed. The timing columns show the median "
         "sampling and wall times across successful, supported records, regardless of host contamination "
         "or timing mode. The contaminated and parallel wall-time columns remain separate diagnostics. "
@@ -1156,11 +1161,16 @@ def quality_time_figure(
                 summary["median_best_energy"], summary["completed"], len(sampling_values),
             ))
 
+    timing_host_note = (
+        "Of the 75 timing-subset records, 66 ran serially on CPU 10 before the switch to 14 workers. "
+        if timing_source == "timing-subset" else
+        "These timings come from a loaded host with parallel workers, one per physical core. "
+    )
     caption = (
         "Energy units: canonical, rescored from the original model, lower is better. The x axis uses "
         f"the median fastest-run elapsed_sampling_s from {timing_source or 'the quality run'}; each job "
-        "contributes its fastest successful run. These timings come from a loaded host with parallel workers, "
-        "one per physical core. End-to-end wall time remains separate in the table and point details."
+        f"contributes its fastest successful run. {timing_host_note}"
+        "End-to-end wall time remains separate in the table and point details."
     )
     body_parts: List[str] = [f'<text x="{margin}" y="24" font-size="16" font-weight="bold">{cell}: quality vs. time (CPU)</text>']
     y_cursor = 42

@@ -451,6 +451,13 @@ def test_matched_runtime_section_renders_requested_columns():
     assert "| `diamond-pm1` | 1 | 20 | `cpu-sa` | 1 | 1 | 1.2 |" in text
 
 
+def test_matched_runtime_default_does_not_assume_parallel_campaign_timings():
+    text = "\n".join(report.matched_runtime_table([], [], kernels=("cpu-sa",)))
+
+    assert "from the campaign" in text
+    assert "parallel workers" not in text
+
+
 def test_matched_runtime_route_ignores_failed_and_unsupported_cpu_records():
     captures = [{
         "cell": "diamond-pm1", "requested_scale": 1.0, "anneal_us": 20,
@@ -724,6 +731,20 @@ def test_depth_quality_time_table_uses_fastest_run_and_keeps_other_timing_labels
     assert cells[12] == "1 (3)"
     assert cells[13] == "100 (1)"
     assert cells[14] == "0.5 (1)"
+
+
+def test_depth_quality_time_table_limits_timing_subset_worker_claim_to_that_source():
+    records = {"native-pm1": []}
+    lines = report.depth_quality_time_table(
+        records, kernels=("cpu-sa",), depths=(512,), timing_source="timing-subset",
+    )
+    text = "\n".join(lines)
+
+    assert "Of the 75 timing-subset records, 66 ran serially on CPU 10 before the switch to 14 workers." in text
+    other_source = "\n".join(report.depth_quality_time_table(
+        records, kernels=("cpu-sa",), depths=(512,), timing_source="pilot",
+    ))
+    assert "75 timing-subset records" not in other_source
 
 
 def test_campaign_quality_uses_timing_subset_for_sampling_and_wall_time(tmp_path, monkeypatch):
@@ -1219,6 +1240,18 @@ def test_quality_time_figure_prints_intermediate_x_axis_ticks():
     assert len(x_texts) >= 4
     for text in x_texts:
         assert text in texts
+
+
+def test_quality_time_figure_identifies_the_timing_subset_worker_transition():
+    records = _energy_points("native-pm1", "cpu-sa", [(512, -100.0, 1.0)])
+    svg = report.quality_time_figure(
+        "native-pm1", records, ["cpu-sa"], [512],
+        timing_records=records, timing_source="timing-subset",
+    )
+    text = " ".join(element for _, _, element in _svg_text_elements(svg))
+
+    assert "Of the 75 timing-subset records, 66 ran serially on CPU 10 before the switch to 14 workers." in text
+    assert "parallel workers, one per physical core" not in text
 
 
 def test_axis_ticks_always_includes_both_endpoints():
