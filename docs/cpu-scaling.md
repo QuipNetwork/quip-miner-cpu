@@ -35,7 +35,7 @@ The "workers" columns show the worker count that the sampler started. In a conta
 | 28 | 28 | 3.34 | 8.4 | 10 | 1.80 | 4 | 0.86 |
 | 32 | 32 | 3.44 | 9.3 | 10 | 1.90 | 4 | 0.83 |
 
-- Host throughput grows almost linearly up to 14 workers. At 14 workers each job takes 20% longer than a job alone, because the cores share memory bandwidth and clock boost.
+- Host throughput grows almost linearly up to 14 workers. At 14 workers each job takes 20% longer than a job alone. This measurement does not show the cause.
 - From 16 to 32 workers, the second hardware thread on each core adds 36% more throughput. At 32 workers each job takes about twice as long as a job alone.
 - In a container, `std::thread::available_parallelism()` returns the CPU quota: 4 for `--cpus=4` and 10 for `--cpus=10`. The worker count never exceeds the quota.
 - The per-job latency, including queue time, is in the `median_job_s` and `p90_job_s` columns of the CSV files.
@@ -44,7 +44,7 @@ The "workers" columns show the worker count that the sampler started. In a conta
 
 **1. Is jobs/s the throughput of all workers together?** Yes. The miner prints completed jobs from all workers, divided by the time since the session started. The time includes startup and every wait for new jobs from the coordinator. Early in a session, or when jobs arrive late, the number is lower than the sampling rate.
 
-**2. Is 0.9 jobs/s expected with 10 CPUs?** Not on this host. With 10 workers, the ideal rate is 10 / 4.4 s, or 2.3 jobs/s. The measured rate in a `--cpus=10` container is 1.93 jobs/s, because each job runs 17% slower when 10 run at once. A rate of 0.9 jobs/s with 10 busy workers means each job takes about 11 seconds. A slower core, or 10 hardware threads on 5 physical cores, can cause that.
+**2. Is 0.9 jobs/s expected with 10 CPUs?** Not on this host. With 10 workers, the ideal rate is 10 / 4.4 s, or 2.3 jobs/s. The measured rate in a `--cpus=10` container is 1.93 jobs/s, because each job runs 16% slower when 10 run at once. A rate of 0.9 jobs/s with 10 busy workers means each job takes about 11 seconds. A slower core, or 10 hardware threads on 5 physical cores, can cause that.
 
 **3. Can you see the worker count and per-worker throughput?** The command `quip-cpu-sa --capabilities` prints `streamWidth`. That value is the declared worker count from the host or container CPU count. A `num_cpus` setting lower than that count starts fewer workers, so `streamWidth` is an upper bound. Every finished job logs an `attempt` line with two times. The `device` time is the time that one worker spent sampling the job, so 1 divided by it is the per-worker rate. The `wall` time also includes the time that the job waited in the queue.
 
