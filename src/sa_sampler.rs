@@ -32,8 +32,8 @@ use crate::coloring::Coloring;
 use crate::sa_int::{anneal_from, sweep_offsets, threshold_draws, threshold_table_fits, IntGraph};
 use crate::sa_msc::{anneal_words, bond_counts, MscState, LANES};
 use crate::sampler_core::{
-    build_beta_schedule, build_seeded_beta_schedule, sample_ising_cancellable, CpuGraph,
-    SampleCancelled,
+    build_beta_schedule, build_seeded_beta_schedule, effective_sweeps_per_beta,
+    sample_ising_cancellable, CpuGraph, SampleCancelled,
 };
 use crate::{run_stream_pump, CPU_ADAPT, DEFAULT_MAX_EDGES, DEFAULT_MAX_NODES};
 
@@ -401,7 +401,7 @@ fn anneal_int(
     let num_reads = params.num_reads.max(1);
     // Cut to the reads: a state past the last read has no read to seed.
     let seeds: &[Vec<i8>] = start.map_or(&[], |s| &s.spins[..s.spins.len().min(num_reads)]);
-    let sweeps_per = params.sweeps_per_beta.max(1);
+    let sweeps_per = effective_sweeps_per_beta(params.num_sweeps, params.sweeps_per_beta);
 
     let mut results = Vec::with_capacity(num_reads);
     match counts {
@@ -1209,13 +1209,13 @@ mod tests {
     }
 
     #[test]
-    fn msa_sweep_budget_uses_complete_beta_rungs() {
+    fn msa_sweep_budget_honors_small_requests_and_complete_rungs() {
         // With no bonds or fields, every attempted flip is accepted. The
         // final signs expose the sweep count without depending on randomness.
         let graph = IsingGraph::new(vec![0.0; 5], vec![], vec![]);
         let mut rng = read_rng(17, 0);
         let initial = MscState::random(5, &mut rng).lane(0);
-        for (sweeps, per_beta, flips) in [(0, 0, 1), (0, 4, 4), (2, 4, 4), (7, 3, 6), (9, 3, 9)] {
+        for (sweeps, per_beta, flips) in [(0, 0, 1), (0, 4, 4), (2, 4, 2), (7, 3, 6), (9, 3, 9)] {
             let params = SampleParams {
                 num_reads: 1,
                 num_sweeps: sweeps,

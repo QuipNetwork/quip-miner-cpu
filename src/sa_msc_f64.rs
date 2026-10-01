@@ -55,7 +55,9 @@ use rand::{Rng, SeedableRng};
 use crate::coloring::Coloring;
 use crate::sa_msc::{MscState, LANES};
 use crate::sa_sampler::{read_rng, SeededStart};
-use crate::sampler_core::{build_beta_schedule, build_seeded_beta_schedule, CpuGraph};
+use crate::sampler_core::{
+    build_beta_schedule, build_seeded_beta_schedule, effective_sweeps_per_beta, CpuGraph,
+};
 use crate::{DEFAULT_MAX_EDGES, DEFAULT_MAX_NODES};
 
 /// Most reads one call may ask for.
@@ -385,7 +387,7 @@ fn anneal(
     states: &mut [MscState],
     cancel: Option<(&CancelToken, Option<u64>)>,
 ) -> Result<(), FloatMsaError> {
-    let sweeps_per = params.sweeps_per_beta.max(1);
+    let sweeps_per = effective_sweeps_per_beta(params.num_sweeps, params.sweeps_per_beta);
     let mut rng = SmallRng::seed_from_u64(params.seed ^ THRESHOLD_SALT);
     for &beta in betas {
         for _ in 0..sweeps_per {
