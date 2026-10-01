@@ -151,7 +151,8 @@ struct Row {
 }
 
 struct StreamMetrics {
-    started_at: Instant,
+    /// From the first submission to the arrival of the last result.
+    wall: Duration,
     latencies: Vec<Duration>,
 }
 
@@ -199,6 +200,7 @@ fn record_result(
     reads: usize,
     submitted: &mut BTreeMap<Vec<u8>, (usize, Instant)>,
     latencies: &mut Vec<Duration>,
+    arrived_at: Instant,
 ) -> Result<(), BenchError> {
     let StreamResult {
         job_id, outcome, ..
@@ -251,7 +253,8 @@ fn record_result(
         }
     }
 
-    latencies.push(started_at.elapsed());
+    // Validation above runs after the arrival time, so it is not in the latency.
+    latencies.push(arrived_at.duration_since(started_at));
     Ok(())
 }
 
@@ -270,6 +273,7 @@ async fn measure_stream(
     let mut submitted = BTreeMap::new();
     let mut latencies = Vec::with_capacity(jobs);
     let mut job_tx = Some(job_tx);
+    let mut last_arrival = started_at;
 
     while received < jobs {
         if next_job == jobs {
@@ -280,7 +284,15 @@ async fn measure_stream(
                     expected: jobs,
                 });
             };
-            record_result(result, graph, reads, &mut submitted, &mut latencies)?;
+            last_arrival = Instant::now();
+            record_result(
+                result,
+                graph,
+                reads,
+                &mut submitted,
+                &mut latencies,
+                last_arrival,
+            )?;
             received += 1;
             continue;
         }
@@ -315,7 +327,8 @@ async fn measure_stream(
                 let Some(result) = result else {
                     return Err(BenchError::OutputClosed { received, expected: jobs });
                 };
-                record_result(result, graph, reads, &mut submitted, &mut latencies)?;
+                last_arrival = Instant::now();
+                record_result(result, graph, reads, &mut submitted, &mut latencies, last_arrival)?;
                 received += 1;
             }
         }
@@ -329,7 +342,7 @@ async fn measure_stream(
     }
 
     Ok(StreamMetrics {
-        started_at,
+        wall: last_arrival.duration_since(started_at),
         latencies,
     })
 }
@@ -365,7 +378,7 @@ async fn run_width(
         (Ok(_), Err(error)) => return Err(error),
     };
 
-    let wall_s = metrics.started_at.elapsed().as_secs_f64();
+    let wall_s = metrics.wall.as_secs_f64();
     if !wall_s.is_finite() || wall_s <= 0.0 {
         return Err(BenchError::InvalidArgument(
             "measured wall time must be finite and positive",
