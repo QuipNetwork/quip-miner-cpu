@@ -79,7 +79,7 @@ impl MpsSampler {
     /// # Examples
     ///
     /// ```
-    /// use quip_miner_cpu::{InitMode, IsingGraph, MpsConfig, MpsSampler, SampleParams};
+    /// use quip_solver_cpu::{InitMode, IsingGraph, MpsConfig, MpsSampler, SampleParams};
     /// use quip_solver_core::{SampleError, Sampler};
     ///
     /// # fn main() -> Result<(), SampleError> {

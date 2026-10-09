@@ -206,7 +206,7 @@ impl SaSampler {
     /// # Examples
     ///
     /// ```
-    /// use quip_miner_cpu::{IsingGraph, SaSampler, SaVariant, SampleParams};
+    /// use quip_solver_cpu::{IsingGraph, SaSampler, SaVariant, SampleParams};
     /// use quip_solver_core::{SampleError, Sampler};
     ///
     /// # fn main() -> Result<(), SampleError> {
@@ -247,9 +247,9 @@ impl SaSampler {
     /// # Examples
     ///
     /// ```
-    /// use quip_miner_cpu::{IsingGraph, SaSampler, SaVariant, SampleParams, SeededStart};
+    /// use quip_solver_cpu::{IsingGraph, SaSampler, SaVariant, SampleParams, SeededStart};
     ///
-    /// # fn main() -> Result<(), quip_miner_cpu::SeedError> {
+    /// # fn main() -> Result<(), quip_solver_cpu::SeedError> {
     /// // A ferromagnetic pair, seeded with a ground state and started cold.
     /// let graph = IsingGraph::new(vec![0.0, 0.0], vec![-1.0], vec![(0, 1)]);
     /// let params = SampleParams {

@@ -186,7 +186,7 @@ fn extended_energy(
 /// # Examples
 ///
 /// ```
-/// use quip_miner_cpu::{sample_ggsb, GgsbConfig, IsingGraph, SampleParams, DSB};
+/// use quip_solver_cpu::{sample_ggsb, GgsbConfig, IsingGraph, SampleParams, DSB};
 ///
 /// let graph = IsingGraph::new(vec![0.0, 0.0], vec![-1.0], vec![(0, 1)]);
 /// let params = SampleParams { num_reads: 4, num_sweeps: 200, seed: 1, ..Default::default() };

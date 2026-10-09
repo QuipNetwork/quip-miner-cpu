@@ -1,8 +1,8 @@
 //! CPU globally guided discrete simulated-bifurcation miner (`quip-cpu-ggdsb`).
 
 use clap::Parser;
-use quip_miner_cpu::{GgsbConfig, SbSampler, CPU_GGDSB_IDENTITY, DSB};
 use quip_solver_core::{run, CommonArgs};
+use quip_solver_cpu::{GgsbConfig, SbSampler, CPU_GGDSB_IDENTITY, DSB};
 use std::process::ExitCode;
 
 #[derive(Parser)]

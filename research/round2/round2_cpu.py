@@ -46,7 +46,7 @@ from pathlib import Path
 from statistics import median
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from quip_miner_dwave import regime_io, round2_io
+from quip_solver_dwave import regime_io, round2_io
 
 import round2_runner as runner
 

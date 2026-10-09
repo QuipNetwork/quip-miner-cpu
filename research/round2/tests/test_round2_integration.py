@@ -38,14 +38,14 @@ from typing import Any, Dict, List
 
 import numpy as np
 
-from quip_miner_dwave import regime_io, round2_io
-from quip_miner_dwave.ocean import SampleResult
+from quip_solver_dwave import regime_io, round2_io
+from quip_solver_dwave.ocean import SampleResult
 
 import round2_metrics as metrics
 import round2_report as report
 import round2_runner as runner
 
-D_ROOT = Path("/home/carback1/quip-miner-dwave")
+D_ROOT = Path("/home/carback1/quip-solver-dwave")
 CAPTURE_SCRIPT = D_ROOT / "scripts" / "round2_capture.py"
 
 CELL = "native-pm1"

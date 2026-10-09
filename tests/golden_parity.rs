@@ -1,8 +1,8 @@
 //! Consensus: reported energies must match `energy_milli` and golden vectors.
 
-use quip_miner_cpu::{sample_ising, Algorithm, IsingGraph, SampleParams, SamplerResult};
 use quip_protocol::scoring::energy_milli;
 use quip_protocol::wire::{decode_spins, encode_spins};
+use quip_solver_cpu::{sample_ising, Algorithm, IsingGraph, SampleParams, SamplerResult};
 use serde_json::Value;
 use std::fs;
 

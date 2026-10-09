@@ -1,8 +1,8 @@
 //! CPU replica-ring simulated-bifurcation miner (`quip-cpu-sbqa`).
 
 use clap::Parser;
-use quip_miner_cpu::{SbSampler, SbqaConfig, CPU_SBQA_IDENTITY};
 use quip_solver_core::{run, CommonArgs};
+use quip_solver_cpu::{SbSampler, SbqaConfig, CPU_SBQA_IDENTITY};
 use std::process::ExitCode;
 
 #[derive(Parser)]

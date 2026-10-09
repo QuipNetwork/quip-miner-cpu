@@ -3,7 +3,7 @@ stages: [test, build, release]
 variables:
   CARGO_HOME: $CI_PROJECT_DIR/.cargo
   # Downloadable binaries live in the generic package registry under this name.
-  PKG: quip-miner-cpu
+  PKG: quip-solver-cpu
   # 16 binary targets on three platforms. The build jobs read the target list
   # out of the manifest, so this number is the one place a new binary has to be
   # acknowledged by hand. Publishing a binary stays a deliberate decision.
@@ -242,7 +242,7 @@ release:
         exit 1
       fi
       base="${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/${PKG}/${CI_COMMIT_TAG}"
-      set -- --name "quip-miner-cpu ${CI_COMMIT_TAG}" --tag-name "${CI_COMMIT_TAG}"
+      set -- --name "quip-solver-cpu ${CI_COMMIT_TAG}" --tag-name "${CI_COMMIT_TAG}"
       # An asset name stays exactly <binary>-<os>-<arch>. `glab release
       # download` writes the asset name as the file name and matches its
       # --asset-name glob against it, so a marker here would put spaces in

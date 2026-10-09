@@ -15,8 +15,8 @@
 //! topology's `allowed_j_milli` set, which is {-1000, +1000} for this fixture.
 
 use quip_solver_core::{Algorithm, IsingGraph, SampleParams};
-use quip_miner_cpu::gibbs_parallel::{sample_gibbs_with, GibbsConfig};
-use quip_miner_cpu::{sample_ising, sample_ising_mps, sample_sb, InitMode, MpsConfig, BSB, DSB};
+use quip_solver_cpu::gibbs_parallel::{sample_gibbs_with, GibbsConfig};
+use quip_solver_cpu::{sample_ising, sample_ising_mps, sample_sb, InitMode, MpsConfig, BSB, DSB};
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
 use std::collections::HashSet;

@@ -852,30 +852,14 @@ dependencies = [
 ]
 
 [[package]]
-name = "quip-miner-cpu"
-version = "0.3.4-rc3"
-dependencies = [
- "clap",
- "crossbeam-channel",
- "quip-proto",
- "quip-protocol",
- "quip-solver-core",
- "rand",
- "serde",
- "tokio",
- "toml 0.8.23",
- "tracing",
-]
-
-[[package]]
 name = "quip-msa-py"
 version = "0.1.0"
 dependencies = [
  "numpy",
  "pyo3",
- "quip-miner-cpu",
  "quip-protocol",
  "quip-solver-core",
+ "quip-solver-cpu",
 ]
 
 [[package]]
@@ -921,6 +905,22 @@ dependencies = [
  "tower 0.5.3",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "quip-solver-cpu"
+version = "0.3.4-rc3"
+dependencies = [
+ "clap",
+ "crossbeam-channel",
+ "quip-proto",
+ "quip-protocol",
+ "quip-solver-core",
+ "rand",
+ "serde",
+ "tokio",
+ "toml 0.8.23",
+ "tracing",
 ]
 
 [[package]]

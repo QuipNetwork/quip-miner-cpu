@@ -326,7 +326,7 @@ impl CpuSampler {
     /// # Examples
     ///
     /// ```
-    /// use quip_miner_cpu::{Algorithm, CpuSampler, IsingGraph, SampleParams};
+    /// use quip_solver_cpu::{Algorithm, CpuSampler, IsingGraph, SampleParams};
     /// use quip_solver_core::{SampleError, Sampler};
     ///
     /// # fn main() -> Result<(), SampleError> {

@@ -42,7 +42,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from quip_miner_dwave import regime_io, regimes
+from quip_solver_dwave import regime_io, regimes
 
 import round2_metrics as metrics
 import round2_runner as runner

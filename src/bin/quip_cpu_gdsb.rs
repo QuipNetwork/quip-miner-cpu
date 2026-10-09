@@ -3,8 +3,8 @@
 //! ballistic form.
 
 use clap::Parser;
-use quip_miner_cpu::{SbSampler, CPU_GDSB_IDENTITY, GDSB};
 use quip_solver_core::{run, CommonArgs};
+use quip_solver_cpu::{SbSampler, CPU_GDSB_IDENTITY, GDSB};
 use std::process::ExitCode;
 
 #[derive(Parser)]

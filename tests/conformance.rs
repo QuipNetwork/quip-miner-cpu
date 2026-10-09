@@ -42,7 +42,7 @@ fn profile_bin(name: &str) -> String {
 /// experimental SB and tensor-network binaries need it, the production ones do
 /// not.
 fn ensure_built_with(package_bins: &[&str], features: &[&str]) {
-    let mut args: Vec<String> = vec!["build".into(), "-p".into(), "quip-miner-cpu".into()];
+    let mut args: Vec<String> = vec!["build".into(), "-p".into(), "quip-solver-cpu".into()];
     if !features.is_empty() {
         args.push("--features".into());
         args.push(features.join(","));
@@ -50,8 +50,8 @@ fn ensure_built_with(package_bins: &[&str], features: &[&str]) {
     let status = Command::new(env!("CARGO"))
         .args(&args)
         .status()
-        .expect("cargo build quip-miner-cpu");
-    assert!(status.success(), "failed to build quip-miner-cpu");
+        .expect("cargo build quip-solver-cpu");
+    assert!(status.success(), "failed to build quip-solver-cpu");
     for b in package_bins {
         assert!(
             std::path::Path::new(&profile_bin(b)).exists(),

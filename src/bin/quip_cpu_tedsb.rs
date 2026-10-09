@@ -1,8 +1,8 @@
 //! CPU tabu-enhanced discrete simulated-bifurcation miner (`quip-cpu-tedsb`).
 
 use clap::Parser;
-use quip_miner_cpu::{SbSampler, TesbConfig, CPU_TEDSB_IDENTITY, DSB};
 use quip_solver_core::{run, CommonArgs};
+use quip_solver_cpu::{SbSampler, TesbConfig, CPU_TEDSB_IDENTITY, DSB};
 use std::process::ExitCode;
 
 #[derive(Parser)]

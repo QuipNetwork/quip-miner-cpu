@@ -1,8 +1,8 @@
 //! CPU multi-spin coded annealing miner (`quip-cpu-msa`).
 
 use clap::Parser;
-use quip_miner_cpu::{SaSampler, SaVariant, CPU_MSA_IDENTITY};
 use quip_solver_core::{run, CommonArgs};
+use quip_solver_cpu::{SaSampler, SaVariant, CPU_MSA_IDENTITY};
 use std::process::ExitCode;
 
 #[derive(Parser)]

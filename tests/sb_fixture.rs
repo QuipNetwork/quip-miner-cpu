@@ -10,11 +10,11 @@
 //! Regenerate and review the diff with:
 //!
 //! ```sh
-//! UPDATE_FIXTURE=1 cargo test --release -p quip-miner-cpu \
+//! UPDATE_FIXTURE=1 cargo test --release -p quip-solver-cpu \
 //!   --test sb_fixture sb_kernel_matches_the_determinism_fixture -- --exact
 //! ```
 
-use quip_miner_cpu::{
+use quip_solver_cpu::{
     sample_ggsb, sample_sb, sample_sbqa, sample_tesb, GgsbConfig, IsingGraph, SampleParams,
     SamplerResult, SbqaConfig, TesbConfig, BSB, DSB, GBSB, GDSB, HBSB, HDSB,
 };

@@ -2,7 +2,7 @@
 
 Task 8 of docs/superpowers/plans/2026-09-22-regime-search-round2.md: the
 controlled CPU comparison runner and the five-model CPU pilot. See
-``quip_miner_dwave.round2_runner`` for the module under test. Tests that need
+``quip_solver_dwave.round2_runner`` for the module under test. Tests that need
 a solver double never call the real ``quip_msa``
 kernel: they exercise the runner's own invariant checks (wrong observed
 kernel, nonfinite score, unsupported unit arm) against a scripted fake, which
@@ -25,7 +25,7 @@ from typing import Any
 import numpy as np
 import pytest
 
-from quip_miner_dwave import regimes, round2_io
+from quip_solver_dwave import regimes, round2_io
 
 import round2_runner as runner
 

@@ -1,6 +1,6 @@
 //! SB particle-level parallelism: workers split the particles inside one read.
 use quip_solver_core::{IsingGraph, SampleParams};
-use quip_miner_cpu::{sample_sb_with_workers, DSB};
+use quip_solver_cpu::{sample_sb_with_workers, DSB};
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
 use std::time::Instant;
