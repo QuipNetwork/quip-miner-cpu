@@ -1,8 +1,8 @@
 //! Reproducible CPU multi-spin annealing measurement harness.
 
 use clap::Parser;
-use quip_miner_cpu::{IsingGraph, SaSampler, SaVariant, SampleParams};
 use quip_solver_core::{Sampler, SamplerResult};
+use quip_solver_cpu::{IsingGraph, SaSampler, SaVariant, SampleParams};
 use std::collections::BTreeSet;
 use std::fmt;
 use std::time::Instant;

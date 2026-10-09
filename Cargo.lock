@@ -798,25 +798,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a1d01941d82fa2ab50be1e79e6714289dd7cde78eba4c074bc5a4374f650dfe0"
 
 [[package]]
-name = "quip-miner-cpu"
-version = "0.3.4-rc3"
-dependencies = [
- "clap",
- "crossbeam-channel",
- "proptest",
- "quip-proto",
- "quip-protocol",
- "quip-solver-conformance",
- "quip-solver-core",
- "rand 0.8.7",
- "serde",
- "serde_json",
- "tokio",
- "toml 0.8.23",
- "tracing",
-]
-
-[[package]]
 name = "quip-proto"
 version = "0.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -877,6 +858,25 @@ dependencies = [
  "tower 0.5.3",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "quip-solver-cpu"
+version = "0.3.4-rc4"
+dependencies = [
+ "clap",
+ "crossbeam-channel",
+ "proptest",
+ "quip-proto",
+ "quip-protocol",
+ "quip-solver-conformance",
+ "quip-solver-core",
+ "rand 0.8.7",
+ "serde",
+ "serde_json",
+ "tokio",
+ "toml 0.8.23",
+ "tracing",
 ]
 
 [[package]]

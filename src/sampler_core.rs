@@ -327,7 +327,7 @@ fn score_spins(spins: &[i8], graph: &IsingGraph) -> SamplerResult {
 /// # Examples
 ///
 /// ```
-/// use quip_miner_cpu::{sample_ising, Algorithm, IsingGraph, SampleParams};
+/// use quip_solver_cpu::{sample_ising, Algorithm, IsingGraph, SampleParams};
 ///
 /// let graph = IsingGraph::new(vec![0.0, 0.0], vec![-1.0], vec![(0, 1)]);
 /// let params = SampleParams {

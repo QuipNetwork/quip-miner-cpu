@@ -16,11 +16,11 @@
 // word update is 64 spin updates, and the last column converts that into the
 // figure a 36-read job actually sees, where 28 of the 64 lanes are idle.
 
-use quip_miner_cpu::sa_int::{
+use quip_solver_cpu::sa_int::{
     acceptance_table, anneal_from, anneal_one_read_int, sweep_offsets, threshold_draws, IntGraph,
 };
-use quip_miner_cpu::sa_msc::{anneal_word, bond_counts, MscState, LANES};
-use quip_miner_cpu::sampler_core::{anneal_one_read, random_spins, CpuGraph};
+use quip_solver_cpu::sa_msc::{anneal_word, bond_counts, MscState, LANES};
+use quip_solver_cpu::sampler_core::{anneal_one_read, random_spins, CpuGraph};
 use quip_solver_core::beta::geometric_beta_schedule;
 use quip_solver_core::IsingGraph;
 use rand::rngs::SmallRng;

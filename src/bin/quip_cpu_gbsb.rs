@@ -2,8 +2,8 @@
 //! bSB with edge-of-chaos control of each particle's bifurcation parameter.
 
 use clap::Parser;
-use quip_miner_cpu::{SbSampler, CPU_GBSB_IDENTITY, GBSB};
 use quip_solver_core::{run, CommonArgs};
+use quip_solver_cpu::{SbSampler, CPU_GBSB_IDENTITY, GBSB};
 use std::process::ExitCode;
 
 #[derive(Parser)]

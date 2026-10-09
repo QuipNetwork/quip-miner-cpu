@@ -126,7 +126,7 @@ pub(crate) fn warm_up_columns(
 /// # Examples
 ///
 /// ```
-/// use quip_miner_cpu::{sample_tesb, IsingGraph, SampleParams, TesbConfig, DSB};
+/// use quip_solver_cpu::{sample_tesb, IsingGraph, SampleParams, TesbConfig, DSB};
 ///
 /// let graph = IsingGraph::new(vec![0.0, 0.0], vec![-1.0], vec![(0, 1)]);
 /// let params = SampleParams { num_reads: 4, num_sweeps: 200, seed: 1, ..Default::default() };

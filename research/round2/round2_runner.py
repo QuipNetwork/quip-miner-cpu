@@ -46,7 +46,7 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
-from quip_miner_dwave import regimes, round2_io
+from quip_solver_dwave import regimes, round2_io
 
 PathLike = os.PathLike
 
@@ -663,7 +663,7 @@ def job_solver_identity(job: CpuJob, identity: Mapping[str, Any]) -> Dict[str, A
 
 
 #: cubic-dimer-pm1's unit bond, in energy units (UNIT_MILLI["cubic-dimer-pm1"] = 500 milli
-#: in quip_miner_dwave.regimes, divided by the milli-to-energy-units factor of 1000).
+#: in quip_solver_dwave.regimes, divided by the milli-to-energy-units factor of 1000).
 CUBIC_DIMER_UNIT_ENERGY = 0.5
 
 

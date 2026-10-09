@@ -1,8 +1,8 @@
 //! CPU tabulated-threshold annealing miner (`quip-cpu-fsa`).
 
 use clap::Parser;
-use quip_miner_cpu::{SaSampler, SaVariant, CPU_FSA_IDENTITY};
 use quip_solver_core::{run, CommonArgs};
+use quip_solver_cpu::{SaSampler, SaVariant, CPU_FSA_IDENTITY};
 use std::process::ExitCode;
 
 #[derive(Parser)]

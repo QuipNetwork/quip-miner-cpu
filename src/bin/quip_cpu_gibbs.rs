@@ -1,10 +1,10 @@
 //! CPU chromatic Gibbs miner (`quip-cpu-gibbs`).
 
 use clap::Parser;
-use quip_miner_cpu::{
+use quip_solver_core::{run, CommonArgs};
+use quip_solver_cpu::{
     Algorithm, CpuSampler, GibbsConfig, GibbsCpuSampler, GibbsParallelism, CPU_GIBBS_IDENTITY,
 };
-use quip_solver_core::{run, CommonArgs};
 use std::process::ExitCode;
 
 #[derive(Parser)]
@@ -15,7 +15,7 @@ struct Cli {
 
     /// Workers splitting each colour class. The default is the measured best
     /// setting; higher counts scale worse and oversubscription is refused.
-    #[arg(long, default_value_t = quip_miner_cpu::gibbs_parallel::DEFAULT_GIBBS_WORKERS)]
+    #[arg(long, default_value_t = quip_solver_cpu::gibbs_parallel::DEFAULT_GIBBS_WORKERS)]
     gibbs_workers: usize,
 
     /// Refuse any graph needing more than this many colour classes.

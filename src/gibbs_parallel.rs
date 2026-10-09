@@ -272,8 +272,8 @@ fn update_range(
 /// # Examples
 ///
 /// ```
-/// use quip_miner_cpu::gibbs_parallel::sample_gibbs_parallel;
-/// use quip_miner_cpu::{IsingGraph, SampleParams};
+/// use quip_solver_cpu::gibbs_parallel::sample_gibbs_parallel;
+/// use quip_solver_cpu::{IsingGraph, SampleParams};
 ///
 /// let graph = IsingGraph::new(vec![0.0, 0.0], vec![-1.0], vec![(0, 1)]);
 /// let params = SampleParams { num_reads: 2, num_sweeps: 64, seed: 1, ..Default::default() };

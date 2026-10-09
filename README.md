@@ -1,4 +1,4 @@
-# quip-miner-cpu
+# quip-solver-cpu
 
 CPU Ising miners for the [quip.network](https://gitlab.com/quip.network) v0.3
 mining protocol: simulated annealing (`quip-cpu-sa`), single-site chromatic
@@ -46,7 +46,7 @@ the constants, and the paper behind each Simulated Bifurcation kernel, and
 names every place the code departs from its paper.
 
 Prebuilt binaries are attached to each
-[Release](https://gitlab.com/quip.network/quip-miner-cpu/-/releases) for
+[Release](https://gitlab.com/quip.network/quip-solver-cpu/-/releases) for
 `linux-amd64`, `linux-arm64`, and `darwin-arm64`. Asset names carry the
 operating system as well as the architecture, because an architecture alone
 cannot separate a Linux aarch64 binary from a Darwin arm64 one.

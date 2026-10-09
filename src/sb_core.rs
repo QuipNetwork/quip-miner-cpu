@@ -619,7 +619,7 @@ pub(crate) fn gauge_fixed_spins(g: &SbGraph, x: &[Real]) -> Vec<i8> {
 /// # Examples
 ///
 /// ```
-/// use quip_miner_cpu::{sample_sb, IsingGraph, SampleParams, DSB};
+/// use quip_solver_cpu::{sample_sb, IsingGraph, SampleParams, DSB};
 ///
 /// let graph = IsingGraph::new(vec![0.0, 0.0], vec![-1.0], vec![(0, 1)]);
 /// let params = SampleParams {

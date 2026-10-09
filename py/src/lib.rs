@@ -14,7 +14,7 @@ use pyo3::prelude::*;
 use pyo3::types::PyDict;
 pyo3::create_exception!(quip_msa, MemoryLimitError, PyValueError);
 
-use quip_miner_cpu::{
+use quip_solver_cpu::{
     sample_research, IsingGraph, ResearchError, ResearchKernel, SaSampler, SaVariant, SampleParams,
     Sampler, SeededStart,
 };

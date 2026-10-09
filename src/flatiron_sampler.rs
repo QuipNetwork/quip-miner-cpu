@@ -41,7 +41,7 @@ impl FlatironSampler {
     /// # Examples
     ///
     /// ```
-    /// use quip_miner_cpu::{FlatironConfig, FlatironSampler, IsingGraph, SampleParams};
+    /// use quip_solver_cpu::{FlatironConfig, FlatironSampler, IsingGraph, SampleParams};
     /// use quip_solver_core::{SampleError, Sampler};
     ///
     /// # fn main() -> Result<(), SampleError> {

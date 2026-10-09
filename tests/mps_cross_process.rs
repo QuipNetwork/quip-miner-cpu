@@ -17,7 +17,7 @@
 //! fixture notices a single Trotter step, so the cross-process check would catch
 //! anything that lets the machine decide where the anneal stops.
 
-use quip_miner_cpu::{sample_ising_mps, InitMode, IsingGraph, MpsConfig, SampleParams};
+use quip_solver_cpu::{sample_ising_mps, InitMode, IsingGraph, MpsConfig, SampleParams};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 

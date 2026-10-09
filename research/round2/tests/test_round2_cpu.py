@@ -18,7 +18,7 @@ from typing import Any, Dict
 import numpy as np
 import pytest
 
-from quip_miner_dwave import round2_io
+from quip_solver_dwave import round2_io
 
 import round2_cpu as cpu
 import round2_runner as runner
@@ -294,7 +294,7 @@ def test_cmd_run_one_writes_samples_before_the_record(tmp_path, monkeypatch):
 
     written_order = []
 
-    import quip_miner_dwave.regime_io as regime_io_module
+    import quip_solver_dwave.regime_io as regime_io_module
 
     original_savez = regime_io_module.atomic_savez
     original_write_json = regime_io_module.atomic_write_json

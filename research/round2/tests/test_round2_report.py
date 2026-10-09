@@ -1536,7 +1536,7 @@ def test_paired_gaps_table_states_no_comparable_pairs_when_none_exist():
 
 
 def test_reconcile_spend_compares_the_charged_total_against_capture_access_us(tmp_path):
-    from quip_miner_dwave import regime_io
+    from quip_solver_dwave import regime_io
 
     qpu_root = tmp_path / "qpu-physical-pilot"
     regime_io.append_spend(qpu_root, regime_io.SUBMIT, "diamond-pm1", "aa", 80, 50_000)
@@ -1551,7 +1551,7 @@ def test_reconcile_spend_compares_the_charged_total_against_capture_access_us(tm
 
 
 def test_reconcile_spend_flags_a_mismatch_between_charges_and_captures(tmp_path):
-    from quip_miner_dwave import regime_io
+    from quip_solver_dwave import regime_io
 
     qpu_root = tmp_path / "qpu-physical-pilot"
     regime_io.append_spend(qpu_root, regime_io.SUBMIT, "diamond-pm1", "aa", 80, 50_000)

@@ -271,7 +271,7 @@ fn anneal(
 /// # Examples
 ///
 /// ```
-/// use quip_miner_cpu::{sample_ising_mps, InitMode, IsingGraph, MpsConfig, SampleParams};
+/// use quip_solver_cpu::{sample_ising_mps, InitMode, IsingGraph, MpsConfig, SampleParams};
 ///
 /// let graph = IsingGraph::new(vec![0.0, 0.0], vec![-1.0], vec![(0, 1)]);
 /// let params = SampleParams { num_reads: 4, num_sweeps: 64, seed: 1, ..Default::default() };

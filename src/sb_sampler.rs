@@ -173,7 +173,7 @@ impl SbSampler {
     /// # Examples
     ///
     /// ```
-    /// use quip_miner_cpu::{IsingGraph, SampleParams, SbSampler, DSB};
+    /// use quip_solver_cpu::{IsingGraph, SampleParams, SbSampler, DSB};
     /// use quip_solver_core::{SampleError, Sampler};
     ///
     /// # fn main() -> Result<(), SampleError> {
