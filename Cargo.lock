@@ -862,7 +862,7 @@ dependencies = [
 
 [[package]]
 name = "quip-solver-cpu"
-version = "0.3.4-rc3"
+version = "0.3.4-rc4"
 dependencies = [
  "clap",
  "crossbeam-channel",
