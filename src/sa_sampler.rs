@@ -51,6 +51,7 @@ pub const CPU_FSA_IDENTITY: BackendIdentity = BackendIdentity {
     max_edges: DEFAULT_MAX_EDGES,
     features: &[],
     adapt: CPU_ADAPT,
+    limits: quip_solver_core::ModelLimits::UNSTATED,
 };
 
 /// Backend identity for `quip-cpu-msa` (multi-spin coded annealing).
@@ -66,6 +67,7 @@ pub const CPU_MSA_IDENTITY: BackendIdentity = BackendIdentity {
     max_edges: DEFAULT_MAX_EDGES,
     features: &[],
     adapt: CPU_MSA_ADAPT,
+    limits: quip_solver_core::ModelLimits::UNSTATED,
 };
 
 /// Adapt envelope for the multi-spin backend, matching CUDA `CUDA_MSA_ADAPT`.
@@ -886,6 +888,7 @@ mod tests {
                 sweeps_per_beta: 1,
                 beta_range: Some((0.05, 4.0)),
                 seed: 7,
+                schedule: quip_solver_core::BetaSchedule::Geometric,
             };
 
             let t_setup = Instant::now();
@@ -1168,6 +1171,7 @@ mod tests {
             sweeps_per_beta: 3,
             beta_range: Some((0.05, 0.15)),
             seed: 19,
+            schedule: quip_solver_core::BetaSchedule::Geometric,
         };
         let int = IntGraph::from_base(&graph).expect("unit graph");
         let mut rng = SmallRng::seed_from_u64(19 ^ 0x5341_5F54_424C_4531);

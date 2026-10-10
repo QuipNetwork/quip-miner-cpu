@@ -26,6 +26,7 @@ pub const CPU_FLATIRON_IDENTITY: BackendIdentity = BackendIdentity {
     max_edges: 524_288,
     features: &[],
     adapt: CPU_MPS_ADAPT,
+    limits: quip_solver_core::ModelLimits::UNSTATED,
 };
 
 /// BP-TNS sampler backend: imaginary-time simple update on the problem

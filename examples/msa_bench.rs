@@ -218,6 +218,7 @@ fn measure_case(case: Case, repeats: usize) -> Result<CaseResult, BenchError> {
         sweeps_per_beta: SWEEPS_PER_BETA,
         beta_range: Some(case.beta),
         seed: SEED,
+        schedule: quip_solver_core::BetaSchedule::Geometric,
     };
 
     let warmup_sampler = SaSampler::new(SaVariant::MultiSpin);
