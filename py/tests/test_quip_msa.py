@@ -121,34 +121,47 @@ def test_a_num_reads_of_zero_is_refused():
 
 
 def test_the_anneal_runs_with_the_gil_released():
-    # While a worker thread anneals, this thread must keep running Python.
-    # Counting loop passes does not show that: with the GIL held, this thread
-    # still spins for one 5 ms switch interval before the worker takes the GIL.
-    # What differs is how much of the call this thread stays responsive for.
-    # A gap of 20 ms or more between two passes is time spent parked, so it
-    # does not count.
+    # A second thread runs a pure Python loop and stamps the time every 0.5 ms
+    # it gets to run. With the GIL held, that thread can only run just before
+    # the call starts or just after it returns, because Python hands the GIL
+    # over at a bytecode boundary and the call has none. So we count the stamps
+    # that fall in the middle half of the call. Held: none. Released: hundreds
+    # on an idle machine, and still dozens when the runner is busy. The edges
+    # of the call are excluded so that the hand-over delay at either end cannot
+    # produce a false pass. The check reads progress, not elapsed time.
     h, edges, j, _ = ring(4096)
     msa = quip_msa.Msa()
 
-    def anneal():
+    stamps: list[float] = []
+    stop = threading.Event()
+
+    def ticker():
+        last = 0.0
+        while not stop.is_set():
+            now = time.perf_counter()
+            if now - last >= 0.0005:
+                stamps.append(now)
+                last = now
+
+    thread = threading.Thread(target=ticker)
+    thread.start()
+    try:
+        # Wait until the ticker is running, so that a slow thread start is not
+        # mistaken for a held GIL.
+        while not stamps:
+            time.sleep(0.001)
+        start = time.perf_counter()
         msa.sample(h, edges, j, num_sweeps=4096, num_reads=64, seed=1)
+        end = time.perf_counter()
+    finally:
+        stop.set()
+        thread.join()
 
-    t0 = time.perf_counter()
-    anneal()
-    alone = time.perf_counter() - t0
-
-    worker = threading.Thread(target=anneal)
-    worker.start()
-    responsive, prev = 0.0, time.perf_counter()
-    while worker.is_alive():
-        now = time.perf_counter()
-        if now - prev < 0.02:
-            responsive += now - prev
-        prev = now
-    worker.join()
-
-    assert responsive > 0.5 * alone, (
-        f"responsive for {responsive * 1000:.0f} ms of a {alone * 1000:.0f} ms anneal"
+    quarter = (end - start) / 4
+    inside = [t for t in stamps if start + quarter <= t <= end - quarter]
+    assert len(inside) >= 10, (
+        f"a second thread ticked {len(inside)} times in the middle half of a "
+        f"{(end - start) * 1000:.0f} ms anneal"
     )
 
 
