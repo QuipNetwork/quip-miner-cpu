@@ -835,6 +835,7 @@ mod tests {
             sweeps_per_beta: 1,
             seed: 19,
             beta_range: Some((0.1, 10.0)),
+            schedule: quip_solver_core::BetaSchedule::Geometric,
         };
         let start = SeededStart {
             spins: &seeds,
@@ -857,6 +858,7 @@ mod tests {
             sweeps_per_beta: 1,
             seed: 0xC01D,
             beta_range: Some((MAX_BETA, MAX_BETA)),
+            schedule: quip_solver_core::BetaSchedule::Geometric,
         };
 
         let float = sample_float_msa(&graph, &params, None, None).expect("valid float request");

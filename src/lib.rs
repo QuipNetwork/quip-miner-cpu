@@ -92,6 +92,7 @@ pub const CPU_SA_IDENTITY: BackendIdentity = BackendIdentity {
     // A real multi-lane `sample_stream` override; no utilization governor.
     features: &["streaming"],
     adapt: CPU_ADAPT,
+    limits: quip_solver_core::ModelLimits::UNSTATED,
 };
 
 /// Backend identity for `quip-cpu-gibbs`.
@@ -103,6 +104,7 @@ pub const CPU_GIBBS_IDENTITY: BackendIdentity = BackendIdentity {
     // Same capability set as `CPU_SA_IDENTITY`.
     features: &["streaming"],
     adapt: CPU_ADAPT,
+    limits: quip_solver_core::ModelLimits::UNSTATED,
 };
 
 /// Why a stream kernel returned no samples.

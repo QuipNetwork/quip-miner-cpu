@@ -47,6 +47,7 @@ pub const CPU_MPS_IDENTITY: BackendIdentity = BackendIdentity {
     max_edges: 524_288,
     features: &[],
     adapt: CPU_MPS_ADAPT,
+    limits: quip_solver_core::ModelLimits::UNSTATED,
 };
 
 /// Backend identity for `quip-cpu-mfa`: the tensor-network kernel with bond
@@ -64,6 +65,7 @@ pub const CPU_MFA_IDENTITY: BackendIdentity = BackendIdentity {
     max_edges: 524_288,
     features: &[],
     adapt: CPU_MPS_ADAPT,
+    limits: quip_solver_core::ModelLimits::UNSTATED,
 };
 
 /// Tensor-network sampler backend: imaginary-time TEBD, exact sampling, greedy

@@ -49,6 +49,7 @@ pub const CPU_SB_IDENTITY: BackendIdentity = BackendIdentity {
     max_edges: DEFAULT_MAX_EDGES,
     features: &[],
     adapt: CPU_SB_ADAPT,
+    limits: quip_solver_core::ModelLimits::UNSTATED,
 };
 
 /// Backend identity for `quip-cpu-bsb` (ballistic Simulated Bifurcation:
@@ -62,6 +63,7 @@ pub const CPU_BSB_IDENTITY: BackendIdentity = BackendIdentity {
     max_edges: DEFAULT_MAX_EDGES,
     features: &[],
     adapt: CPU_SB_ADAPT,
+    limits: quip_solver_core::ModelLimits::UNSTATED,
 };
 
 /// Backend identity for `quip-cpu-hdsb` (heated discrete Simulated
@@ -73,6 +75,7 @@ pub const CPU_HDSB_IDENTITY: BackendIdentity = BackendIdentity {
     max_edges: DEFAULT_MAX_EDGES,
     features: &[],
     adapt: CPU_SB_ADAPT,
+    limits: quip_solver_core::ModelLimits::UNSTATED,
 };
 
 /// Backend identity for `quip-cpu-hbsb` (heated ballistic Simulated
@@ -87,6 +90,7 @@ pub const CPU_HBSB_IDENTITY: BackendIdentity = BackendIdentity {
     max_edges: DEFAULT_MAX_EDGES,
     features: &[],
     adapt: CPU_SB_ADAPT,
+    limits: quip_solver_core::ModelLimits::UNSTATED,
 };
 
 /// Backend identity for `quip-cpu-gbsb` (generalized ballistic Simulated
@@ -99,6 +103,7 @@ pub const CPU_GBSB_IDENTITY: BackendIdentity = BackendIdentity {
     max_edges: DEFAULT_MAX_EDGES,
     features: &[],
     adapt: CPU_SB_ADAPT,
+    limits: quip_solver_core::ModelLimits::UNSTATED,
 };
 
 /// Backend identity for `quip-cpu-gdsb`: the same control on the discrete
@@ -111,6 +116,7 @@ pub const CPU_GDSB_IDENTITY: BackendIdentity = BackendIdentity {
     max_edges: DEFAULT_MAX_EDGES,
     features: &[],
     adapt: CPU_SB_ADAPT,
+    limits: quip_solver_core::ModelLimits::UNSTATED,
 };
 
 /// Backend identity for `quip-cpu-tedsb` (tabu-enhanced discrete Simulated
@@ -122,6 +128,7 @@ pub const CPU_TEDSB_IDENTITY: BackendIdentity = BackendIdentity {
     max_edges: DEFAULT_MAX_EDGES,
     features: &[],
     adapt: CPU_SB_ADAPT,
+    limits: quip_solver_core::ModelLimits::UNSTATED,
 };
 
 /// Backend identity for `quip-cpu-sbqa` (Simulated Bifurcation Quantum
@@ -133,6 +140,7 @@ pub const CPU_SBQA_IDENTITY: BackendIdentity = BackendIdentity {
     max_edges: DEFAULT_MAX_EDGES,
     features: &[],
     adapt: CPU_SB_ADAPT,
+    limits: quip_solver_core::ModelLimits::UNSTATED,
 };
 
 /// Backend identity for `quip-cpu-ggdsb` (globally guided discrete Simulated
@@ -144,6 +152,7 @@ pub const CPU_GGDSB_IDENTITY: BackendIdentity = BackendIdentity {
     max_edges: DEFAULT_MAX_EDGES,
     features: &[],
     adapt: CPU_SB_ADAPT,
+    limits: quip_solver_core::ModelLimits::UNSTATED,
 };
 
 /// Which SB kernel a sampler drives.

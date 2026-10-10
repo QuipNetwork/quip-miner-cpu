@@ -2,6 +2,7 @@
 
 use quip_proto::v1::RejectReason;
 use quip_solver_conformance::driver::{drive_miner, DriverReport};
+use quip_solver_conformance::solve::drive_solve;
 use std::process::Command;
 use std::sync::LazyLock;
 use tokio::sync::Mutex;
@@ -21,6 +22,110 @@ static GATE: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 async fn drive_miner_bounded(bin_path: &str, socket: &str) -> DriverReport {
     let _guard = GATE.lock().await;
     drive_miner(bin_path, socket).await
+}
+
+/// Grade the binary built by Cargo against the one-shot solve contract.
+async fn assert_solve_conformance(bin: &str) {
+    let _guard = GATE.lock().await;
+    let report = drive_solve(&profile_bin(bin)).await;
+    assert!(
+        report.is_conformant(),
+        "{bin} --solve failed conformance:\n{}",
+        report.summary()
+    );
+}
+
+#[tokio::test]
+async fn quip_cpu_sa_passes_solve_conformance() {
+    assert_solve_conformance("quip-cpu-sa").await;
+}
+
+#[tokio::test]
+async fn quip_cpu_gibbs_passes_solve_conformance() {
+    assert_solve_conformance("quip-cpu-gibbs").await;
+}
+
+#[tokio::test]
+async fn quip_cpu_sb_passes_solve_conformance() {
+    assert_solve_conformance("quip-cpu-sb").await;
+}
+
+#[cfg(feature = "experimental")]
+#[tokio::test]
+async fn quip_cpu_bsb_passes_solve_conformance() {
+    assert_solve_conformance("quip-cpu-bsb").await;
+}
+
+#[cfg(feature = "experimental")]
+#[tokio::test]
+async fn quip_cpu_hdsb_passes_solve_conformance() {
+    assert_solve_conformance("quip-cpu-hdsb").await;
+}
+
+#[cfg(feature = "experimental")]
+#[tokio::test]
+async fn quip_cpu_hbsb_passes_solve_conformance() {
+    assert_solve_conformance("quip-cpu-hbsb").await;
+}
+
+#[cfg(feature = "experimental")]
+#[tokio::test]
+async fn quip_cpu_gbsb_passes_solve_conformance() {
+    assert_solve_conformance("quip-cpu-gbsb").await;
+}
+
+#[cfg(feature = "experimental")]
+#[tokio::test]
+async fn quip_cpu_gdsb_passes_solve_conformance() {
+    assert_solve_conformance("quip-cpu-gdsb").await;
+}
+
+#[cfg(feature = "experimental")]
+#[tokio::test]
+async fn quip_cpu_tedsb_passes_solve_conformance() {
+    assert_solve_conformance("quip-cpu-tedsb").await;
+}
+
+#[cfg(feature = "experimental")]
+#[tokio::test]
+async fn quip_cpu_sbqa_passes_solve_conformance() {
+    assert_solve_conformance("quip-cpu-sbqa").await;
+}
+
+#[cfg(feature = "experimental")]
+#[tokio::test]
+async fn quip_cpu_ggdsb_passes_solve_conformance() {
+    assert_solve_conformance("quip-cpu-ggdsb").await;
+}
+
+#[cfg(feature = "experimental")]
+#[tokio::test]
+async fn quip_cpu_fsa_passes_solve_conformance() {
+    assert_solve_conformance("quip-cpu-fsa").await;
+}
+
+#[cfg(feature = "experimental")]
+#[tokio::test]
+async fn quip_cpu_msa_passes_solve_conformance() {
+    assert_solve_conformance("quip-cpu-msa").await;
+}
+
+#[cfg(feature = "experimental")]
+#[tokio::test]
+async fn quip_cpu_mps_passes_solve_conformance() {
+    assert_solve_conformance("quip-cpu-mps").await;
+}
+
+#[cfg(feature = "experimental")]
+#[tokio::test]
+async fn quip_cpu_mfa_passes_solve_conformance() {
+    assert_solve_conformance("quip-cpu-mfa").await;
+}
+
+#[cfg(feature = "experimental")]
+#[tokio::test]
+async fn quip_cpu_flatiron_passes_solve_conformance() {
+    assert_solve_conformance("quip-cpu-flatiron").await;
 }
 
 /// Cross-package binary path (deps/ → profile/ → bin).
