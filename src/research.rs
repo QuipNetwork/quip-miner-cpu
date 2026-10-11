@@ -372,7 +372,7 @@ fn sample_unit_research(
         results,
         graph,
         "unit-bit-sliced",
-        "shared-threshold-row-v1",
+        crate::sa_msc::RNG_SCHEME,
         seeded_reads,
         beta_ladder,
     ))
