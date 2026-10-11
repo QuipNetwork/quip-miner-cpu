@@ -36,16 +36,16 @@ seven timed repeats per case. Target-energy success rates require a separate cor
 
 ## Per-lane thresholds (QUI-1596)
 
-Unit MSA now draws a separate acceptance threshold for each lane. The row has
-512 entries, each with 64 lane thresholds. One beta rung draws
+The unit multi-spin kernel now draws a separate acceptance threshold for each
+lane. The row has 512 entries, each with 64 lane thresholds. One temperature rung draws
 32,768 thresholds. Each word reads the row from its own cyclic offset.
 
 The table shows median milliseconds per job after one warmup and five timed
-repeats. The baseline is commit `1d65a90` from `origin/main`. The other MSA
+repeats. The baseline is commit `1d65a90` from `origin/main`. The other multi-spin
 columns use this branch with the stated row width. The scalar column uses the
 current `cpu-sa` sampler on the same synthetic cases.
 
-| case | baseline MSA | row 256 | row 512 | row 1024 | row 2048 | current `cpu-sa` |
+| case | baseline multi-spin | row 256 | row 512 | row 1024 | row 2048 | current `cpu-sa` |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | `hot64` | 3.985 | 6.019 | 7.693 | 10.219 | 14.008 | 46.609 |
 | `mixed128` | 32.025 | 41.051 | 44.977 | 52.040 | 66.477 | 755.580 |
@@ -55,18 +55,18 @@ current `cpu-sa` sampler on the same synthetic cases.
 | `setup128` | 3.790 | 3.910 | 3.951 | 3.914 | 4.041 | 21.561 |
 | `setup128_fresh` | 3.992 | 4.139 | 4.147 | 4.200 | 4.192 | 21.485 |
 
-The selected row slows `hot64` by 1.93x and `mixed128` by 1.40x against the
-baseline MSA kernel. Setup cases slow by about 1.04x. On these synthetic jobs,
+The selected row slows `hot64` by 1.93x and `mixed128` by 1.40x relative to the
+baseline multi-spin kernel. Setup cases slow by about 1.04x. On these synthetic jobs,
 the new `cpu-msa` rate is 6.06x the current `cpu-sa` rate for `hot64` and
 16.80x for `mixed128`. These ratios divide the scalar median by the row-512
 median. They do not replace a corpus throughput measurement.
 
 Applying the measured 1.404x `mixed128` slowdown to the old corpus rate of
-958.7 jobs per minute gives about 682.6 jobs per minute. Against the old
+958.7 jobs per minute gives about 682.6 jobs per minute. Relative to the old
 `cpu-sa` rate of 110.8 jobs per minute, that projects to 6.16x. This estimate
 assumes the synthetic slowdown transfers unchanged to corpus throughput.
 
-The diversity test uses 64 reads per run. Each cell lists distinct MSA reads
+The diversity test uses 64 reads per run. Each cell lists distinct multi-spin reads
 for one model and sweep count. The scalar counts are 18 and 11 for the complete
 graph, and 64 and 64 for the ring.
 
@@ -86,15 +86,15 @@ command. Each cell shows the system uptime and the one-minute load average.
 
 | timed command | before `uptime` | after `uptime` |
 | --- | --- | --- |
-| baseline MSA | 32 days, 7:11 / 4.28 | 32 days, 7:12 / 7.41 |
+| baseline multi-spin | 32 days, 7:11 / 4.28 | 32 days, 7:12 / 7.41 |
 | row 256 | 32 days, 7:12 / 5.55 | 32 days, 7:12 / 5.74 |
 | row 512 | 32 days, 7:13 / 6.00 | 32 days, 7:13 / 6.00 |
 | row 1024 | 32 days, 7:13 / 5.85 | 32 days, 7:13 / 5.85 |
 | row 2048 | 32 days, 7:13 / 5.29 | 32 days, 7:13 / 7.03 |
 | current `cpu-sa` | 32 days, 7:17 / 2.83 | 32 days, 7:18 / 2.68 |
 
-The earlier corpus's 10.19x figure below describes the old MSA kernel against
-`sa-base`. The current corpus mining rate remains unmeasured. A new corpus
+The historical 958.7 jobs-per-minute result describes the old multi-spin kernel.
+The current corpus mining rate remains unmeasured. A new corpus
 replay can measure jobs per minute on the same instances.
 
 ## Earlier corpus results
@@ -207,7 +207,7 @@ described earlier.
 **The multi-spin coded kernel**, exposed as `cpu-msa`. One `u64` holds the same
 lattice spin across 64 replicas. A replica is a read, so a 64-read job is one
 word pass. Satisfied bonds accumulate in six bit planes through carry-save or
-ripple counting. The acceptance test compares that counter against per-lane
+ripple counting. The acceptance test compares that counter with per-lane
 thresholds. An early acceptance check skips counting when every lane must flip.
 
 ## Why `cpu-sa` itself changed
