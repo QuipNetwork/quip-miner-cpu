@@ -99,7 +99,8 @@ const CSA_NEIGHBORS: usize = 20;
 const CSA_INPUTS: usize = CSA_NEIGHBORS + 1;
 
 /// Per-lane threshold entries per beta rung. Power of two for masking.
-/// Chosen by the Task 3 measurement in `docs/sa-acceleration.md`.
+/// At 512 entries, both models stayed within two distinct reads of the
+/// 2048-entry row; 256 entries missed that limit on the dense model.
 pub(crate) const LANE_ROW: usize = 512;
 const _: () = assert!(LANE_ROW.is_power_of_two());
 
@@ -806,7 +807,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(clippy::print_stdout, reason = "report the measured read diversity")]
     fn dense_and_deep_runs_keep_distinct_reads() {
         let complete = unit_graph(28, 7, &[0.0], 1.0);
         let sparse_ring = ring(256);
@@ -841,7 +841,6 @@ mod tests {
                 counts.push((name, count, unit_distinct.len(), sa_distinct.len()));
             }
         }
-        println!("distinct read counts (model, sweeps, unit, sa): {counts:?}");
         assert!(
             counts
                 .iter()
