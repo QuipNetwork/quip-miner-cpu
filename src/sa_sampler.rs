@@ -1190,7 +1190,7 @@ mod tests {
             let state = MscState::random(5, &mut rng);
             for lane in 0..64.min(params.num_reads - base) {
                 let mut spins = state.lane(lane);
-                for (row, shifts) in draws.chunks_exact(8192).zip(offsets) {
+                for (row, shifts) in draws.as_chunks::<8192>().0.iter().zip(offsets) {
                     for off in shifts {
                         for var in [1, 3, 0, 2, 4] {
                             let mut field = graph.h[var];

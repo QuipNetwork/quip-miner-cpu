@@ -522,7 +522,12 @@ mod tests {
             let mut state = MscState::random(int.num_nodes(), &mut rng);
             let before: Vec<Vec<i8>> = (0..LANES).map(|l| state.lane(l)).collect();
             let nodes: Vec<u32> = (0..int.num_nodes() as u32).collect();
-            for (row, shifts) in draws.chunks_exact(draw_row()).zip(offsets.chunks_exact(2)) {
+            for (row, shifts) in draws
+                .as_chunks::<{ draw_row() }>()
+                .0
+                .iter()
+                .zip(offsets.as_chunks::<2>().0.iter())
+            {
                 for &off in shifts {
                     sweep_word(&int, &counts, row, &nodes, off, &mut state);
                 }

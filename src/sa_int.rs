@@ -388,7 +388,7 @@ pub(crate) fn anneal_from(
     const MASK: usize = DRAW_ROW - 1;
 
     let mut sweep = 0usize;
-    for row in draws.chunks_exact(DRAW_ROW) {
+    for row in draws.as_chunks::<DRAW_ROW>().0 {
         for _ in 0..sweeps_per_beta {
             if let Some((guard, watermark)) = cancel {
                 if guard.is_cancelled(watermark) {
