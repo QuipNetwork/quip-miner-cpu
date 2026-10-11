@@ -499,7 +499,7 @@ mod tests {
         assert_eq!(out.metadata.requested_kernel, "cpu-msa-f64");
         assert_eq!(out.metadata.observed_kernel, "cpu-msa-f64");
         assert_eq!(out.metadata.representation, "packed-spins-f64-fields");
-        assert_eq!(out.metadata.rng_scheme, "shared-node-threshold-v1");
+        assert_eq!(out.metadata.rng_scheme, "per-lane-draw-v1");
         assert!(out.metadata.workspace_bytes.is_some());
         for (spins, &e) in out.spins.iter().zip(&out.energies) {
             let expected = f64::from(spins[0]) * 0.125
