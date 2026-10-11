@@ -296,7 +296,7 @@ def test_concurrent_calls_match_serial_results():
 
 
 def test_memory_limit_raises_distinct_error():
-    h = np.zeros(100_000, dtype=np.float64)
+    h = np.zeros(2_000_000, dtype=np.float64)
     h[0] = 0.37
     edges = np.empty((0, 2), dtype=np.int64)
     j = np.empty(0, dtype=np.float64)

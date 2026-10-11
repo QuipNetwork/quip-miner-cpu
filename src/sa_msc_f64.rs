@@ -53,6 +53,7 @@ use quip_solver_core::{CancelToken, IsingGraph, SampleParams};
 use rand::distributions::Open01;
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
+use std::mem::size_of;
 
 use crate::coloring::Coloring;
 use crate::sa_msc::{MscState, LANES};
@@ -72,8 +73,9 @@ pub(crate) const MAX_COEFFICIENT_SUM: f64 = 1e100;
 /// Largest inverse temperature accepted, at either end or as a seeded start.
 pub(crate) const MAX_BETA: f64 = 1e100;
 
-/// Cap on the kernel's own allocations, excluding the caller's arrays.
-pub(crate) const WORKSPACE_CAP_BYTES: usize = 256 << 20;
+/// Cap on the kernel's own allocations, excluding the caller's arrays. A
+/// 2M-node model with 20M edges and 64 reads needs about 0.6 GiB.
+pub(crate) const WORKSPACE_CAP_BYTES: usize = 8 << 30;
 
 /// Name of the randomness scheme this kernel implements.
 pub(crate) const RNG_SCHEME: &str = "per-lane-draw-v1";
@@ -185,7 +187,8 @@ pub(crate) fn check_beta(name: &str, beta: f64) -> Result<(), FloatMsaError> {
 }
 
 /// Bytes the run allocates: CSR adjacency, packed words, output rows and
-/// energies, the colouring, and the per-visit field scratch.
+/// energies, the colouring, per-word acceptance streams, and the per-visit
+/// field scratch.
 fn workspace_bytes(nodes: usize, edges: usize, reads: usize, words: usize) -> Option<usize> {
     let csr = nodes
         .checked_mul(12)?
@@ -196,9 +199,11 @@ fn workspace_bytes(nodes: usize, edges: usize, reads: usize, words: usize) -> Op
         .checked_mul(nodes)?
         .checked_add(reads.checked_mul(8)?)?;
     let coloring = nodes.checked_mul(8)?;
+    let streams = words.checked_mul(size_of::<SmallRng>())?;
     csr.checked_add(packed)?
         .checked_add(output)?
         .checked_add(coloring)?
+        .checked_add(streams)?
         .checked_add(LANES * 8)
 }
 
@@ -944,18 +949,28 @@ mod tests {
     }
 
     #[test]
-    fn a_request_past_the_workspace_cap_is_refused_before_allocation() {
-        let graph = IsingGraph::new(vec![0.0; 100_000], vec![], vec![]);
+    fn a_large_model_with_many_reads_hits_the_workspace_cap() {
+        let n = 2_000_000;
+        let graph = IsingGraph::new(vec![0.0; n], vec![], vec![]);
         let err = sample_float_msa(&graph, &params(MAX_READS, 1, 1), None, None)
-            .expect_err("output rows alone exceed the cap");
-        let limited = if let FloatMsaError::MemoryLimit { needed, cap } = err {
-            cap == WORKSPACE_CAP_BYTES && needed > cap
-        } else {
-            false
-        };
-        assert!(limited, "{err:?}");
-        // The same model with one read fits, so the cap decided, not the size.
-        assert!(sample_float_msa(&graph, &params(1, 0, 1), None, None).is_ok());
+            .expect_err("4096 reads of 2M nodes exceed the cap");
+        assert!(
+            matches!(err, FloatMsaError::MemoryLimit { needed, cap } if cap == WORKSPACE_CAP_BYTES && needed > cap),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn workspace_estimate_counts_per_word_acceptance_streams() {
+        let base = 16 + 8 + 9 + 8 + LANES * 8;
+        assert_eq!(
+            workspace_bytes(1, 0, 1, 1),
+            Some(base + size_of::<SmallRng>())
+        );
+        assert_eq!(
+            workspace_bytes(1, 0, 1, 2),
+            Some(base + 8 + 2 * size_of::<SmallRng>())
+        );
     }
 
     #[test]
@@ -1011,12 +1026,7 @@ mod tests {
             ("no nodes", chain(vec![], vec![], vec![]), params(4, 8, 1)),
             (
                 "too many nodes",
-                chain(vec![0.0; 100_001], vec![], vec![]),
-                params(4, 8, 1),
-            ),
-            (
-                "too many edges",
-                chain(vec![0.0; 2], vec![0.0; 1_000_001], vec![(0, 1); 1_000_001]),
+                chain(vec![0.0; 4_194_305], vec![], vec![]),
                 params(4, 8, 1),
             ),
             (

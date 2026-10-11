@@ -62,8 +62,12 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-const DEFAULT_MAX_NODES: u32 = 100_000;
-const DEFAULT_MAX_EDGES: u32 = 1_000_000;
+/// Largest model every CPU sampler takes. Node ids stay below 2^31 (bit 31 of
+/// a `sa_int` neighbour id is the coupling sign) and directed edge slots below
+/// 2^32 (`u32` CSR offsets). Memory, not index width, bounds a job inside these
+/// caps. Sized for the 2M-variable SHA-256 QUBO (QUI-1807).
+const DEFAULT_MAX_NODES: u32 = 4_194_304;
+const DEFAULT_MAX_EDGES: u32 = 67_108_864;
 
 /// CPU adapt envelope.
 ///

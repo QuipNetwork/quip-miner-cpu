@@ -462,6 +462,32 @@ mod tests {
     }
 
     #[test]
+    fn a_two_million_node_chain_runs_on_both_msa_kernels() {
+        let n = 2_000_000;
+        let edges: Vec<(usize, usize)> = (0..n - 1).map(|v| (v, v + 1)).collect();
+        let unit = IsingGraph::new(vec![0.0; n], vec![-1.0; n - 1], edges.clone());
+        let float = IsingGraph::new(vec![0.25; n], vec![-0.5; n - 1], edges);
+        let p = params(64, 1, 3);
+        for (graph, kernel) in [
+            (&unit, ResearchKernel::UnitMsa),
+            (&float, ResearchKernel::FloatMsa),
+        ] {
+            let out = sample_research(graph, &p, kernel, None, None).expect("within the caps");
+            assert_eq!(out.spins.len(), 64);
+            assert_eq!(out.spins[0].len(), n);
+        }
+    }
+
+    #[test]
+    fn a_model_past_the_node_cap_is_refused() {
+        let graph = IsingGraph::new(vec![0.0; 4_194_305], vec![], vec![]);
+        for kernel in ResearchKernel::ALL {
+            let err = sample_research(&graph, &params(1, 1, 1), kernel, None, None).unwrap_err();
+            assert!(is_invalid(&err), "{kernel:?}: {err:?}");
+        }
+    }
+
+    #[test]
     fn kernel_names_round_trip_and_unknown_names_do_not_parse() {
         for kernel in ResearchKernel::ALL {
             assert_eq!(ResearchKernel::parse(kernel.name()), Some(kernel));
