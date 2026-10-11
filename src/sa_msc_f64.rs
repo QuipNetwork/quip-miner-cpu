@@ -164,6 +164,23 @@ fn invalid<T>(msg: String) -> Result<T, FloatMsaError> {
     Err(FloatMsaError::InvalidInput(msg))
 }
 
+pub(crate) fn check_size(nodes: usize, edges: usize) -> Result<(), FloatMsaError> {
+    if nodes == 0 {
+        return invalid("the problem has no nodes".to_owned());
+    }
+    if nodes > DEFAULT_MAX_NODES as usize {
+        return invalid(format!(
+            "{nodes} nodes exceed the limit of {DEFAULT_MAX_NODES}"
+        ));
+    }
+    if edges > DEFAULT_MAX_EDGES as usize {
+        return invalid(format!(
+            "{edges} edges exceed the limit of {DEFAULT_MAX_EDGES}"
+        ));
+    }
+    Ok(())
+}
+
 fn check_coefficient(name: &str, index: usize, value: f64) -> Result<(), FloatMsaError> {
     if !value.is_finite() {
         return invalid(format!("{name}[{index}] is not finite"));
@@ -214,19 +231,7 @@ fn validate(
 ) -> Result<Plan, FloatMsaError> {
     let nodes = graph.h.len();
     let edges = graph.edges.len();
-    if nodes == 0 {
-        return invalid("the problem has no nodes".to_owned());
-    }
-    if nodes > DEFAULT_MAX_NODES as usize {
-        return invalid(format!(
-            "{nodes} nodes exceed the limit of {DEFAULT_MAX_NODES}"
-        ));
-    }
-    if edges > DEFAULT_MAX_EDGES as usize {
-        return invalid(format!(
-            "{edges} edges exceed the limit of {DEFAULT_MAX_EDGES}"
-        ));
-    }
+    check_size(nodes, edges)?;
     if graph.j.len() != edges {
         return invalid(format!("{} couplings for {edges} edges", graph.j.len()));
     }
@@ -970,6 +975,28 @@ mod tests {
         assert_eq!(
             workspace_bytes(1, 0, 1, 2),
             Some(base + 8 + 2 * size_of::<SmallRng>())
+        );
+    }
+
+    #[test]
+    fn size_check_accepts_node_cap_and_rejects_the_next_node() {
+        assert_eq!(check_size(4_194_304, 0), Ok(()));
+        assert_eq!(
+            check_size(4_194_305, 0),
+            Err(FloatMsaError::InvalidInput(
+                "4194305 nodes exceed the limit of 4194304".to_owned()
+            ))
+        );
+    }
+
+    #[test]
+    fn size_check_accepts_edge_cap_and_rejects_the_next_edge() {
+        assert_eq!(check_size(1, 67_108_864), Ok(()));
+        assert_eq!(
+            check_size(1, 67_108_865),
+            Err(FloatMsaError::InvalidInput(
+                "67108865 edges exceed the limit of 67108864".to_owned()
+            ))
         );
     }
 

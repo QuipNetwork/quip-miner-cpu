@@ -16,10 +16,9 @@ use quip_solver_core::{CancelToken, IsingGraph, SampleParams, SamplerResult};
 
 use crate::sa_int::IntGraph;
 use crate::sa_msc::bond_counts;
-use crate::sa_msc_f64::{check_beta, energy_f64, sample_float_msa, FloatMsaError};
+use crate::sa_msc_f64::{check_beta, check_size, energy_f64, sample_float_msa, FloatMsaError};
 use crate::sa_sampler::{check_seeds, sample_unit_packed, SeededStart};
 use crate::sampler_core::{sample_sa_scalar, ScalarArithmetic};
-use crate::{DEFAULT_MAX_EDGES, DEFAULT_MAX_NODES};
 use quip_solver_core::beta::default_ising_beta_range;
 
 /// Most reads one research call may ask for, on any kernel.
@@ -141,6 +140,14 @@ fn invalid<T>(msg: String) -> Result<T, ResearchError> {
     Err(ResearchError::InvalidInput(msg))
 }
 
+fn map_float_error(error: FloatMsaError) -> ResearchError {
+    match error {
+        FloatMsaError::InvalidInput(msg) => ResearchError::InvalidInput(msg),
+        FloatMsaError::MemoryLimit { needed, cap } => ResearchError::MemoryLimit { needed, cap },
+        FloatMsaError::Cancelled => ResearchError::Cancelled,
+    }
+}
+
 /// The checks every kernel shares: a model the scorer can index, finite
 /// coefficients, and a schedule every kernel honours the same way. Bounds on
 /// coefficient values and memory live with the float kernel.
@@ -151,19 +158,7 @@ fn validate_common(
 ) -> Result<(), ResearchError> {
     let nodes = graph.h.len();
     let edges = graph.edges.len();
-    if nodes == 0 {
-        return invalid("the problem has no nodes".to_owned());
-    }
-    if nodes > DEFAULT_MAX_NODES as usize {
-        return invalid(format!(
-            "{nodes} nodes exceed the limit of {DEFAULT_MAX_NODES}"
-        ));
-    }
-    if edges > DEFAULT_MAX_EDGES as usize {
-        return invalid(format!(
-            "{edges} edges exceed the limit of {DEFAULT_MAX_EDGES}"
-        ));
-    }
+    check_size(nodes, edges).map_err(map_float_error)?;
     if graph.j.len() != edges {
         return invalid(format!("{} couplings for {edges} edges", graph.j.len()));
     }
@@ -384,11 +379,7 @@ fn sample_float_research(
     start: Option<SeededStart<'_>>,
     cancel: Option<(&CancelToken, Option<u64>)>,
 ) -> Result<ResearchSamples, ResearchError> {
-    let out = sample_float_msa(graph, params, start, cancel).map_err(|e| match e {
-        FloatMsaError::InvalidInput(msg) => ResearchError::InvalidInput(msg),
-        FloatMsaError::MemoryLimit { needed, cap } => ResearchError::MemoryLimit { needed, cap },
-        FloatMsaError::Cancelled => ResearchError::Cancelled,
-    })?;
+    let out = sample_float_msa(graph, params, start, cancel).map_err(map_float_error)?;
     Ok(ResearchSamples {
         spins: out.spins,
         energies: out.energies,
