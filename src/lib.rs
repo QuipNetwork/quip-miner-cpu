@@ -69,6 +69,14 @@ const DEFAULT_MAX_EDGES: u32 = 1_000_000;
 /// local-field cap, and every milli coefficient represented exactly. The
 /// integer fast paths (`sa_int`, `sa_msc`) take only the models they hold
 /// exactly and fall back to the f64 kernel for the rest, so they share these.
+///
+/// On `quip-cpu-msa` and `quip-cpu-fsa` that makes 1 milli exact, but not
+/// always MSA or FSA: a model outside the integer fast path (a coupling outside
+/// `{-1, 0, +1}`, or a field that is not a whole number of magnitude at most
+/// 100) runs on the plain `cpu-sa` kernel. On `quip-cpu-msa` a field above 1 in magnitude, or a
+/// node with more than 63 bonds counting its field, sends the model to the
+/// tabulated FSA kernel instead. A solver selector that needs MSA itself has to
+/// check the model as well as these limits.
 pub(crate) const F64_LIMITS: quip_solver_core::ModelLimits = quip_solver_core::ModelLimits {
     max_degree: Some(0),
     max_local_field_milli: Some(0),
