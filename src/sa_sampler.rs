@@ -49,9 +49,9 @@ pub const CPU_FSA_IDENTITY: BackendIdentity = BackendIdentity {
     algorithm: quip_proto::v1::Algorithm::Fsa,
     max_nodes: DEFAULT_MAX_NODES,
     max_edges: DEFAULT_MAX_EDGES,
-    features: &[],
+    features: crate::LINEAR_ONLY,
     adapt: CPU_ADAPT,
-    limits: quip_solver_core::ModelLimits::UNSTATED,
+    limits: crate::F64_LIMITS,
 };
 
 /// Backend identity for `quip-cpu-msa` (multi-spin coded annealing).
@@ -65,9 +65,9 @@ pub const CPU_MSA_IDENTITY: BackendIdentity = BackendIdentity {
     algorithm: quip_proto::v1::Algorithm::Msa,
     max_nodes: DEFAULT_MAX_NODES,
     max_edges: DEFAULT_MAX_EDGES,
-    features: &[],
+    features: crate::LINEAR_ONLY,
     adapt: CPU_MSA_ADAPT,
-    limits: quip_solver_core::ModelLimits::UNSTATED,
+    limits: crate::F64_LIMITS,
 };
 
 /// Adapt envelope for the multi-spin backend, matching CUDA `CUDA_MSA_ADAPT`.

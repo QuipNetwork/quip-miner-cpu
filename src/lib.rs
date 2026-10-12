@@ -65,6 +65,24 @@ use std::sync::Arc;
 const DEFAULT_MAX_NODES: u32 = 100_000;
 const DEFAULT_MAX_EDGES: u32 = 1_000_000;
 
+/// Model limits of every kernel that samples the f64 graph: no degree or
+/// local-field cap, and every milli coefficient represented exactly. The
+/// integer fast paths (`sa_int`, `sa_msc`) take only the models they hold
+/// exactly and fall back to the f64 kernel for the rest, so they share these.
+pub(crate) const F64_LIMITS: quip_solver_core::ModelLimits = quip_solver_core::ModelLimits {
+    max_degree: Some(0),
+    max_local_field_milli: Some(0),
+    exact_resolution_milli: Some(1),
+};
+
+/// Features of the f64 Metropolis and Gibbs identities. Each builds its ladder
+/// with `build_beta_schedule`, which honours `SampleParams::schedule`.
+const STREAMING_LINEAR: &[&str] = &["streaming", quip_solver_core::LINEAR_SCHEDULE_FEATURE];
+
+/// Features of the single-lane identities whose ladder honours
+/// `SampleParams::schedule`: the SA variants and the tensor-network kernels.
+pub(crate) const LINEAR_ONLY: &[&str] = &[quip_solver_core::LINEAR_SCHEDULE_FEATURE];
+
 /// CPU adapt envelope.
 ///
 /// Sized so one SA attempt on an Advantage2-scale graph finishes inside a
@@ -90,9 +108,9 @@ pub const CPU_SA_IDENTITY: BackendIdentity = BackendIdentity {
     max_nodes: DEFAULT_MAX_NODES,
     max_edges: DEFAULT_MAX_EDGES,
     // A real multi-lane `sample_stream` override; no utilization governor.
-    features: &["streaming"],
+    features: STREAMING_LINEAR,
     adapt: CPU_ADAPT,
-    limits: quip_solver_core::ModelLimits::UNSTATED,
+    limits: F64_LIMITS,
 };
 
 /// Backend identity for `quip-cpu-gibbs`.
@@ -102,9 +120,9 @@ pub const CPU_GIBBS_IDENTITY: BackendIdentity = BackendIdentity {
     max_nodes: DEFAULT_MAX_NODES,
     max_edges: DEFAULT_MAX_EDGES,
     // Same capability set as `CPU_SA_IDENTITY`.
-    features: &["streaming"],
+    features: STREAMING_LINEAR,
     adapt: CPU_ADAPT,
-    limits: quip_solver_core::ModelLimits::UNSTATED,
+    limits: F64_LIMITS,
 };
 
 /// Why a stream kernel returned no samples.

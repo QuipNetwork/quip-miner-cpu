@@ -2,7 +2,7 @@
 
 use quip_proto::v1::RejectReason;
 use quip_solver_conformance::driver::{drive_miner, DriverReport};
-use quip_solver_conformance::solve::drive_solve;
+use quip_solver_conformance::solve::{drive_solve, CaseOutcome};
 use std::process::Command;
 use std::sync::LazyLock;
 use tokio::sync::Mutex;
@@ -24,13 +24,22 @@ async fn drive_miner_bounded(bin_path: &str, socket: &str) -> DriverReport {
     drive_miner(bin_path, socket).await
 }
 
-/// Grade the binary built by Cargo against the one-shot solve contract.
+/// Grade the binary built by Cargo against the one-shot solve contract, and
+/// check the linear-schedule case ran against the right expectation: solved
+/// for an identity that lists `linear-schedule`, refused for one that does
+/// not. The gate grades both, so this pins which one each binary claims.
 async fn assert_solve_conformance(bin: &str) {
     let _guard = GATE.lock().await;
     let report = drive_solve(&profile_bin(bin)).await;
     assert!(
         report.is_conformant(),
         "{bin} --solve failed conformance:\n{}",
+        report.summary()
+    );
+    assert_eq!(
+        report.outcome("linear-schedule"),
+        Some(&CaseOutcome::Passed),
+        "{bin}:\n{}",
         report.summary()
     );
 }
@@ -126,6 +135,33 @@ async fn quip_cpu_mfa_passes_solve_conformance() {
 #[tokio::test]
 async fn quip_cpu_flatiron_passes_solve_conformance() {
     assert_solve_conformance("quip-cpu-flatiron").await;
+}
+
+/// The identities with a beta ladder list `linear-schedule`; the Simulated
+/// Bifurcation ones have none and do not. Every identity states its limits.
+#[test]
+fn capabilities_advertise_the_schedule_feature_and_limits() {
+    let bins = ["quip-cpu-sa", "quip-cpu-gibbs", "quip-cpu-sb"];
+    ensure_built(&bins);
+    for bin in bins {
+        let out = Command::new(profile_bin(bin))
+            .arg("--capabilities")
+            .output()
+            .unwrap();
+        let caps: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        let linear = caps["features"]
+            .as_array()
+            .is_some_and(|f| f.iter().any(|f| f == "linear-schedule"));
+        assert_eq!(linear, bin != "quip-cpu-sb", "{bin}: {caps}");
+        assert_eq!(caps["maxDegree"], 0, "{bin}: {caps}");
+        assert_eq!(caps["maxLocalFieldMilli"], 0, "{bin}: {caps}");
+        let resolution = if bin == "quip-cpu-sb" {
+            serde_json::Value::Null
+        } else {
+            serde_json::json!(1)
+        };
+        assert_eq!(caps["exactResolutionMilli"], resolution, "{bin}: {caps}");
+    }
 }
 
 /// Cross-package binary path (deps/ → profile/ → bin).
