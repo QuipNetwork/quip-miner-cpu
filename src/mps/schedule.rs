@@ -2,7 +2,9 @@
 //! become imaginary-time increments and a transverse-field ramp.
 //!
 //! The beta ladder is the same `quip_solver_core::beta` ladder the SA kernel
-//! uses, so `beta_range` means the same thing for every CPU backend. Imaginary
+//! uses, of the kind `SampleParams::schedule` names, so `beta_range` and the
+//! schedule kind mean the same thing for every CPU backend. Either kind rises
+//! monotonically, so every increment is non-negative. Imaginary
 //! time steps are the increments of that ladder, `eta_k = beta_k - beta_(k-1)`
 //! with `beta_0 = 0`, so the total imaginary time equals the final beta.
 //!
@@ -11,7 +13,7 @@
 //! increment makes every gate the identity, so running one would cost time and
 //! change nothing.
 
-use quip_solver_core::beta::{default_ising_beta_range, geometric_beta_schedule};
+use quip_solver_core::beta::default_ising_beta_range;
 use quip_solver_core::{IsingGraph, SampleParams};
 
 /// Trotter-step cap. Imaginary-time evolution reaches the ground state of a
@@ -79,7 +81,7 @@ pub(crate) fn build(graph: &IsingGraph, params: &SampleParams, steps: usize) -> 
     let (hot, cold) = params
         .beta_range
         .unwrap_or_else(|| default_ising_beta_range(graph));
-    let ladder = geometric_beta_schedule(hot, cold, num_betas);
+    let ladder = params.schedule.build(hot, cold, num_betas);
     let g0 = gamma_zero(graph);
     let denom = (steps - 1).max(1) as f64;
 
@@ -163,6 +165,22 @@ mod tests {
             "total imaginary time {total} must equal the final beta"
         );
         assert!(s.eta.iter().all(|&e| e >= 0.0));
+    }
+
+    /// A linear ladder rises by the same amount at every rung, so after the
+    /// first step every increment is the same.
+    #[test]
+    fn a_linear_ladder_gives_equal_increments() {
+        let g = chain4();
+        let params = SampleParams {
+            num_sweeps: 5,
+            sweeps_per_beta: 1,
+            beta_range: Some((1.0, 5.0)),
+            schedule: quip_solver_core::BetaSchedule::Linear,
+            ..Default::default()
+        };
+        let s = build(&g, &params, 5);
+        assert_eq!(s.eta, vec![1.0, 1.0, 1.0, 1.0, 1.0]);
     }
 
     #[test]

@@ -16,7 +16,8 @@
 //! base graph.
 
 use quip_protocol::scoring::energy_milli;
-use quip_solver_core::beta::{default_ising_beta_range, geometric_beta_schedule};
+use quip_solver_core::beta::default_ising_beta_range;
+use quip_solver_core::BetaSchedule;
 use quip_solver_core::{Algorithm, CancelToken, IsingGraph, SampleParams, SamplerResult};
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
@@ -122,23 +123,25 @@ pub(crate) fn effective_sweeps_per_beta(num_sweeps: usize, sweeps_per_beta: usiz
     }
 }
 
-/// Geometric beta schedule for one sample request (f64 for CPU precision).
+/// Beta schedule for one sample request (f64 for CPU precision), of the kind
+/// `params.schedule` names.
 pub(crate) fn build_beta_schedule(graph: &IsingGraph, params: &SampleParams) -> Vec<f64> {
     let sweeps_per = effective_sweeps_per_beta(params.num_sweeps, params.sweeps_per_beta);
     let num_betas = (params.num_sweeps / sweeps_per).max(1);
     let (hot, cold) = params
         .beta_range
         .unwrap_or_else(|| default_ising_beta_range(graph));
-    geometric_beta_schedule(hot, cold, num_betas)
+    params.schedule.build(hot, cold, num_betas)
 }
 
 /// Beta schedule for a seeded run: the same ladder, entered part of the way up.
 ///
 /// A seeded anneal that starts at the hot end forgets its seed, because a hot
 /// sweep accepts almost every flip. `start_beta` replaces the hot end. With no
-/// value it is the geometric midpoint of the cold run's range, which is the
-/// middle rung of a geometric ladder. The cold end never drops below the
-/// start, so the ladder cannot run backwards.
+/// value it is the middle rung of the cold run's ladder: the geometric midpoint
+/// of the range for a geometric ladder, the arithmetic one for a linear ladder.
+/// The cold end never drops below the start, so the ladder cannot run
+/// backwards.
 pub(crate) fn build_seeded_beta_schedule(
     graph: &IsingGraph,
     params: &SampleParams,
@@ -149,8 +152,11 @@ pub(crate) fn build_seeded_beta_schedule(
     let (hot, cold) = params
         .beta_range
         .unwrap_or_else(|| default_ising_beta_range(graph));
-    let start = start_beta.unwrap_or_else(|| (hot * cold).sqrt());
-    geometric_beta_schedule(start, cold.max(start), num_betas)
+    let start = start_beta.unwrap_or_else(|| match params.schedule {
+        BetaSchedule::Geometric => (hot * cold).sqrt(),
+        BetaSchedule::Linear => (hot + cold) / 2.0,
+    });
+    params.schedule.build(start, cold.max(start), num_betas)
 }
 
 fn spin_sign(s: i8) -> f64 {
@@ -426,6 +432,7 @@ pub(crate) fn sample_sa_scalar(
 mod tests {
     use super::*;
     use proptest::prelude::*;
+    use quip_solver_core::beta::geometric_beta_schedule;
 
     fn ferro2() -> IsingGraph {
         // Prefer aligned spins: J=-1 means E = J s0 s1 is lower when s0==s1.
@@ -851,6 +858,41 @@ mod tests {
         let told = build_seeded_beta_schedule(&graph, &params, Some(4.0));
         assert!((told[0] - 4.0).abs() < 1e-12);
         assert!((told[15] - 10.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_linear_request_builds_an_evenly_spaced_ladder() {
+        let graph = ferro2();
+        let params = SampleParams {
+            num_sweeps: 5,
+            beta_range: Some((1.0, 5.0)),
+            schedule: BetaSchedule::Linear,
+            ..Default::default()
+        };
+        assert_eq!(
+            build_beta_schedule(&graph, &params),
+            vec![1.0, 2.0, 3.0, 4.0, 5.0]
+        );
+        let geometric = SampleParams {
+            schedule: BetaSchedule::Geometric,
+            ..params
+        };
+        assert!((build_beta_schedule(&graph, &geometric)[2] - 5.0_f64.sqrt()).abs() < 1e-12);
+    }
+
+    #[test]
+    fn a_seeded_linear_ladder_starts_at_the_arithmetic_midpoint() {
+        let graph = IsingGraph::new(vec![0.0, 0.0], vec![-1.0], vec![(0, 1)]);
+        let params = SampleParams {
+            num_sweeps: 3,
+            beta_range: Some((1.0, 9.0)),
+            schedule: BetaSchedule::Linear,
+            ..Default::default()
+        };
+        assert_eq!(
+            build_seeded_beta_schedule(&graph, &params, None),
+            vec![5.0, 7.0, 9.0]
+        );
     }
 
     #[test]
