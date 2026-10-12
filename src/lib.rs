@@ -591,6 +591,55 @@ mod tests {
         }
     }
 
+    /// One kernel under test: graph and params in, spins of each read out.
+    type Kernel<'a> = &'a dyn Fn(&IsingGraph, &SampleParams) -> Vec<Vec<i8>>;
+
+    /// Reads from a hot, short anneal on a 32-node ring, where samples are
+    /// close to uniform and so depend visibly on the seed.
+    fn hot_reads(
+        sampler: &dyn Fn(&IsingGraph, &SampleParams) -> Vec<Vec<i8>>,
+        seed: u64,
+    ) -> Vec<Vec<i8>> {
+        let n = 32;
+        let graph = IsingGraph::new(
+            vec![0.0; n],
+            (0..n)
+                .map(|i| if i % 3 == 0 { 1.0 } else { -1.0 })
+                .collect(),
+            (0..n).map(|i| (i, (i + 1) % n)).collect(),
+        );
+        let params = SampleParams {
+            num_reads: 8,
+            num_sweeps: 4,
+            beta_range: Some((0.01, 0.02)),
+            seed,
+            ..Default::default()
+        };
+        sampler(&graph, &params)
+    }
+
+    /// `--solve` hands the kernels a full 64-bit seed. Seeds that differ only
+    /// in their high 32 bits must give different samples, and the same seed the
+    /// same samples, for every production kernel.
+    #[test]
+    fn the_high_half_of_the_seed_reaches_every_production_kernel() {
+        let spins = |reads: Vec<SamplerResult>| reads.into_iter().map(|r| r.spins).collect();
+        let sa = CpuSampler::new(Algorithm::Sa);
+        let gibbs = GibbsCpuSampler(CpuSampler::new(Algorithm::Gibbs));
+        let sb = SbSampler::new(DSB);
+        let kernels: [(&str, Kernel<'_>); 3] = [
+            ("sa", &|g, p| spins(sa.sample(g, p).expect("sa"))),
+            ("gibbs", &|g, p| spins(gibbs.sample(g, p).expect("gibbs"))),
+            ("sb", &|g, p| spins(sb.sample(g, p).expect("sb"))),
+        ];
+        let low = 0x0000_0000_dead_beef_u64;
+        let high = low | (1 << 40);
+        for (name, kernel) in kernels {
+            assert_eq!(hot_reads(kernel, low), hot_reads(kernel, low), "{name}");
+            assert_ne!(hot_reads(kernel, low), hot_reads(kernel, high), "{name}");
+        }
+    }
+
     #[test]
     fn stream_width_is_at_least_one() {
         let sampler = CpuSampler::new(Algorithm::Gibbs);
