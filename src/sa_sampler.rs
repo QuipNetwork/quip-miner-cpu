@@ -633,6 +633,7 @@ impl Sampler for SaSampler {
         graph: &IsingGraph,
         params: &SampleParams,
     ) -> Result<Vec<SamplerResult>, SampleError> {
+        crate::check_sample_size(graph.h.len(), graph.edges.len())?;
         Ok(sample_sa_variant_with_cache(
             graph,
             params,

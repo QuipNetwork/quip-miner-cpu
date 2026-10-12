@@ -180,8 +180,9 @@ downhill or flat candidate has `n ≤ 0 ≤ M`, the whole Metropolis test collap
 to one integer comparison, `m ≥ -M`. The kernel draws no random number per
 candidate flip.
 
-The FSA kernel draws a threshold table per job. MSA fills one reusable row per
-temperature. Both share thresholds across reads and shift the row offset each sweep.
+The tabulated kernel draws a threshold table per job and shares it across reads.
+The packed kernel fills one reusable row per temperature with separate thresholds for each lane.
+Both shift the row offset each sweep.
 
 The field-free case, `h = 0`, buys nothing extra here. A field in `{-1, 0, +1}`
 folds into the same kernel as one extra bond to a spin pinned at `+1`, so

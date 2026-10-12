@@ -16,7 +16,10 @@ use quip_solver_core::{CancelToken, IsingGraph, SampleParams, SamplerResult};
 
 use crate::sa_int::IntGraph;
 use crate::sa_msc::bond_counts;
-use crate::sa_msc_f64::{check_beta, check_size, energy_f64, sample_float_msa, FloatMsaError};
+use crate::sa_msc_f64::{
+    check_beta, check_size, check_workspace, energy_f64, sample_float_msa, FloatMsaError,
+    WORKSPACE_CAP_BYTES,
+};
 use crate::sa_sampler::{check_seeds, sample_unit_packed, SeededStart};
 use crate::sampler_core::{sample_sa_scalar, ScalarArithmetic};
 use quip_solver_core::beta::default_ising_beta_range;
@@ -107,9 +110,9 @@ pub enum ResearchError {
     SeededScalarUnsupported,
     /// The cancel token fired.
     Cancelled,
-    /// The float kernel's workspace would exceed its cap.
+    /// The float workspace or scalar/unit output would exceed the 8 GiB cap.
     MemoryLimit {
-        /// Bytes the run would allocate, `usize::MAX` if the count overflowed.
+        /// Estimated bytes counted against the cap, `usize::MAX` on overflow.
         needed: usize,
         /// The cap.
         cap: usize,
@@ -127,7 +130,7 @@ impl std::fmt::Display for ResearchError {
             Self::MemoryLimit { needed, cap } => {
                 write!(
                     f,
-                    "the run needs {needed} bytes of workspace; the cap is {cap}"
+                    "the run needs {needed} bytes of memory; the cap is {cap}"
                 )
             }
         }
@@ -148,25 +151,56 @@ fn map_float_error(error: FloatMsaError) -> ResearchError {
     }
 }
 
+/// Refuse oversized research requests using counts alone, before graph copies
+/// or edge-pair validation buffers are allocated.
+///
+/// The merged MSA name uses the float workspace bound because its selected
+/// kernel cannot be known from counts alone.
+///
+/// # Errors
+///
+/// Returns [`ResearchError::InvalidInput`] for size or read-count violations,
+/// and [`ResearchError::MemoryLimit`] when checked byte counts exceed 8 GiB.
+pub fn check_research_counts(
+    nodes: usize,
+    edges: usize,
+    reads: usize,
+    kernel: ResearchKernel,
+) -> Result<(), ResearchError> {
+    check_size(nodes, edges).map_err(map_float_error)?;
+    if !(1..=MAX_READS).contains(&reads) {
+        return invalid(format!("num_reads must be in 1..={MAX_READS}; got {reads}"));
+    }
+    let needed = reads
+        .checked_mul(nodes)
+        .and_then(|spins| spins.checked_add(reads.checked_mul(8)?))
+        .unwrap_or(usize::MAX);
+    if needed > WORKSPACE_CAP_BYTES {
+        return Err(ResearchError::MemoryLimit {
+            needed,
+            cap: WORKSPACE_CAP_BYTES,
+        });
+    }
+    if matches!(kernel, ResearchKernel::FloatMsa | ResearchKernel::Msa) {
+        check_workspace(nodes, edges, reads).map_err(map_float_error)?;
+    }
+    Ok(())
+}
+
 /// The checks every kernel shares: a model the scorer can index, finite
-/// coefficients, and a schedule every kernel honours the same way. Bounds on
-/// coefficient values and memory live with the float kernel.
+/// coefficients, and a schedule every kernel honours the same way. The float
+/// kernel also checks stricter coefficient bounds in its own validation.
 fn validate_common(
     graph: &IsingGraph,
     params: &SampleParams,
+    kernel: ResearchKernel,
     start: Option<SeededStart<'_>>,
 ) -> Result<(), ResearchError> {
     let nodes = graph.h.len();
     let edges = graph.edges.len();
-    check_size(nodes, edges).map_err(map_float_error)?;
+    check_research_counts(nodes, edges, params.num_reads, kernel)?;
     if graph.j.len() != edges {
         return invalid(format!("{} couplings for {edges} edges", graph.j.len()));
-    }
-    if !(1..=MAX_READS).contains(&params.num_reads) {
-        return invalid(format!(
-            "num_reads must be in 1..={MAX_READS}; got {}",
-            params.num_reads
-        ));
     }
     // The protocol samplers round zero sweeps up to one rung; the float
     // kernel returns the start states. A comparison needs one meaning.
@@ -245,7 +279,7 @@ fn validate_seeds(
 /// start beta that is not finite, not positive, above the cap, or reversed; [`ResearchError::UnsupportedUnitModel`] when
 /// the unit kernel cannot represent the model;
 /// [`ResearchError::SeededScalarUnsupported`] for a seeded scalar request;
-/// [`ResearchError::MemoryLimit`] from the float kernel's cap;
+/// [`ResearchError::MemoryLimit`] from the 8 GiB memory cap;
 /// [`ResearchError::Cancelled`] when `cancel` fires.
 pub fn sample_research(
     graph: &IsingGraph,
@@ -256,7 +290,7 @@ pub fn sample_research(
 ) -> Result<ResearchSamples, ResearchError> {
     // A seed set with no states is a cold run, as it is for `Msa.sample`.
     let start = start.filter(|s| !s.spins.is_empty());
-    validate_common(graph, params, start)?;
+    validate_common(graph, params, kernel, start)?;
     match kernel {
         ResearchKernel::ScalarSa => sample_scalar_research(graph, params, start, cancel),
         ResearchKernel::UnitMsa => sample_unit_research(graph, params, start, cancel),
@@ -475,6 +509,26 @@ mod tests {
         for kernel in ResearchKernel::ALL {
             let err = sample_research(&graph, &params(1, 1, 1), kernel, None, None).unwrap_err();
             assert!(is_invalid(&err), "{kernel:?}: {err:?}");
+        }
+    }
+
+    #[test]
+    fn count_preflight_refuses_edge_heavy_float_requests() {
+        assert!(matches!(
+            check_research_counts(2_000_000, 67_108_864, 3136, ResearchKernel::FloatMsa),
+            Err(ResearchError::MemoryLimit { needed, cap })
+                if cap == WORKSPACE_CAP_BYTES && needed > cap
+        ));
+    }
+
+    #[test]
+    fn count_preflight_refuses_oversized_scalar_and_unit_outputs() {
+        for kernel in [ResearchKernel::ScalarSa, ResearchKernel::UnitMsa] {
+            assert!(matches!(
+                check_research_counts(4_194_304, 0, 2048, kernel),
+                Err(ResearchError::MemoryLimit { needed, cap })
+                    if cap == WORKSPACE_CAP_BYTES && needed > cap
+            ));
         }
     }
 

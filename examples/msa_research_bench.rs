@@ -188,7 +188,14 @@ fn run(
     }
 }
 
-fn emit(regime: &str, kernel: ResearchKernel, budget: &str, sweeps: usize, model: u64, p: &Point) {
+fn emit(
+    regime: &str,
+    kernel: ResearchKernel,
+    budget: &str,
+    sweeps: usize,
+    model: u64,
+    p: &Point,
+) -> io::Result<()> {
     let mut stdout = io::stdout().lock();
     writeln!(
         stdout,
@@ -200,12 +207,23 @@ fn emit(regime: &str, kernel: ResearchKernel, budget: &str, sweeps: usize, model
         p.distinct,
         p.workspace.map_or("null".to_owned(), |w| w.to_string()),
     )
-    .expect("write benchmark row to stdout");
 }
 
-fn main() {
+fn main() -> io::Result<()> {
+    match run_bench() {
+        Err(error) if error.kind() == io::ErrorKind::BrokenPipe => Ok(()),
+        result => result,
+    }
+}
+
+fn run_bench() -> io::Result<()> {
     let args = Args::parse();
-    assert!(args.repeats >= 1, "--repeats must be at least 1");
+    if args.repeats == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "--repeats must be at least 1",
+        ));
+    }
     for model in 0..args.models {
         for (regime, graph, kernels) in regimes(model) {
             for &sweeps in &SWEEPS {
@@ -215,7 +233,7 @@ fn main() {
                     if kernel == ResearchKernel::FloatMsa {
                         float_seconds = Some(p.seconds);
                     }
-                    emit(regime, kernel, "matched-sweeps", sweeps, model, &p);
+                    emit(regime, kernel, "matched-sweeps", sweeps, model, &p)?;
                 }
                 // Matched time: scalar SA at the sweep count that takes as long
                 // as the float kernel took, from scalar SA's measured rate.
@@ -245,9 +263,10 @@ fn main() {
                         scaled,
                         model,
                         &p,
-                    );
+                    )?;
                 }
             }
         }
     }
+    Ok(())
 }

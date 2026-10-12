@@ -224,6 +224,21 @@ fn workspace_bytes(nodes: usize, edges: usize, reads: usize, words: usize) -> Op
         .checked_add(LANES * 8)
 }
 
+pub(crate) fn check_workspace(
+    nodes: usize,
+    edges: usize,
+    reads: usize,
+) -> Result<usize, FloatMsaError> {
+    let needed = workspace_bytes(nodes, edges, reads, reads.div_ceil(LANES)).unwrap_or(usize::MAX);
+    if needed > WORKSPACE_CAP_BYTES {
+        return Err(FloatMsaError::MemoryLimit {
+            needed,
+            cap: WORKSPACE_CAP_BYTES,
+        });
+    }
+    Ok(needed)
+}
+
 fn validate(
     graph: &IsingGraph,
     params: &SampleParams,
@@ -239,6 +254,7 @@ fn validate(
     if !(1..=MAX_READS).contains(&reads) {
         return invalid(format!("num_reads must be in 1..={MAX_READS}; got {reads}"));
     }
+    let needed = check_workspace(nodes, edges, reads)?;
 
     let mut sum = 0.0f64;
     for (i, &h) in graph.h.iter().enumerate() {
@@ -304,12 +320,6 @@ fn validate(
     }
 
     let words = reads.div_ceil(LANES);
-    let cap = WORKSPACE_CAP_BYTES;
-    let needed = workspace_bytes(nodes, edges, reads, words).unwrap_or(usize::MAX);
-    if needed > cap {
-        return Err(FloatMsaError::MemoryLimit { needed, cap });
-    }
-
     // The validated endpoints are the ones the ladder is built from.
     let resolved = SampleParams {
         beta_range: Some((hot, cold)),
@@ -976,6 +986,16 @@ mod tests {
             workspace_bytes(1, 0, 1, 2),
             Some(base + 8 + 2 * size_of::<SmallRng>())
         );
+    }
+
+    #[test]
+    fn edge_heavy_workspace_is_refused_from_counts() {
+        assert!(check_workspace(2_000_000, 0, 3136).is_ok());
+        assert!(matches!(
+            check_workspace(2_000_000, 67_108_864, 3136),
+            Err(FloatMsaError::MemoryLimit { needed, cap })
+                if cap == WORKSPACE_CAP_BYTES && needed > cap
+        ));
     }
 
     #[test]

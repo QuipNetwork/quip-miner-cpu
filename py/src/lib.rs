@@ -14,6 +14,7 @@ use pyo3::prelude::*;
 use pyo3::types::PyDict;
 pyo3::create_exception!(quip_msa, MemoryLimitError, PyValueError);
 
+use quip_solver_cpu::research::check_research_counts;
 use quip_solver_cpu::{
     sample_research, IsingGraph, ResearchError, ResearchKernel, SaSampler, SaVariant, SampleParams,
     Sampler, SeededStart,
@@ -239,6 +240,16 @@ impl Msa {
             PyValueError::new_err(format!(
                 "unknown kernel {kernel:?}; expected cpu-sa, cpu-msa-unit, cpu-msa-f64 or cpu-msa"
             ))
+        })?;
+        check_research_counts(
+            h.as_array().len(),
+            edges.as_array().nrows(),
+            num_reads,
+            kernel,
+        )
+        .map_err(|error| match error {
+            ResearchError::MemoryLimit { .. } => MemoryLimitError::new_err(error.to_string()),
+            _ => PyValueError::new_err(error.to_string()),
         })?;
         let graph = build_graph(&h, &edges, &j)?;
         let nodes = graph.h.len();
