@@ -604,6 +604,31 @@ mod tests {
     }
 
     #[test]
+    fn a_linear_request_anneals_an_evenly_spaced_ladder_on_every_kernel() {
+        let graph = unit_graph(24, 5);
+        let params = SampleParams {
+            sweeps_per_beta: 1,
+            schedule: quip_solver_core::BetaSchedule::Linear,
+            ..params(4, 16, 4)
+        };
+        for kernel in ResearchKernel::ALL {
+            let out = sample_research(&graph, &params, kernel, None, None)
+                .expect("a unit model runs on every kernel");
+            let ladder = &out.metadata.beta_ladder;
+            assert_eq!(ladder.len(), 16, "{kernel:?}");
+            assert!((ladder[0] - 0.1).abs() < 1e-14, "{kernel:?}: {ladder:?}");
+            assert!((ladder[15] - 5.0).abs() < 1e-14, "{kernel:?}: {ladder:?}");
+            let step = (5.0 - 0.1) / 15.0;
+            for pair in ladder.windows(2) {
+                assert!(
+                    (pair[1] - pair[0] - step).abs() < 1e-12,
+                    "{kernel:?}: {ladder:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn a_seeded_float_run_reports_its_start_beta_and_cold_end() {
         let graph = fractional_pair();
         let params = SampleParams {

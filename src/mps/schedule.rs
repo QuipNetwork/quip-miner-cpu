@@ -3,10 +3,12 @@
 //!
 //! The beta ladder is the same `quip_solver_core::beta` ladder the SA kernel
 //! uses, of the kind `SampleParams::schedule` names, so `beta_range` and the
-//! schedule kind mean the same thing for every CPU backend. Either kind rises
-//! monotonically, so every increment is non-negative. Imaginary
+//! schedule kind mean the same thing for every CPU backend. Imaginary
 //! time steps are the increments of that ladder, `eta_k = beta_k - beta_(k-1)`
-//! with `beta_0 = 0`, so the total imaginary time equals the final beta.
+//! with `beta_0 = 0`, so the total imaginary time of a rising ladder equals
+//! the final beta. `--solve` passes a reversed `beta_range` through
+//! unvalidated, which gives a falling ladder of either kind; `build` clamps
+//! each increment at zero, so no step runs backwards in imaginary time.
 //!
 //! With `sweeps_per_beta > 1` the ladder is held for that many Trotter steps,
 //! so the held steps carry `eta = 0`. The anneal loop skips them: a zero
