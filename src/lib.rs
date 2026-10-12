@@ -596,10 +596,7 @@ mod tests {
 
     /// Reads from a hot, short anneal on a 32-node ring, where samples are
     /// close to uniform and so depend visibly on the seed.
-    fn hot_reads(
-        sampler: &dyn Fn(&IsingGraph, &SampleParams) -> Vec<Vec<i8>>,
-        seed: u64,
-    ) -> Vec<Vec<i8>> {
+    fn hot_reads(sampler: Kernel<'_>, seed: u64) -> Vec<Vec<i8>> {
         let n = 32;
         let graph = IsingGraph::new(
             vec![0.0; n],
