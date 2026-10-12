@@ -556,6 +556,7 @@ impl Sampler for GibbsCpuSampler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sampler_core::{sample_sa_scalar, ScalarArithmetic};
     use quip_solver_core::{Sampler, StreamJob, StreamOutcome, StreamResult};
     use std::time::Duration;
 
@@ -594,32 +595,42 @@ mod tests {
     /// One kernel under test: graph and params in, spins of each read out.
     type Kernel<'a> = &'a dyn Fn(&IsingGraph, &SampleParams) -> Vec<Vec<i8>>;
 
-    /// Reads from a hot, short anneal on a 32-node ring, where samples are
-    /// close to uniform and so depend visibly on the seed.
-    fn hot_reads(sampler: Kernel<'_>, seed: u64) -> Vec<Vec<i8>> {
+    /// A 32-node ring with couplings `±scale`. A scale of one sends SA down
+    /// its integer path; a non-integer scale sends it down the f64 path.
+    fn hot_ring(scale: f64) -> IsingGraph {
         let n = 32;
-        let graph = IsingGraph::new(
+        IsingGraph::new(
             vec![0.0; n],
             (0..n)
-                .map(|i| if i % 3 == 0 { 1.0 } else { -1.0 })
+                .map(|i| if i % 3 == 0 { scale } else { -scale })
                 .collect(),
             (0..n).map(|i| (i, (i + 1) % n)).collect(),
-        );
-        let params = SampleParams {
+        )
+    }
+
+    /// A hot, short anneal, where samples are close to uniform and so depend
+    /// visibly on the seed.
+    fn hot_params(seed: u64) -> SampleParams {
+        SampleParams {
             num_reads: 8,
             num_sweeps: 4,
             beta_range: Some((0.01, 0.02)),
             seed,
             ..Default::default()
-        };
-        sampler(&graph, &params)
+        }
     }
 
-    /// `--solve` hands the kernels a full 64-bit seed. Seeds that differ only
-    /// in their high 32 bits must give different samples, and the same seed the
-    /// same samples, for every production kernel. The pairs differ in bit 40,
-    /// in bit 63, and in bit 0 of a seed above 2^53, which an f64 round trip
-    /// would merge into one seed.
+    /// Reads from the hot anneal on the ring with couplings `±scale`.
+    fn hot_reads(sampler: Kernel<'_>, scale: f64, seed: u64) -> Vec<Vec<i8>> {
+        sampler(&hot_ring(scale), &hot_params(seed))
+    }
+
+    /// `--solve` hands the kernels a full 64-bit seed. Seeds that differ in one
+    /// bit must give different samples, and the same seed the same samples,
+    /// for every production kernel. The pairs differ in bit 40, in bit 63, and
+    /// in bit 0 of a seed above 2^53, which an f64 round trip would merge into
+    /// one seed. Each runs on unit and on fractional couplings, so SA's integer
+    /// and f64 paths both see the seed.
     #[test]
     fn the_high_half_of_the_seed_reaches_every_production_kernel() {
         let spins = |reads: Vec<SamplerResult>| reads.into_iter().map(|r| r.spins).collect();
@@ -634,14 +645,25 @@ mod tests {
         let low = 0x0000_0000_dead_beef_u64;
         let top = low | (1 << 63);
         let pairs = [(low, low | (1 << 40)), (low, top), (top, top ^ 1)];
+        let scales = [1.0, 0.375];
+        let sa_arithmetic = |scale| {
+            let (_, arithmetic, _) =
+                sample_sa_scalar(&hot_ring(scale), &hot_params(low), None).expect("uncancelled");
+            arithmetic
+        };
+        assert_eq!(sa_arithmetic(scales[0]), ScalarArithmetic::Int);
+        assert_eq!(sa_arithmetic(scales[1]), ScalarArithmetic::F64);
         for (name, kernel) in kernels {
-            assert_eq!(hot_reads(kernel, low), hot_reads(kernel, low), "{name}");
-            for (a, b) in pairs {
-                assert_ne!(
-                    hot_reads(kernel, a),
-                    hot_reads(kernel, b),
-                    "{name}: {a:#x} vs {b:#x}"
-                );
+            for scale in scales {
+                let reads = |seed| hot_reads(kernel, scale, seed);
+                assert_eq!(reads(low), reads(low), "{name}, scale {scale}");
+                for (a, b) in pairs {
+                    assert_ne!(
+                        reads(a),
+                        reads(b),
+                        "{name}, scale {scale}: {a:#x} vs {b:#x}"
+                    );
+                }
             }
         }
     }
