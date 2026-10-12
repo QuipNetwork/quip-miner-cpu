@@ -599,6 +599,50 @@ mod tests {
         }
     }
 
+    /// Every identity states its limits, and lists `linear-schedule` exactly
+    /// when its kernel anneals a beta ladder. The Simulated Bifurcation
+    /// kernels have no ladder. The two lists together cover every binary.
+    #[test]
+    fn every_identity_states_its_schedule_feature_and_limits() {
+        let ladder = [
+            CPU_SA_IDENTITY,
+            CPU_GIBBS_IDENTITY,
+            CPU_FSA_IDENTITY,
+            CPU_MSA_IDENTITY,
+            CPU_MPS_IDENTITY,
+            CPU_MFA_IDENTITY,
+            CPU_FLATIRON_IDENTITY,
+        ];
+        let sb = [
+            CPU_SB_IDENTITY,
+            CPU_BSB_IDENTITY,
+            CPU_HDSB_IDENTITY,
+            CPU_HBSB_IDENTITY,
+            CPU_GBSB_IDENTITY,
+            CPU_GDSB_IDENTITY,
+            CPU_TEDSB_IDENTITY,
+            CPU_SBQA_IDENTITY,
+            CPU_GGDSB_IDENTITY,
+        ];
+        let linear = quip_solver_core::LINEAR_SCHEDULE_FEATURE;
+        for id in &ladder {
+            assert!(id.features.contains(&linear), "{:?}", id.algorithm);
+            assert_eq!(id.limits, F64_LIMITS, "{:?}", id.algorithm);
+        }
+        for id in &sb {
+            assert!(!id.features.contains(&linear), "{:?}", id.algorithm);
+            assert_eq!(id.limits, sb_sampler::SB_LIMITS, "{:?}", id.algorithm);
+        }
+
+        let algorithms: std::collections::BTreeSet<_> =
+            ladder.iter().chain(&sb).map(|id| id.algorithm).collect();
+        let bins = std::fs::read_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/src/bin"))
+            .expect("src/bin")
+            .count();
+        assert_eq!(algorithms.len(), ladder.len() + sb.len());
+        assert_eq!(algorithms.len(), bins);
+    }
+
     #[test]
     fn new_and_sample_returns_num_reads_of_pm1_spins() {
         let sampler = CpuSampler::new(Algorithm::Sa);

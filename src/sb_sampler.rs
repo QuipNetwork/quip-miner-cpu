@@ -45,7 +45,7 @@ pub(crate) const CPU_SB_ADAPT: AdaptBounds = AdaptBounds {
 /// They integrate in f32, so they make no exact-resolution claim. They have no
 /// beta ladder either, so they do not list `linear-schedule`, and `--solve`
 /// refuses a linear request for them.
-const SB_LIMITS: quip_solver_core::ModelLimits = quip_solver_core::ModelLimits {
+pub(crate) const SB_LIMITS: quip_solver_core::ModelLimits = quip_solver_core::ModelLimits {
     max_degree: Some(0),
     max_local_field_milli: Some(0),
     exact_resolution_milli: None,

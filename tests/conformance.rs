@@ -185,8 +185,10 @@ async fn quip_cpu_flatiron_passes_solve_conformance() {
     assert_solve_conformance("quip-cpu-flatiron").await;
 }
 
-/// The identities with a beta ladder list `linear-schedule`; the Simulated
-/// Bifurcation ones have none and do not. Every identity states its limits.
+/// The production binaries advertise their identity's feature and limits:
+/// SA and Gibbs anneal a beta ladder and list `linear-schedule`, SB has no
+/// ladder and does not. `every_identity_states_its_schedule_feature_and_limits`
+/// in `src/lib.rs` checks the same for every identity.
 #[test]
 fn capabilities_advertise_the_schedule_feature_and_limits() {
     let bins = ["quip-cpu-sa", "quip-cpu-gibbs", "quip-cpu-sb"];
