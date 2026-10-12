@@ -617,7 +617,9 @@ mod tests {
 
     /// `--solve` hands the kernels a full 64-bit seed. Seeds that differ only
     /// in their high 32 bits must give different samples, and the same seed the
-    /// same samples, for every production kernel.
+    /// same samples, for every production kernel. The pairs differ in bit 40,
+    /// in bit 63, and in bit 0 of a seed above 2^53, which an f64 round trip
+    /// would merge into one seed.
     #[test]
     fn the_high_half_of_the_seed_reaches_every_production_kernel() {
         let spins = |reads: Vec<SamplerResult>| reads.into_iter().map(|r| r.spins).collect();
@@ -630,10 +632,17 @@ mod tests {
             ("sb", &|g, p| spins(sb.sample(g, p).expect("sb"))),
         ];
         let low = 0x0000_0000_dead_beef_u64;
-        let high = low | (1 << 40);
+        let top = low | (1 << 63);
+        let pairs = [(low, low | (1 << 40)), (low, top), (top, top ^ 1)];
         for (name, kernel) in kernels {
             assert_eq!(hot_reads(kernel, low), hot_reads(kernel, low), "{name}");
-            assert_ne!(hot_reads(kernel, low), hot_reads(kernel, high), "{name}");
+            for (a, b) in pairs {
+                assert_ne!(
+                    hot_reads(kernel, a),
+                    hot_reads(kernel, b),
+                    "{name}: {a:#x} vs {b:#x}"
+                );
+            }
         }
     }
 
