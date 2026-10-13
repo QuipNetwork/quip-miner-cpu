@@ -2,8 +2,9 @@
 
 use quip_proto::v1::RejectReason;
 use quip_solver_conformance::driver::{drive_miner, DriverReport};
-use quip_solver_conformance::solve::drive_solve;
-use std::process::Command;
+use quip_solver_conformance::solve::{drive_solve, CaseOutcome};
+use std::io::Write;
+use std::process::{Command, Stdio};
 use std::sync::LazyLock;
 use tokio::sync::Mutex;
 
@@ -24,15 +25,71 @@ async fn drive_miner_bounded(bin_path: &str, socket: &str) -> DriverReport {
     drive_miner(bin_path, socket).await
 }
 
-/// Grade the binary built by Cargo against the one-shot solve contract.
+/// Grade the binary built by Cargo against the one-shot solve contract, then
+/// check which linear-schedule behaviour it claims. The gate grades the case
+/// Passed both when a listing binary solves and when a non-listing one
+/// refuses, so this reads the advertised features and runs a linear request
+/// itself: solved with a `linear` sampler echo when the binary lists
+/// `linear-schedule`, exit 64 with nothing on stdout when it does not.
 async fn assert_solve_conformance(bin: &str) {
     let _guard = GATE.lock().await;
-    let report = drive_solve(&profile_bin(bin)).await;
+    let path = profile_bin(bin);
+    let report = drive_solve(&path).await;
     assert!(
         report.is_conformant(),
         "{bin} --solve failed conformance:\n{}",
         report.summary()
     );
+    assert_eq!(
+        report.outcome("linear-schedule"),
+        Some(&CaseOutcome::Passed),
+        "{bin}:\n{}",
+        report.summary()
+    );
+
+    let caps = Command::new(&path).arg("--capabilities").output().unwrap();
+    let caps: serde_json::Value = serde_json::from_slice(&caps.stdout).unwrap();
+    let lists_linear = caps["features"]
+        .as_array()
+        .is_some_and(|f| f.iter().any(|f| f == "linear-schedule"));
+    let problem = serde_json::json!({
+        "h": [0.0, 0.0, 0.0, 0.0],
+        "j": [-1.0, -1.0, -1.0, -1.0],
+        "edges": [[0, 1], [1, 2], [2, 3], [3, 0]],
+        "num_reads": 2,
+        "num_sweeps": 16,
+        "sweeps_per_beta": 1,
+        "beta_range": null,
+        "beta_schedule_type": "linear",
+        "seed": 1,
+    });
+    let mut child = Command::new(&path)
+        .arg("--solve")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(problem.to_string().as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    if lists_linear {
+        assert_eq!(out.status.code(), Some(0), "{bin}: {stderr}");
+        let reads: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        let reads = reads.as_array().expect("an array of reads");
+        assert_eq!(reads.len(), 2, "{bin}");
+        for read in reads {
+            assert_eq!(read["sampler"]["beta_schedule_type"], "linear", "{bin}");
+        }
+    } else {
+        assert_eq!(out.status.code(), Some(64), "{bin}: {stderr}");
+        assert!(out.stdout.is_empty(), "{bin} wrote solutions");
+    }
 }
 
 #[tokio::test]
@@ -126,6 +183,35 @@ async fn quip_cpu_mfa_passes_solve_conformance() {
 #[tokio::test]
 async fn quip_cpu_flatiron_passes_solve_conformance() {
     assert_solve_conformance("quip-cpu-flatiron").await;
+}
+
+/// The production binaries advertise their identity's feature and limits:
+/// SA and Gibbs anneal a beta ladder and list `linear-schedule`, SB has no
+/// ladder and does not. `every_identity_states_its_schedule_feature_and_limits`
+/// in `src/lib.rs` checks the same for every identity.
+#[test]
+fn capabilities_advertise_the_schedule_feature_and_limits() {
+    let bins = ["quip-cpu-sa", "quip-cpu-gibbs", "quip-cpu-sb"];
+    ensure_built(&bins);
+    for bin in bins {
+        let out = Command::new(profile_bin(bin))
+            .arg("--capabilities")
+            .output()
+            .unwrap();
+        let caps: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        let linear = caps["features"]
+            .as_array()
+            .is_some_and(|f| f.iter().any(|f| f == "linear-schedule"));
+        assert_eq!(linear, bin != "quip-cpu-sb", "{bin}: {caps}");
+        assert_eq!(caps["maxDegree"], 0, "{bin}: {caps}");
+        assert_eq!(caps["maxLocalFieldMilli"], 0, "{bin}: {caps}");
+        let resolution = if bin == "quip-cpu-sb" {
+            serde_json::Value::Null
+        } else {
+            serde_json::json!(1)
+        };
+        assert_eq!(caps["exactResolutionMilli"], resolution, "{bin}: {caps}");
+    }
 }
 
 /// Cross-package binary path (deps/ → profile/ → bin).

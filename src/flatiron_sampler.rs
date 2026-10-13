@@ -24,9 +24,9 @@ pub const CPU_FLATIRON_IDENTITY: BackendIdentity = BackendIdentity {
     algorithm: quip_proto::v1::Algorithm::Flatiron,
     max_nodes: 65_536,
     max_edges: 524_288,
-    features: &[],
+    features: crate::LINEAR_ONLY,
     adapt: CPU_MPS_ADAPT,
-    limits: quip_solver_core::ModelLimits::UNSTATED,
+    limits: crate::F64_LIMITS,
 };
 
 /// BP-TNS sampler backend: imaginary-time simple update on the problem

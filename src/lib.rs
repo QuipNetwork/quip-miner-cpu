@@ -65,6 +65,32 @@ use std::sync::Arc;
 const DEFAULT_MAX_NODES: u32 = 100_000;
 const DEFAULT_MAX_EDGES: u32 = 1_000_000;
 
+/// Model limits of every kernel that samples the f64 graph: no degree or
+/// local-field cap, and every milli coefficient represented exactly. The
+/// integer fast paths (`sa_int`, `sa_msc`) take only the models they hold
+/// exactly and fall back to the f64 kernel for the rest, so they share these.
+///
+/// On `quip-cpu-msa` and `quip-cpu-fsa` that makes 1 milli exact, but not
+/// always MSA or FSA: a model outside the integer fast path (a coupling outside
+/// `{-1, 0, +1}`, or a field that is not a whole number of magnitude at most
+/// 100) runs on the plain `cpu-sa` kernel. On `quip-cpu-msa` a field above 1 in magnitude, or a
+/// node with more than 63 bonds counting its field, sends the model to the
+/// tabulated FSA kernel instead. A solver selector that needs MSA itself has to
+/// check the model as well as these limits.
+pub(crate) const F64_LIMITS: quip_solver_core::ModelLimits = quip_solver_core::ModelLimits {
+    max_degree: Some(0),
+    max_local_field_milli: Some(0),
+    exact_resolution_milli: Some(1),
+};
+
+/// Features of the f64 Metropolis and Gibbs identities. Each builds its ladder
+/// with `build_beta_schedule`, which honours `SampleParams::schedule`.
+const STREAMING_LINEAR: &[&str] = &["streaming", quip_solver_core::LINEAR_SCHEDULE_FEATURE];
+
+/// Features of the single-lane identities whose ladder honours
+/// `SampleParams::schedule`: the SA variants and the tensor-network kernels.
+pub(crate) const LINEAR_ONLY: &[&str] = &[quip_solver_core::LINEAR_SCHEDULE_FEATURE];
+
 /// CPU adapt envelope.
 ///
 /// Sized so one SA attempt on an Advantage2-scale graph finishes inside a
@@ -90,9 +116,9 @@ pub const CPU_SA_IDENTITY: BackendIdentity = BackendIdentity {
     max_nodes: DEFAULT_MAX_NODES,
     max_edges: DEFAULT_MAX_EDGES,
     // A real multi-lane `sample_stream` override; no utilization governor.
-    features: &["streaming"],
+    features: STREAMING_LINEAR,
     adapt: CPU_ADAPT,
-    limits: quip_solver_core::ModelLimits::UNSTATED,
+    limits: F64_LIMITS,
 };
 
 /// Backend identity for `quip-cpu-gibbs`.
@@ -102,9 +128,9 @@ pub const CPU_GIBBS_IDENTITY: BackendIdentity = BackendIdentity {
     max_nodes: DEFAULT_MAX_NODES,
     max_edges: DEFAULT_MAX_EDGES,
     // Same capability set as `CPU_SA_IDENTITY`.
-    features: &["streaming"],
+    features: STREAMING_LINEAR,
     adapt: CPU_ADAPT,
-    limits: quip_solver_core::ModelLimits::UNSTATED,
+    limits: F64_LIMITS,
 };
 
 /// Why a stream kernel returned no samples.
@@ -571,6 +597,50 @@ mod tests {
             seed: 42,
             ..Default::default()
         }
+    }
+
+    /// Every identity states its limits, and lists `linear-schedule` exactly
+    /// when its kernel anneals a beta ladder. The Simulated Bifurcation
+    /// kernels have no ladder. The two lists together cover every binary.
+    #[test]
+    fn every_identity_states_its_schedule_feature_and_limits() {
+        let ladder = [
+            CPU_SA_IDENTITY,
+            CPU_GIBBS_IDENTITY,
+            CPU_FSA_IDENTITY,
+            CPU_MSA_IDENTITY,
+            CPU_MPS_IDENTITY,
+            CPU_MFA_IDENTITY,
+            CPU_FLATIRON_IDENTITY,
+        ];
+        let sb = [
+            CPU_SB_IDENTITY,
+            CPU_BSB_IDENTITY,
+            CPU_HDSB_IDENTITY,
+            CPU_HBSB_IDENTITY,
+            CPU_GBSB_IDENTITY,
+            CPU_GDSB_IDENTITY,
+            CPU_TEDSB_IDENTITY,
+            CPU_SBQA_IDENTITY,
+            CPU_GGDSB_IDENTITY,
+        ];
+        let linear = quip_solver_core::LINEAR_SCHEDULE_FEATURE;
+        for id in &ladder {
+            assert!(id.features.contains(&linear), "{:?}", id.algorithm);
+            assert_eq!(id.limits, F64_LIMITS, "{:?}", id.algorithm);
+        }
+        for id in &sb {
+            assert!(!id.features.contains(&linear), "{:?}", id.algorithm);
+            assert_eq!(id.limits, sb_sampler::SB_LIMITS, "{:?}", id.algorithm);
+        }
+
+        let algorithms: std::collections::BTreeSet<_> =
+            ladder.iter().chain(&sb).map(|id| id.algorithm).collect();
+        let bins = std::fs::read_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/src/bin"))
+            .expect("src/bin")
+            .count();
+        assert_eq!(algorithms.len(), ladder.len() + sb.len());
+        assert_eq!(algorithms.len(), bins);
     }
 
     #[test]
