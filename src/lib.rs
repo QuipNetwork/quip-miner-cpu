@@ -62,8 +62,16 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-const DEFAULT_MAX_NODES: u32 = 100_000;
-const DEFAULT_MAX_EDGES: u32 = 1_000_000;
+/// Largest model the SA, MSA and research samplers take. Node ids stay below 2^31 (bit 31 of
+/// a `sa_int` neighbour id is the coupling sign) and directed edge slots below
+/// 2^32 (`u32` CSR offsets). Memory, not index width, bounds a job inside these
+/// caps. Sized for the 2M-variable SHA-256 QUBO (QUI-1807).
+const DEFAULT_MAX_NODES: u32 = 4_194_304;
+const DEFAULT_MAX_EDGES: u32 = 67_108_864;
+
+pub(crate) fn check_sample_size(nodes: usize, edges: usize) -> Result<(), SampleError> {
+    sa_msc_f64::check_size(nodes, edges).map_err(|_| SampleError::Capacity)
+}
 
 /// Model limits of every kernel that samples the f64 graph: no degree or
 /// local-field cap, and every milli coefficient represented exactly. The
@@ -444,6 +452,7 @@ impl Sampler for CpuSampler {
         graph: &IsingGraph,
         params: &SampleParams,
     ) -> Result<Vec<SamplerResult>, SampleError> {
+        check_sample_size(graph.h.len(), graph.edges.len())?;
         if self.algorithm == Algorithm::Gibbs {
             // A colour budget the graph cannot meet is a size bound: an
             // identical job (same graph) fails again identically, which is
@@ -585,6 +594,13 @@ mod tests {
     use crate::sampler_core::{sample_sa_scalar, ScalarArithmetic};
     use quip_solver_core::{Sampler, StreamJob, StreamOutcome, StreamResult};
     use std::time::Duration;
+
+    #[test]
+    fn direct_sa_sampler_size_preflight_uses_advertised_caps() {
+        assert_eq!(check_sample_size(4_194_304, 67_108_864), Ok(()));
+        assert_eq!(check_sample_size(4_194_305, 0), Err(SampleError::Capacity));
+        assert_eq!(check_sample_size(1, 67_108_865), Err(SampleError::Capacity));
+    }
 
     fn tiny_ferro() -> IsingGraph {
         IsingGraph::new(vec![0.0, 0.0], vec![-1.0], vec![(0, 1)])

@@ -8,7 +8,7 @@
 //! - [`SaVariant::Tabulated`] moves the Metropolis test into its geometric
 //!   form and draws the thresholds from a table shared by every read.
 //! - [`SaVariant::MultiSpin`] packs 64 reads into each machine word, redraws
-//!   one shared threshold row per temperature, and sweeps in color order.
+//!   per-lane thresholds each temperature, and sweeps in color order.
 //!
 //! Both need discrete couplings, and a problem that does not qualify falls
 //! back one step at a time, so either binary is safe to point at any job — it
@@ -633,6 +633,7 @@ impl Sampler for SaSampler {
         graph: &IsingGraph,
         params: &SampleParams,
     ) -> Result<Vec<SamplerResult>, SampleError> {
+        crate::check_sample_size(graph.h.len(), graph.edges.len())?;
         Ok(sample_sa_variant_with_cache(
             graph,
             params,
@@ -932,39 +933,21 @@ mod tests {
         }
     }
 
-    /// Energies captured from the scalar per-lane finalisation, before
-    /// [`score_word`] existed (commit f6e432c), on a 90-node graph with 70
-    /// reads — both a node count and a read count that are not multiples of
-    /// [`LANES`], so the run spans a partial word. The bit-parallel
-    /// finalisation must reproduce these exactly.
+    /// Finalisation scores cold and seeded anneals against scalar scoring,
+    /// including the partial second word of a 70-read job.
     #[test]
-    fn finalisation_matches_the_pre_optimisation_baseline() {
-        const COLD: [i64; 70] = [
-            -313000, -301000, -293000, -313000, -295000, -269000, -291000, -327000, -273000,
-            -329000, -251000, -287000, -285000, -295000, -297000, -305000, -295000, -329000,
-            -295000, -285000, -279000, -285000, -311000, -303000, -293000, -317000, -275000,
-            -323000, -293000, -289000, -293000, -285000, -297000, -281000, -291000, -291000,
-            -295000, -321000, -255000, -323000, -307000, -287000, -275000, -263000, -285000,
-            -295000, -271000, -259000, -305000, -299000, -291000, -311000, -295000, -287000,
-            -285000, -295000, -311000, -313000, -285000, -315000, -303000, -289000, -317000,
-            -307000, -293000, -315000, -319000, -269000, -317000, -283000,
-        ];
-        const WARM: [i64; 70] = [
-            -311000, -295000, -293000, -311000, -309000, -313000, -305000, -291000, -307000,
-            -301000, -307000, -323000, -319000, -281000, -311000, -285000, -277000, -327000,
-            -269000, -285000, -279000, -295000, -267000, -277000, -277000, -309000, -327000,
-            -301000, -311000, -321000, -327000, -301000, -305000, -321000, -335000, -317000,
-            -297000, -323000, -305000, -327000, -309000, -303000, -327000, -317000, -309000,
-            -307000, -319000, -323000, -315000, -285000, -301000, -287000, -287000, -331000,
-            -333000, -305000, -297000, -285000, -325000, -297000, -303000, -299000, -295000,
-            -281000, -287000, -333000, -313000, -291000, -273000, -303000,
-        ];
+    fn finalisation_matches_scalar_after_anneal() {
         let graph = zephyr_like(90, 77, &[-1.0, 0.0, 1.0]);
         let cold = SaSampler::new(SaVariant::MultiSpin)
             .sample(&graph, &params(70, 5, 123))
             .expect("cold");
-        let got_cold: Vec<i64> = cold.iter().map(|r| r.energy_milli).collect();
-        assert_eq!(got_cold, COLD);
+        assert_eq!(cold.len(), 70);
+        for result in &cold {
+            assert_eq!(
+                result.energy_milli,
+                energy_milli(&result.spins, &graph.h, &graph.j, &graph.edges)
+            );
+        }
 
         let seeds: Vec<Vec<i8>> = (0..70)
             .map(|r| {
@@ -981,8 +964,13 @@ mod tests {
         let warm = SaSampler::new(SaVariant::MultiSpin)
             .sample_seeded(&graph, &params(70, 5, 123), start)
             .expect("warm");
-        let got_warm: Vec<i64> = warm.iter().map(|r| r.energy_milli).collect();
-        assert_eq!(got_warm, WARM);
+        assert_eq!(warm.len(), 70);
+        for result in &warm {
+            assert_eq!(
+                result.energy_milli,
+                energy_milli(&result.spins, &graph.h, &graph.j, &graph.edges)
+            );
+        }
     }
 
     /// [`score_word`]'s bit-parallel finalisation must match the plain
@@ -1158,8 +1146,8 @@ mod tests {
 
     #[test]
     fn msa_matches_scalar_color_sweeps_across_replica_words() {
-        // The path's color order is [1, 3], then [0, 2, 4]. Updating in
-        // node order, or shifting the second word differently, changes spins.
+        // The path's color order is [1, 3], then [0, 2, 4]. The two words
+        // also use distinct offsets into the shared row.
         let graph = IsingGraph::new(
             vec![1.0, 0.0, -1.0, 0.0, 1.0],
             vec![1.0, -1.0, 1.0, -1.0],
@@ -1175,23 +1163,33 @@ mod tests {
         };
         let int = IntGraph::from_base(&graph).expect("unit graph");
         let mut rng = SmallRng::seed_from_u64(19 ^ 0x5341_5F54_424C_4531);
-        let draws = threshold_draws(
-            &build_beta_schedule(&graph, &params),
-            int.max_field(),
-            &mut rng,
-        )
-        .expect("three rows");
-        // CUDA splitmix64(seed ^ (beta_idx << 20) ^ sweep) & 8191.
-        let offsets = [[6724, 4146, 4963], [4285, 4953, 6317], [3132, 4413, 1117]];
+        let mut cuts = vec![0; int.max_field() + 1];
+        let mut rows = Vec::new();
+        for beta in build_beta_schedule(&graph, &params) {
+            crate::sa_int::fill_cuts(beta, &mut cuts);
+            let mut row = vec![[0u8; 64]; crate::sa_msc::LANE_ROW];
+            for entry in &mut row {
+                for threshold in entry {
+                    *threshold = crate::sa_int::draw_threshold(&cuts, rng.gen::<u64>());
+                }
+            }
+            rows.push(row);
+        }
+        // Splitmix64 offsets for seed 19, indexed by beta, word and sweep.
+        let offsets = [
+            [[68, 50, 355], [453, 114, 48]],
+            [[189, 345, 173], [163, 219, 477]],
+            [[60, 317, 93], [208, 167, 347]],
+        ];
         let actual = sample_sa_variant(&graph, &params, SaVariant::MultiSpin, None)
             .expect("sampling succeeds");
-        for base in [0, 64] {
+        for (word, base) in [0, 64].into_iter().enumerate() {
             let mut rng = read_rng(params.seed, base);
             let state = MscState::random(5, &mut rng);
             for lane in 0..64.min(params.num_reads - base) {
                 let mut spins = state.lane(lane);
-                for (row, shifts) in draws.chunks_exact(8192).zip(offsets) {
-                    for off in shifts {
+                for (beta_idx, row) in rows.iter().enumerate() {
+                    for &off in &offsets[beta_idx][word] {
                         for var in [1, 3, 0, 2, 4] {
                             let mut field = graph.h[var];
                             for (&(u, v), &j) in graph.edges.iter().zip(&graph.j) {
@@ -1202,7 +1200,8 @@ mod tests {
                                 }
                             }
                             let delta = -2.0 * f64::from(spins[var]) * field;
-                            if delta <= 2.0 * f64::from(row[(var + off) & 8191]) {
+                            let m = row[(var + off) & (crate::sa_msc::LANE_ROW - 1)][lane];
+                            if delta <= 2.0 * f64::from(m) {
                                 spins[var] = -spins[var];
                             }
                         }

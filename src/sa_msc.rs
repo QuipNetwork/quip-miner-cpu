@@ -43,11 +43,11 @@
 //! L ≤ ⌊(d' + M) / 2⌋
 //! ```
 //!
-//! a comparison of the bit-sliced counter against a scalar. Accepted replicas
+//! a comparison of the bit-sliced counter against per-lane limits. Accepted replicas
 //! come back as a mask and the flip is one XOR into `spin[i]`.
 //!
-//! If the shared threshold `M` is at least `d'`, every lane accepts. The
-//! kernel then inverts the spin word and skips the neighbor walk.
+//! If every lane has threshold `M` at least `d'`, the kernel inverts the spin
+//! word and skips the neighbor walk.
 //!
 //! # Cost, and what it gives up
 //!
@@ -59,28 +59,23 @@
 //! field is recomputed on every attempt. At degree 20 that tax is larger than
 //! it was on the degree-6 Chimera graphs of the paper.
 //!
-//! # Randomness
+//! # Randomness: `per-lane-threshold-planes-v1`
 //!
-//! One acceptance threshold `M` is shared by every replica of a node update,
-//! including replicas in different words. The paper takes the same
-//! route and the replicas still separate, because they start from independent
-//! configurations and see different `L`. It is a real coupling all the same,
-//! and this crate's miner is scored on solution diversity, so
-//! `mining::diversity` is measured against `cpu-sa` rather than assumed.
-//!
-//! # Sweep schedule
-//!
-//! As in CUDA MSA, one 8192-byte threshold row is redrawn at each beta rung.
-//! Each sweep uses a seed-derived cyclic offset shared by all replica words,
-//! then visits independent color classes in sequence. The CPU retains its
-//! `SmallRng` threshold stream, `f64` beta ladder, and per-sweep cancellation;
-//! this is the same update algorithm, not a bit-identical CUDA random stream.
+//! Each lane reads its own geometric threshold `M`. A row entry holds six bit
+//! planes, and bit `r` of plane `k` is bit `k` of lane `r`'s threshold. One row
+//! of [`LANE_ROW`] entries is drawn per beta rung and shared by the words, and
+//! each word reads it from its own seed-derived cyclic offset. Two lanes that
+//! reach the same spins therefore see different thresholds, and separate
+//! again (QUI-1596). The test per lane is `L ≤ ⌊(d' + M)/2⌋`, computed with a
+//! bit-sliced add, a shift and a bit-sliced comparison. The row costs
+//! `LANE_ROW × 64` draws per rung. This schedule differs from CUDA MSA, which
+//! still shares one threshold per word.
 
 use quip_solver_core::{CancelToken, SampleParams};
-use rand::{rngs::SmallRng, SeedableRng};
+use rand::{rngs::SmallRng, Rng, SeedableRng};
 
 use crate::coloring::Coloring;
-use crate::sa_int::{draw_row, fill_threshold_row, IntGraph};
+use crate::sa_int::{draw_threshold, fill_cuts, IntGraph};
 use crate::sampler_core::SampleCancelled;
 
 /// Replicas advanced by one word update.
@@ -103,6 +98,70 @@ pub(crate) const MAX_DEGREE: usize = (1 << PLANES) - 1;
 const CSA_NEIGHBORS: usize = 20;
 const CSA_INPUTS: usize = CSA_NEIGHBORS + 1;
 
+/// Per-lane threshold entries per beta rung. Power of two for masking.
+/// At 512 entries, both models stayed within two distinct reads of the
+/// 2048-entry row; 256 entries missed that limit on the dense model.
+pub(crate) const LANE_ROW: usize = 512;
+const _: () = assert!(LANE_ROW.is_power_of_two());
+
+/// Name of the randomness scheme this kernel implements.
+pub(crate) const RNG_SCHEME: &str = "per-lane-threshold-planes-v1";
+
+/// A per-lane six-bit value, as bit planes.
+type Planes = [u64; PLANES];
+
+/// Draw one rung's per-lane thresholds. `cut` comes from
+/// [`crate::sa_int::fill_cuts`]. A threshold above [`MAX_DEGREE`] accepts the
+/// same moves as [`MAX_DEGREE`], so it is clamped there.
+fn fill_lane_row(cut: &[u64], rng: &mut SmallRng, row: &mut [Planes]) {
+    for entry in row {
+        *entry = [0; PLANES];
+        for lane in 0..LANES {
+            let m = usize::from(draw_threshold(cut, rng.gen::<u64>())).min(MAX_DEGREE);
+            for (k, plane) in entry.iter_mut().enumerate() {
+                *plane |= (((m >> k) & 1) as u64) << lane;
+            }
+        }
+    }
+}
+
+/// `⌊(d + m) / 2⌋` per lane: add the constant `d` across the planes, then
+/// drop the lowest plane. `d, m ≤ 63`, so the sum needs seven planes and the
+/// result six.
+fn limit_planes(m: &Planes, d: usize) -> Planes {
+    let mut sum = [0u64; PLANES + 1];
+    let mut carry = 0u64;
+    for k in 0..PLANES {
+        let c = 0u64.wrapping_sub(((d >> k) & 1) as u64);
+        sum[k] = m[k] ^ c ^ carry;
+        carry = (m[k] & c) | (carry & (m[k] ^ c));
+    }
+    sum[PLANES] = carry;
+    let mut out = [0u64; PLANES];
+    out.copy_from_slice(&sum[1..]);
+    out
+}
+
+/// Per lane `a ≤ b`, scanning from the high plane.
+fn le_planes(a: &Planes, b: &Planes) -> u64 {
+    let mut lt = 0u64;
+    let mut eq = u64::MAX;
+    for k in (0..PLANES).rev() {
+        lt |= eq & !a[k] & b[k];
+        eq &= !(a[k] ^ b[k]);
+    }
+    lt | eq
+}
+
+/// `d` in every lane, as planes.
+fn constant_planes(d: usize) -> Planes {
+    let mut planes = [0u64; PLANES];
+    for (k, plane) in planes.iter_mut().enumerate() {
+        *plane = 0u64.wrapping_sub(((d >> k) & 1) as u64);
+    }
+    planes
+}
+
 /// Spin words for one replica block.
 pub(crate) struct MscState {
     /// `spin[i]` bit `r` is node `i` of replica `r`; 0 is `+1`.
@@ -112,7 +171,7 @@ pub(crate) struct MscState {
 impl MscState {
     /// Random initial configurations, one independent draw per node covering
     /// all 64 replicas at once.
-    pub(crate) fn random(n: usize, rng: &mut impl rand::Rng) -> Self {
+    pub(crate) fn random(n: usize, rng: &mut impl Rng) -> Self {
         Self {
             spin: (0..n).map(|_| rng.gen::<u64>()).collect(),
         }
@@ -127,7 +186,7 @@ impl MscState {
     ///
     /// `seeds` holds at most [`LANES`] states of `n` spins each; the caller
     /// checks both.
-    pub(crate) fn seeded(n: usize, seeds: &[&[i8]], rng: &mut impl rand::Rng) -> Self {
+    pub(crate) fn seeded(n: usize, seeds: &[&[i8]], rng: &mut impl Rng) -> Self {
         debug_assert!(seeds.len() <= LANES);
         debug_assert!(seeds.iter().all(|s| s.len() == n));
         // Bits at and above `seeds.len()` keep the random draw.
@@ -194,9 +253,8 @@ pub(crate) fn bond_counts(graph: &IntGraph) -> Option<Vec<u8>> {
     Some(counts)
 }
 
-/// Advance all replica words together, following the CUDA MSA schedule.
-/// One threshold row is redrawn per beta and shared across words. Colors
-/// run in sequence, and every word uses the same seed-derived sweep offset.
+/// Advance all replica words together. One threshold row is redrawn per beta
+/// and shared across words. Colors run in sequence, with a per-word offset.
 pub(crate) fn anneal_words(
     graph: &IntGraph,
     counts: &[u8],
@@ -206,7 +264,7 @@ pub(crate) fn anneal_words(
     states: &mut [MscState],
     cancel: Option<(&CancelToken, Option<u64>)>,
 ) -> Result<(), SampleCancelled> {
-    let mut row = vec![0; draw_row()];
+    let mut row = vec![[0u64; PLANES]; LANE_ROW];
     let mut cut = vec![0; graph.max_field() + 1];
     let mut rng = SmallRng::seed_from_u64(params.seed ^ 0x5341_5F54_424C_4531);
     let sweeps_per_beta =
@@ -217,16 +275,17 @@ pub(crate) fn anneal_words(
                 return Err(SampleCancelled);
             }
         }
-        fill_threshold_row(beta, &mut cut, &mut rng, &mut row);
+        fill_cuts(beta, &mut cut);
+        fill_lane_row(&cut, &mut rng, &mut row);
         for sweep in 0..sweeps_per_beta {
             if let Some((guard, watermark)) = cancel {
                 if guard.is_cancelled(watermark) {
                     return Err(SampleCancelled);
                 }
             }
-            let off = sweep_offset(params.seed, beta_idx, sweep);
             for class in colors.classes() {
-                for state in states.iter_mut() {
+                for (word, state) in states.iter_mut().enumerate() {
+                    let off = word_offset(params.seed, word, beta_idx, sweep);
                     sweep_word(graph, counts, &row, class, off, state);
                 }
             }
@@ -235,20 +294,23 @@ pub(crate) fn anneal_words(
     Ok(())
 }
 
-/// CUDA's splitmix64 offset, shared by every replica at a given sweep.
-fn sweep_offset(seed: u64, beta_idx: usize, sweep: usize) -> usize {
-    let mut x =
-        (seed ^ ((beta_idx as u64) << 20) ^ sweep as u64).wrapping_add(0x9E37_79B9_7F4A_7C15);
+/// Splitmix64 offset into the lane row for one word at one sweep.
+fn word_offset(seed: u64, word: usize, beta_idx: usize, sweep: usize) -> usize {
+    let mut x = (seed
+        ^ (word as u64).wrapping_mul(0xD1B5_4A32_D192_ED03)
+        ^ ((beta_idx as u64) << 20)
+        ^ sweep as u64)
+        .wrapping_add(0x9E37_79B9_7F4A_7C15);
     x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-    ((x ^ (x >> 31)) as usize) & (draw_row() - 1)
+    ((x ^ (x >> 31)) as usize) & (LANE_ROW - 1)
 }
 
-/// Update a color's nodes in one word from a shared threshold row.
+/// Update a color's nodes in one word from the per-lane threshold row.
 fn sweep_word(
     graph: &IntGraph,
     counts: &[u8],
-    row: &[u8],
+    row: &[Planes],
     nodes: &[u32],
     off: usize,
     state: &mut MscState,
@@ -257,17 +319,16 @@ fn sweep_word(
     for &var in nodes {
         let var = var as usize;
         let d = usize::from(counts[var]);
-        let m = usize::from(row[(var + off) & mask]);
-        // m >= d iff (d + m) / 2 >= d, so every lane accepts and the
-        // satisfied-bond count is unused.
-        if m >= d {
+        let m = &row[(var + off) & mask];
+        // A lane with m >= d accepts whatever its count. When every lane
+        // does, skip the count.
+        if le_planes(&constant_planes(d), m) == u64::MAX {
             state.spin[var] = !state.spin[var];
             continue;
         }
         let bi = state.spin[var];
         let planes = count_planes(graph, var, bi, &state.spin);
-        let limit = (d + m) / 2;
-        state.spin[var] = bi ^ le_constant(&planes, limit);
+        state.spin[var] = bi ^ le_planes(&planes, &limit_planes(m, d));
     }
 }
 
@@ -372,41 +433,9 @@ fn add_plane(planes: &mut [u64; PLANES], filled: &mut usize, l: u64) {
     }
 }
 
-/// Mask of lanes whose bit-sliced count is `<= limit`.
-///
-/// Total: a `limit` at or above [`MAX_DEGREE`] admits every representable
-/// count.
-///
-/// Builds `[count >= limit + 1]` from the least significant plane up — with
-/// `f_k` the verdict on the low `k+1` bits, `f_k = plane_k & f_{k-1}` when the
-/// constant's bit is set and `f_k = plane_k | f_{k-1}` when it is clear — then
-/// inverts. Written branchlessly because the constant changes on every word
-/// update, so a data-dependent branch here would mispredict constantly.
-#[inline]
-fn le_constant(planes: &[u64; PLANES], limit: usize) -> u64 {
-    let bound = limit + 1;
-    if bound > MAX_DEGREE {
-        // Every representable count is below the bound.
-        return u64::MAX;
-    }
-    let mut ge = u64::MAX;
-    for (k, &p) in planes.iter().enumerate() {
-        let set = 0u64.wrapping_sub(((bound >> k) & 1) as u64);
-        let both = p & ge;
-        let either = p ^ ge;
-        // set == all ones -> p & ge; set == 0 -> p | ge == (p & ge) | (p ^ ge)
-        ge = both | (either & !set);
-    }
-    !ge
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sa_int::{
-        anneal_from, draw_row, fill_threshold_row, sweep_offsets, threshold_draws,
-    };
-    use quip_solver_core::beta::geometric_beta_schedule;
     use quip_solver_core::IsingGraph;
     use rand::rngs::SmallRng;
     use rand::{Rng, SeedableRng};
@@ -429,25 +458,76 @@ mod tests {
         IsingGraph::new(h, j, edges)
     }
 
-    #[test]
-    fn le_constant_matches_integer_comparison() {
-        // Plant a known count in every lane and check the mask.
-        for limit in 0..=MAX_DEGREE {
-            let mut planes = [0u64; PLANES];
-            for (lane, count) in (0..LANES).map(|l| (l, l % (MAX_DEGREE + 1))) {
-                for (k, plane) in planes.iter_mut().enumerate() {
-                    *plane |= (((count >> k) & 1) as u64) << lane;
-                }
+    fn ring(n: usize) -> IsingGraph {
+        let mut rng = SmallRng::seed_from_u64(8);
+        let edges = (0..n).map(|u| (u, (u + 1) % n)).collect();
+        let j = (0..n)
+            .map(|_| if rng.gen::<bool>() { 1.0 } else { -1.0 })
+            .collect();
+        IsingGraph::new(vec![0.0; n], j, edges)
+    }
+
+    /// Plant a per-lane value `f(lane)` into six planes.
+    fn planes_of(f: impl Fn(usize) -> usize) -> Planes {
+        let mut planes = [0u64; PLANES];
+        for lane in 0..LANES {
+            let v = f(lane);
+            for (k, plane) in planes.iter_mut().enumerate() {
+                *plane |= (((v >> k) & 1) as u64) << lane;
             }
-            let mask = le_constant(&planes, limit);
+        }
+        planes
+    }
+
+    fn lane_value(planes: &Planes, lane: usize) -> usize {
+        (0..PLANES)
+            .map(|k| (((planes[k] >> lane) & 1) as usize) << k)
+            .sum()
+    }
+
+    #[test]
+    fn le_planes_matches_integer_comparison() {
+        for shift in 0..64 {
+            let a = planes_of(|l| (l * 7 + shift) % 64);
+            let b = planes_of(|l| (l * 13 + 3 * shift) % 64);
+            let mask = le_planes(&a, &b);
             for lane in 0..LANES {
-                let count = lane % (MAX_DEGREE + 1);
+                let (x, y) = (lane_value(&a, lane), lane_value(&b, lane));
+                assert_eq!((mask >> lane) & 1 == 1, x <= y, "lane {lane}: {x} <= {y}");
+            }
+        }
+    }
+
+    #[test]
+    fn limit_planes_halves_degree_plus_threshold() {
+        for d in 0..=MAX_DEGREE {
+            let m = planes_of(|l| l % 64);
+            let limit = limit_planes(&m, d);
+            for lane in 0..LANES {
                 assert_eq!(
-                    (mask >> lane) & 1 == 1,
-                    count <= limit,
-                    "lane {lane} count {count} limit {limit}"
+                    lane_value(&limit, lane),
+                    (d + lane % 64) / 2,
+                    "d {d} lane {lane}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn lane_rows_draw_the_geometric_threshold_per_lane() {
+        let beta = 0.3;
+        let mut cut = vec![0u64; 21];
+        fill_cuts(beta, &mut cut);
+        let mut row = vec![[0u64; PLANES]; LANE_ROW];
+        fill_lane_row(&cut, &mut SmallRng::seed_from_u64(8), &mut row);
+        let total = (LANE_ROW * LANES) as f64;
+        for k in 1..4 {
+            let at_least: usize = row
+                .iter()
+                .map(|e| (0..LANES).filter(|&l| lane_value(e, l) >= k).count())
+                .sum();
+            let want = (-2.0 * beta * k as f64).exp();
+            assert!((at_least as f64 / total - want).abs() < 0.01, "k {k}");
         }
     }
 
@@ -501,38 +581,44 @@ mod tests {
         }
     }
 
-    /// The load-bearing test: every lane of the multi-spin kernel must trace
-    /// exactly the trajectory the scalar kernel traces from the same initial
-    /// configuration and the same acceptance thresholds.
     #[test]
-    fn every_lane_matches_the_scalar_kernel() {
-        for (seed, fields) in [
-            (1u64, &[0.0][..]),
-            (2, &[-1.0, 0.0, 1.0][..]),
-            (3, &[1.0][..]),
-        ] {
-            let graph = unit_graph(40, seed, fields, 0.35);
-            let int = IntGraph::from_base(&graph).expect("unit couplings qualify");
-            let counts = bond_counts(&int).expect("degree within bounds");
-            let betas = geometric_beta_schedule(0.05, 6.0, 24);
-            let mut rng = SmallRng::seed_from_u64(seed);
-            let draws = threshold_draws(&betas, int.max_field(), &mut rng).expect("short ladder");
-            let offsets = sweep_offsets(betas.len(), 2, &mut rng);
+    fn every_lane_matches_a_per_lane_scalar_reference() {
+        let graph = unit_graph(40, 2, &[-1.0, 0.0, 1.0], 0.35);
+        let int = IntGraph::from_base(&graph).expect("unit couplings qualify");
+        let counts = bond_counts(&int).expect("degree within bounds");
+        let mut cut = vec![0u64; int.max_field() + 1];
+        fill_cuts(0.8, &mut cut);
+        let mut row = vec![[0u64; PLANES]; LANE_ROW];
+        fill_lane_row(&cut, &mut SmallRng::seed_from_u64(3), &mut row);
+        let mut state = MscState::random(int.num_nodes(), &mut SmallRng::seed_from_u64(4));
+        let before: Vec<Vec<i8>> = (0..LANES).map(|l| state.lane(l)).collect();
+        let nodes: Vec<u32> = (0..int.num_nodes() as u32).collect();
+        let off = 17;
+        sweep_word(&int, &counts, &row, &nodes, off, &mut state);
 
-            let mut state = MscState::random(int.num_nodes(), &mut rng);
-            let before: Vec<Vec<i8>> = (0..LANES).map(|l| state.lane(l)).collect();
-            let nodes: Vec<u32> = (0..int.num_nodes() as u32).collect();
-            for (row, shifts) in draws.chunks_exact(draw_row()).zip(offsets.chunks_exact(2)) {
-                for &off in shifts {
-                    sweep_word(&int, &counts, row, &nodes, off, &mut state);
+        for (lane, start) in before.iter().enumerate() {
+            let mut s = start.clone();
+            for var in 0..int.num_nodes() {
+                let d = usize::from(counts[var]);
+                let m = lane_value(&row[(var + off) & (LANE_ROW - 1)], lane);
+                // L: satisfied bonds, the field bond included.
+                let mut l = 0;
+                for &e in int.neighbors(var) {
+                    let j = if e >> 31 == 1 { -1 } else { 1 };
+                    let nb = (e & 0x7fff_ffff) as usize;
+                    if j * i32::from(s[var]) * i32::from(s[nb]) < 0 {
+                        l += 1;
+                    }
+                }
+                let h = i32::from(int.bias(var));
+                if h != 0 && h * i32::from(s[var]) < 0 {
+                    l += 1;
+                }
+                if l <= (d + m) / 2 {
+                    s[var] = -s[var];
                 }
             }
-
-            for (lane, start) in before.iter().enumerate() {
-                let mut spins = start.clone();
-                anneal_from(&int, &draws, 2, &mut spins, &offsets, None).expect("no cancel token");
-                assert_eq!(state.lane(lane), spins, "seed {seed} lane {lane}");
-            }
+            assert_eq!(state.lane(lane), s, "lane {lane}");
         }
     }
 
@@ -663,7 +749,7 @@ mod tests {
                         }
                         for m in threshold_samples(d) {
                             let mut state = MscState { spin: spin.clone() };
-                            let row = vec![m as u8; draw_row()];
+                            let row = vec![planes_of(|_| m.min(MAX_DEGREE)); LANE_ROW];
                             sweep_word(&int, &counts, &row, &[0], 0, &mut state);
                             let limit = (d + m) / 2;
                             for (lane, packed_count) in packed.iter().enumerate() {
@@ -684,68 +770,103 @@ mod tests {
     }
 
     #[test]
-    fn early_accept_flips_every_lane_when_threshold_covers_degree() {
-        let graph = signed_star(6, 1.0, 3);
-        let int = IntGraph::from_base(&graph).expect("unit star");
-        let counts = bond_counts(&int).expect("degree within bounds");
-        let d = usize::from(counts[0]);
-        let mut rng = SmallRng::seed_from_u64(5);
-        let spin = MscState::random(int.num_nodes(), &mut rng).spin;
-        for m in [d, d + 1] {
-            let mut state = MscState { spin: spin.clone() };
-            let row = vec![m as u8; draw_row()];
-            sweep_word(&int, &counts, &row, &[0], 0, &mut state);
-            assert_eq!(state.spin[0], !spin[0], "m {m} must flip every lane");
-        }
+    fn identical_lanes_separate() {
+        let graph = unit_graph(64, 6, &[0.0], 0.2);
+        let int = IntGraph::from_base(&graph).unwrap();
+        let counts = bond_counts(&int).unwrap();
+        let colors = Coloring::new(&crate::sampler_core::CpuGraph::from_base(&graph));
+        let same: Vec<i8> = (0..64).map(|i| if i % 2 == 0 { 1 } else { -1 }).collect();
+        let seeds: Vec<&[i8]> = vec![same.as_slice(); LANES];
+        let mut states = vec![MscState::seeded(
+            64,
+            &seeds,
+            &mut SmallRng::seed_from_u64(1),
+        )];
+        let params = SampleParams {
+            seed: 9,
+            sweeps_per_beta: 1,
+            ..Default::default()
+        };
+        anneal_words(
+            &int,
+            &counts,
+            &colors,
+            &[0.2, 0.2, 0.2, 0.2],
+            &params,
+            &mut states,
+            None,
+        )
+        .unwrap();
+        let distinct: std::collections::BTreeSet<Vec<i8>> =
+            (0..LANES).map(|l| states[0].lane(l)).collect();
+        assert!(
+            distinct.len() >= 32,
+            "{} distinct lanes of 64",
+            distinct.len()
+        );
     }
 
     #[test]
-    fn anneal_words_matches_per_word_sweep_word() {
-        let graph = unit_graph(24, 11, &[-1.0, 0.0, 1.0], 0.4);
-        let int = IntGraph::from_base(&graph).expect("unit couplings qualify");
-        let counts = bond_counts(&int).expect("degree within bounds");
-        let colors = Coloring::new(&crate::sampler_core::CpuGraph::from_base(&graph));
-        let betas = [0.2_f64, 1.5];
-        let params = SampleParams {
-            seed: 42,
-            sweeps_per_beta: 3,
-            ..Default::default()
-        };
-        let mut rng = SmallRng::seed_from_u64(1);
-        let mut states = vec![
-            MscState::random(int.num_nodes(), &mut rng),
-            MscState::random(int.num_nodes(), &mut rng),
-        ];
-        let mut replay: Vec<MscState> = states
-            .iter()
-            .map(|s| MscState {
-                spin: s.spin.clone(),
-            })
-            .collect();
-        anneal_words(&int, &counts, &colors, &betas, &params, &mut states, None)
-            .expect("no cancel token");
-
-        let mut row = vec![0; draw_row()];
-        let mut cut = vec![0; int.max_field() + 1];
-        let mut table_rng = SmallRng::seed_from_u64(params.seed ^ 0x5341_5F54_424C_4531);
-        let sweeps_per_beta = crate::sampler_core::effective_sweeps_per_beta(
-            params.num_sweeps,
-            params.sweeps_per_beta,
-        );
-        for (beta_idx, &beta) in betas.iter().enumerate() {
-            fill_threshold_row(beta, &mut cut, &mut table_rng, &mut row);
-            for sweep in 0..sweeps_per_beta {
-                let off = sweep_offset(params.seed, beta_idx, sweep);
-                for class in colors.classes() {
-                    for state in replay.iter_mut() {
-                        sweep_word(&int, &counts, &row, class, off, state);
-                    }
-                }
+    fn dense_and_deep_runs_keep_distinct_reads() {
+        let complete = unit_graph(28, 7, &[0.0], 1.0);
+        let sparse_ring = ring(256);
+        let mut counts = Vec::new();
+        for (name, graph, sweeps) in [("complete", complete, 1000), ("ring", sparse_ring, 32_768)] {
+            for count in [50, sweeps] {
+                let params = SampleParams {
+                    num_reads: 64,
+                    num_sweeps: count,
+                    seed: 12,
+                    ..Default::default()
+                };
+                let unit = crate::research::sample_research(
+                    &graph,
+                    &params,
+                    crate::research::ResearchKernel::UnitMsa,
+                    None,
+                    None,
+                )
+                .unwrap();
+                let sa = crate::research::sample_research(
+                    &graph,
+                    &params,
+                    crate::research::ResearchKernel::ScalarSa,
+                    None,
+                    None,
+                )
+                .unwrap();
+                let unit_distinct: std::collections::BTreeSet<&Vec<i8>> =
+                    unit.spins.iter().collect();
+                let sa_distinct: std::collections::BTreeSet<&Vec<i8>> = sa.spins.iter().collect();
+                counts.push((name, count, unit_distinct.len(), sa_distinct.len()));
             }
         }
-        for (got, expect) in states.iter().zip(&replay) {
-            assert_eq!(got.spin, expect.spin);
-        }
+        assert!(
+            counts
+                .iter()
+                .all(|&(_, _, unit, sa)| unit > 1 && unit * 2 >= sa),
+            "distinct read counts (model, sweeps, unit, sa): {counts:?}"
+        );
+    }
+
+    #[test]
+    fn models_larger_than_the_lane_row_run() {
+        let graph = unit_graph(LANE_ROW * 3 + 5, 4, &[1.0], 0.0);
+        let params = SampleParams {
+            num_reads: 64,
+            num_sweeps: 4,
+            seed: 2,
+            ..Default::default()
+        };
+        let out = crate::research::sample_research(
+            &graph,
+            &params,
+            crate::research::ResearchKernel::UnitMsa,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(out.spins.len(), 64);
     }
 
     #[test]

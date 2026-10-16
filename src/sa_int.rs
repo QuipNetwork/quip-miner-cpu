@@ -334,23 +334,32 @@ pub(crate) fn threshold_draws(
     Some(out)
 }
 
-/// Redraw one temperature's thresholds, reusing the row and acceptance cuts.
+/// Acceptance cuts for one temperature: `cut[k]` scales `exp(-2βk)` to `u64`.
 /// `cut` has one entry for every possible field magnitude, including zero.
-pub(crate) fn fill_threshold_row(beta: f64, cut: &mut [u64], rng: &mut SmallRng, row: &mut [u8]) {
+pub(crate) fn fill_cuts(beta: f64, cut: &mut [u64]) {
     let scale = -2.0 * beta;
     for (k, c) in cut.iter_mut().enumerate() {
         *c = scale_u64((scale * k as f64).exp());
     }
-    // With no bonds or fields there is no uphill move, so every threshold is 0.
+}
+
+/// The geometric threshold `M` for one uniform `u`: the count of uphill
+/// levels whose cut lies above `u`. With no bonds or fields it is 0.
+pub(crate) fn draw_threshold(cut: &[u64], u: u64) -> u8 {
     let first = cut.get(1).copied().unwrap_or(0);
-    for slot in row {
-        let u = rng.gen::<u64>();
+    if u >= first {
+        0
+    } else {
         // Accepted levels form a prefix of the non-increasing cuts.
-        *slot = if u >= first {
-            0
-        } else {
-            cut[1..].partition_point(|&c| u < c) as u8
-        };
+        cut[1..].partition_point(|&c| u < c) as u8
+    }
+}
+
+/// Redraw one temperature's thresholds, reusing the row and acceptance cuts.
+pub(crate) fn fill_threshold_row(beta: f64, cut: &mut [u64], rng: &mut SmallRng, row: &mut [u8]) {
+    fill_cuts(beta, cut);
+    for slot in row {
+        *slot = draw_threshold(cut, rng.gen::<u64>());
     }
 }
 
@@ -369,11 +378,6 @@ pub(crate) fn sweep_offsets(
         .collect()
 }
 
-/// Width of one threshold row, exposed for the multi-spin kernel.
-pub(crate) const fn draw_row() -> usize {
-    DRAW_ROW
-}
-
 /// The tabulated-threshold annealing core: pure given `spins` and `offsets`.
 pub(crate) fn anneal_from(
     graph: &IntGraph,
@@ -388,7 +392,7 @@ pub(crate) fn anneal_from(
     const MASK: usize = DRAW_ROW - 1;
 
     let mut sweep = 0usize;
-    for row in draws.chunks_exact(DRAW_ROW) {
+    for row in draws.as_chunks::<DRAW_ROW>().0 {
         for _ in 0..sweeps_per_beta {
             if let Some((guard, watermark)) = cancel {
                 if guard.is_cancelled(watermark) {

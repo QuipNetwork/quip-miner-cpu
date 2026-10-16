@@ -21,17 +21,19 @@
 //! reads an incrementally updated field cache, which can drift from that
 //! recomputation due to IEEE rounding.
 //! A lane accepts when `Δ ≤ 0`, or when `ln u < -β Δ` for one uniform `u`
-//! drawn per node visit. Accepted lanes come back as a mask and the flip is
+//! drawn per uphill candidate. Accepted lanes come back as a mask and the flip is
 //! one XOR into the node's word.
 //!
-//! # Randomness: `shared-node-threshold-v1`
+//! # Randomness: `per-lane-draw-v1`
 //!
-//! One open-interval uniform is drawn per node visit and its logarithm is
-//! shared by every lane of every replica word at that visit, as the unit
-//! kernel shares its threshold row. Reads are therefore not independent
-//! trials. Cold lanes start from the same per-word stream as the unit
-//! kernel's, so lane `r` of a cold `cpu-msa-f64` run and lane `r` of a cold
-//! `cpu-msa` run with the same seed start from the same configuration.
+//! Every replica word owns one `SmallRng` stream, seeded from the job seed and
+//! the word index. At each node visit, each lane with `Δ > 0` draws its own
+//! open-interval uniform from that stream, in lane order. A lane with
+//! `Δ ≤ 0` accepts without a draw. Two lanes that reach the same spins see
+//! different draws, so they separate again, which a shared draw cannot do
+//! (QUI-1596). Read `r` depends only on word `r / 64`, so a longer run's
+//! leading reads equal a shorter run's reads. Cold lanes start from the same
+//! per-word stream as the unit kernel's.
 //!
 //! # Limits
 //!
@@ -51,6 +53,7 @@ use quip_solver_core::{CancelToken, IsingGraph, SampleParams};
 use rand::distributions::Open01;
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
+use std::mem::size_of;
 
 use crate::coloring::Coloring;
 use crate::sa_msc::{MscState, LANES};
@@ -70,14 +73,23 @@ pub(crate) const MAX_COEFFICIENT_SUM: f64 = 1e100;
 /// Largest inverse temperature accepted, at either end or as a seeded start.
 pub(crate) const MAX_BETA: f64 = 1e100;
 
-/// Cap on the kernel's own allocations, excluding the caller's arrays.
-pub(crate) const WORKSPACE_CAP_BYTES: usize = 256 << 20;
+/// Cap on the kernel's own allocations, excluding the caller's arrays. A
+/// 2M-node model with 20M edges and 64 reads needs about 0.6 GiB.
+pub(crate) const WORKSPACE_CAP_BYTES: usize = 8 << 30;
 
 /// Name of the randomness scheme this kernel implements.
-pub(crate) const RNG_SCHEME: &str = "shared-node-threshold-v1";
+pub(crate) const RNG_SCHEME: &str = "per-lane-draw-v1";
 
-/// Salt for the per-node threshold stream, distinct from the unit kernel's.
-const THRESHOLD_SALT: u64 = 0x4D53_415F_4636_3401;
+/// Salt for the per-word acceptance streams.
+const LANE_SALT: u64 = 0x4D53_415F_4C41_4E45;
+
+/// The acceptance stream of replica word `word`.
+fn lane_stream(seed: u64, word: usize) -> SmallRng {
+    let mut x = (word as u64).wrapping_add(0x9E37_79B9_7F4A_7C15);
+    x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    SmallRng::seed_from_u64(seed ^ LANE_SALT ^ x ^ (x >> 31))
+}
 
 /// Why a request was refused or stopped.
 #[derive(Debug, Clone, PartialEq)]
@@ -152,6 +164,23 @@ fn invalid<T>(msg: String) -> Result<T, FloatMsaError> {
     Err(FloatMsaError::InvalidInput(msg))
 }
 
+pub(crate) fn check_size(nodes: usize, edges: usize) -> Result<(), FloatMsaError> {
+    if nodes == 0 {
+        return invalid("the problem has no nodes".to_owned());
+    }
+    if nodes > DEFAULT_MAX_NODES as usize {
+        return invalid(format!(
+            "{nodes} nodes exceed the limit of {DEFAULT_MAX_NODES}"
+        ));
+    }
+    if edges > DEFAULT_MAX_EDGES as usize {
+        return invalid(format!(
+            "{edges} edges exceed the limit of {DEFAULT_MAX_EDGES}"
+        ));
+    }
+    Ok(())
+}
+
 fn check_coefficient(name: &str, index: usize, value: f64) -> Result<(), FloatMsaError> {
     if !value.is_finite() {
         return invalid(format!("{name}[{index}] is not finite"));
@@ -175,7 +204,8 @@ pub(crate) fn check_beta(name: &str, beta: f64) -> Result<(), FloatMsaError> {
 }
 
 /// Bytes the run allocates: CSR adjacency, packed words, output rows and
-/// energies, the colouring, and the per-visit field scratch.
+/// energies, the colouring, per-word acceptance streams, and the per-visit
+/// field scratch.
 fn workspace_bytes(nodes: usize, edges: usize, reads: usize, words: usize) -> Option<usize> {
     let csr = nodes
         .checked_mul(12)?
@@ -186,10 +216,27 @@ fn workspace_bytes(nodes: usize, edges: usize, reads: usize, words: usize) -> Op
         .checked_mul(nodes)?
         .checked_add(reads.checked_mul(8)?)?;
     let coloring = nodes.checked_mul(8)?;
+    let streams = words.checked_mul(size_of::<SmallRng>())?;
     csr.checked_add(packed)?
         .checked_add(output)?
         .checked_add(coloring)?
+        .checked_add(streams)?
         .checked_add(LANES * 8)
+}
+
+pub(crate) fn check_workspace(
+    nodes: usize,
+    edges: usize,
+    reads: usize,
+) -> Result<usize, FloatMsaError> {
+    let needed = workspace_bytes(nodes, edges, reads, reads.div_ceil(LANES)).unwrap_or(usize::MAX);
+    if needed > WORKSPACE_CAP_BYTES {
+        return Err(FloatMsaError::MemoryLimit {
+            needed,
+            cap: WORKSPACE_CAP_BYTES,
+        });
+    }
+    Ok(needed)
 }
 
 fn validate(
@@ -199,19 +246,7 @@ fn validate(
 ) -> Result<Plan, FloatMsaError> {
     let nodes = graph.h.len();
     let edges = graph.edges.len();
-    if nodes == 0 {
-        return invalid("the problem has no nodes".to_owned());
-    }
-    if nodes > DEFAULT_MAX_NODES as usize {
-        return invalid(format!(
-            "{nodes} nodes exceed the limit of {DEFAULT_MAX_NODES}"
-        ));
-    }
-    if edges > DEFAULT_MAX_EDGES as usize {
-        return invalid(format!(
-            "{edges} edges exceed the limit of {DEFAULT_MAX_EDGES}"
-        ));
-    }
+    check_size(nodes, edges)?;
     if graph.j.len() != edges {
         return invalid(format!("{} couplings for {edges} edges", graph.j.len()));
     }
@@ -219,6 +254,7 @@ fn validate(
     if !(1..=MAX_READS).contains(&reads) {
         return invalid(format!("num_reads must be in 1..={MAX_READS}; got {reads}"));
     }
+    let needed = check_workspace(nodes, edges, reads)?;
 
     let mut sum = 0.0f64;
     for (i, &h) in graph.h.iter().enumerate() {
@@ -284,12 +320,6 @@ fn validate(
     }
 
     let words = reads.div_ceil(LANES);
-    let cap = WORKSPACE_CAP_BYTES;
-    let needed = workspace_bytes(nodes, edges, reads, words).unwrap_or(usize::MAX);
-    if needed > cap {
-        return Err(FloatMsaError::MemoryLimit { needed, cap });
-    }
-
     // The validated endpoints are the ones the ladder is built from.
     let resolved = SampleParams {
         beta_range: Some((hot, cold)),
@@ -388,8 +418,7 @@ pub(crate) fn sample_float_msa(
     })
 }
 
-/// Run the ladder over every replica word, colour class by colour class,
-/// with one threshold draw per node visit shared by all words.
+/// Run the ladder over every replica word, colour class by colour class.
 fn anneal(
     cpu: &CpuGraph,
     colors: &Coloring,
@@ -400,21 +429,21 @@ fn anneal(
     mut after_sweep: impl FnMut(),
 ) -> Result<(), FloatMsaError> {
     let sweeps_per = effective_sweeps_per_beta(params.num_sweeps, params.sweeps_per_beta);
-    let mut rng = SmallRng::seed_from_u64(params.seed ^ THRESHOLD_SALT);
+    let mut streams: Vec<SmallRng> = (0..states.len())
+        .map(|w| lane_stream(params.seed, w))
+        .collect();
     for &beta in betas {
         for _ in 0..sweeps_per {
             check_cancel(cancel)?;
             for class in colors.classes() {
                 for &var in class {
                     let var = var as usize;
-                    let u: f64 = rng.sample(Open01);
-                    let log_uniform = u.ln();
                     let (nbrs, coups) = cpu.neighbors(var);
                     let bias = cpu.bias(var);
-                    for state in states.iter_mut() {
+                    for (state, stream) in states.iter_mut().zip(&mut streams) {
                         let words = state.spins_mut();
                         let own = words[var];
-                        let mask = flip_mask(own, words, nbrs, coups, bias, beta, log_uniform);
+                        let mask = flip_mask(own, words, nbrs, coups, bias, beta, stream);
                         words[var] ^= mask;
                     }
                 }
@@ -453,14 +482,18 @@ fn flip_mask(
     coups: &[f64],
     bias: f64,
     beta: f64,
-    log_uniform: f64,
+    rng: &mut SmallRng,
 ) -> u64 {
     let local = local_fields(spins, nbrs, coups, bias);
     let mut mask = 0u64;
     for (lane, &field) in local.iter().enumerate() {
         // Spin +1 gives -2·field; the set bit of spin -1 flips that sign.
         let delta = f64::from_bits((-2.0 * field).to_bits() ^ (((own >> lane) & 1) << 63));
-        if delta <= 0.0 || log_uniform < -beta * delta {
+        let accept = delta <= 0.0 || {
+            let u: f64 = rng.sample(Open01);
+            u.ln() < -beta * delta
+        };
+        if accept {
             mask |= 1 << lane;
         }
     }
@@ -588,12 +621,16 @@ mod tests {
         // Plan Task 4 step 7, on the CSR-slice signature. Every lane of a
         // zero word is spin +1, so the downhill flip covers the whole word;
         // in the second call only lane 0 is spin -1 and uphill.
-        assert_eq!(flip_mask(0, &[0], &[], &[], 0.25, 1.0, -0.5), u64::MAX);
-        assert_eq!(flip_mask(1, &[1], &[], &[], 0.25, 1.0, -0.25), !1u64);
+        let mut rng = SmallRng::seed_from_u64(1);
+        assert_eq!(flip_mask(0, &[0], &[], &[], 0.25, 1.0, &mut rng), u64::MAX);
+        assert_eq!(
+            flip_mask(1, &[1], &[], &[], 0.25, MAX_BETA, &mut rng),
+            !1u64
+        );
     }
 
     #[test]
-    fn masks_match_a_scalar_oracle_given_the_same_uniform() {
+    fn masks_match_a_scalar_oracle_given_the_same_stream() {
         let n = 40;
         let graph = weighted_graph(n, 0.3, 7);
         let cpu = CpuGraph::from_base(&graph);
@@ -602,21 +639,34 @@ mod tests {
         for _ in 0..200 {
             let var = rng.gen_range(0..n);
             let beta = rng.gen_range(0.01..5.0);
-            let log_u = -rng.gen_range(0.0..20.0);
+            let mut stream = SmallRng::seed_from_u64(rng.gen());
+            let mut expected_stream = stream.clone();
             let (nbrs, coups) = cpu.neighbors(var);
-            let mask = flip_mask(words[var], &words, nbrs, coups, cpu.bias(var), beta, log_u);
+            let mask = flip_mask(
+                words[var],
+                &words,
+                nbrs,
+                coups,
+                cpu.bias(var),
+                beta,
+                &mut stream,
+            );
             for lane in 0..LANES {
                 let spins = lane_spins(&words, lane);
                 let field = effective_field(var, &spins, &cpu);
                 let delta = -2.0 * f64::from(spins[var]) * field;
-                let accept = delta <= 0.0 || log_u < -beta * delta;
+                let accept = delta <= 0.0 || {
+                    let u: f64 = expected_stream.sample(Open01);
+                    u.ln() < -beta * delta
+                };
                 assert_eq!((mask >> lane) & 1 == 1, accept, "var {var} lane {lane}");
             }
+            assert_eq!(stream.gen::<u64>(), expected_stream.gen::<u64>());
         }
     }
 
     #[test]
-    fn one_threshold_per_node_visit_is_shared_across_replica_words() {
+    fn each_lane_draws_from_its_words_stream() {
         let graph = IsingGraph::new(
             vec![0.25, -0.375, 0.5],
             vec![0.75, -0.625, 0.5],
@@ -625,44 +675,108 @@ mod tests {
         let params = SampleParams {
             sweeps_per_beta: 1,
             beta_range: Some((0.05, 3.0)),
-            ..params(128, 1, 0x5A17)
+            ..params(128, 3, 0x5A17)
         };
         let cpu = CpuGraph::from_base(&graph);
         let colors = Coloring::new(&cpu);
         let betas = build_beta_schedule(&graph, &params);
         let sweeps_per_beta = effective_sweeps_per_beta(params.num_sweeps, params.sweeps_per_beta);
-        let mut expected: Vec<Vec<i8>> = (0..params.num_reads)
+        let mut expected: Vec<Vec<Vec<i8>>> = (0..params.num_reads)
             .step_by(LANES)
-            .flat_map(|read| {
+            .map(|read| {
                 let mut rng = read_rng(params.seed, read);
                 let state = MscState::random(graph.h.len(), &mut rng);
-                (0..LANES.min(params.num_reads - read)).map(move |lane| state.lane(lane))
+                (0..LANES).map(|lane| state.lane(lane)).collect()
             })
             .collect();
-        let mut thresholds = SmallRng::seed_from_u64(params.seed ^ THRESHOLD_SALT);
-
-        for &beta in &betas {
-            for _ in 0..sweeps_per_beta {
-                for class in colors.classes() {
-                    for &var in class {
-                        let uniform: f64 = thresholds.sample(Open01);
-                        let log_uniform = uniform.ln();
-                        for spins in &mut expected {
-                            let field = effective_field(var as usize, spins, &cpu);
-                            let delta = -2.0 * f64::from(spins[var as usize]) * field;
-                            if delta <= 0.0 || log_uniform < -beta * delta {
-                                spins[var as usize] = -spins[var as usize];
+        for (word, lanes) in expected.iter_mut().enumerate() {
+            let mut stream = lane_stream(params.seed, word);
+            for &beta in &betas {
+                for _ in 0..sweeps_per_beta {
+                    for class in colors.classes() {
+                        for &var in class {
+                            let var = var as usize;
+                            for spins in lanes.iter_mut() {
+                                let field = effective_field(var, spins, &cpu);
+                                let delta = -2.0 * f64::from(spins[var]) * field;
+                                let accept = delta <= 0.0 || {
+                                    let u: f64 = stream.sample(Open01);
+                                    u.ln() < -beta * delta
+                                };
+                                if accept {
+                                    spins[var] = -spins[var];
+                                }
                             }
                         }
                     }
                 }
             }
         }
-
+        let expected: Vec<Vec<i8>> = expected.into_iter().flatten().collect();
         let actual = sample_float_msa(&graph, &params, None, None).expect("valid request");
-        assert_eq!(actual.spins.len(), 128);
-        for (read, (actual, expected)) in actual.spins.iter().zip(&expected).enumerate() {
-            assert_eq!(actual, expected, "read {read}");
+        for (read, (got, want)) in actual.spins.iter().zip(&expected).enumerate() {
+            assert_eq!(got, want, "read {read}");
+        }
+    }
+
+    #[test]
+    fn identical_lanes_separate() {
+        let graph = weighted_graph(28, 1.0, 9);
+        let seed_state: Vec<i8> = (0..28).map(|i| if i % 3 == 0 { -1 } else { 1 }).collect();
+        let seeds = vec![seed_state; 64];
+        let params = SampleParams {
+            beta_range: Some((0.05, 0.5)),
+            ..params(64, 8, 3)
+        };
+        let start = SeededStart {
+            spins: &seeds,
+            start_beta: None,
+        };
+        let out = sample_float_msa(&graph, &params, Some(start), None).expect("valid request");
+        let distinct: std::collections::BTreeSet<&Vec<i8>> = out.spins.iter().collect();
+        assert!(
+            distinct.len() >= 32,
+            "{} distinct rows of 64",
+            distinct.len()
+        );
+    }
+
+    #[test]
+    fn dense_models_keep_distinct_reads() {
+        // QUI-1596 regression: a complete N=28 fractional model at 64 reads.
+        let graph = weighted_graph(28, 1.0, 21);
+        for num_sweeps in [50, 1000] {
+            let params = SampleParams {
+                beta_range: None,
+                ..params(64, num_sweeps, 5)
+            };
+            let msa = sample_float_msa(&graph, &params, None, None).expect("valid request");
+            let sa = sample_research(&graph, &params, ResearchKernel::ScalarSa, None, None)
+                .expect("valid scalar request");
+            let msa_distinct = msa
+                .spins
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len();
+            let sa_distinct = sa
+                .spins
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len();
+            assert!(
+                msa_distinct > 1 && msa_distinct * 2 >= sa_distinct,
+                "sweeps {num_sweeps}: msa {msa_distinct}, sa {sa_distinct}"
+            );
+        }
+    }
+
+    #[test]
+    fn read_prefixes_do_not_depend_on_the_read_count() {
+        let graph = weighted_graph(12, 0.5, 5);
+        let long = sample_float_msa(&graph, &params(129, 20, 4), None, None).unwrap();
+        for reads in [1_usize, 63, 64, 65] {
+            let short = sample_float_msa(&graph, &params(reads, 20, 4), None, None).unwrap();
+            assert_eq!(short.spins[..], long.spins[..reads], "reads {reads}");
         }
     }
 
@@ -850,36 +964,60 @@ mod tests {
     }
 
     #[test]
-    fn cold_float_lanes_match_cold_unit_lanes_on_a_pm_one_model() {
-        let graph = IsingGraph::new(vec![0.0, 0.0], vec![-1.0], vec![(0, 1)]);
-        let params = SampleParams {
-            num_reads: 128,
-            num_sweeps: 1,
-            sweeps_per_beta: 1,
-            seed: 0xC01D,
-            beta_range: Some((MAX_BETA, MAX_BETA)),
-            schedule: quip_solver_core::BetaSchedule::Geometric,
-        };
-
-        let float = sample_float_msa(&graph, &params, None, None).expect("valid float request");
-        let unit = sample_research(&graph, &params, ResearchKernel::UnitMsa, None, None)
-            .expect("valid unit request");
-        assert_eq!(float.spins, unit.spins);
+    fn a_large_model_with_many_reads_hits_the_workspace_cap() {
+        let n = 2_000_000;
+        let graph = IsingGraph::new(vec![0.0; n], vec![], vec![]);
+        let err = sample_float_msa(&graph, &params(MAX_READS, 1, 1), None, None)
+            .expect_err("4096 reads of 2M nodes exceed the cap");
+        assert!(
+            matches!(err, FloatMsaError::MemoryLimit { needed, cap } if cap == WORKSPACE_CAP_BYTES && needed > cap),
+            "{err:?}"
+        );
     }
 
     #[test]
-    fn a_request_past_the_workspace_cap_is_refused_before_allocation() {
-        let graph = IsingGraph::new(vec![0.0; 100_000], vec![], vec![]);
-        let err = sample_float_msa(&graph, &params(MAX_READS, 1, 1), None, None)
-            .expect_err("output rows alone exceed the cap");
-        let limited = if let FloatMsaError::MemoryLimit { needed, cap } = err {
-            cap == WORKSPACE_CAP_BYTES && needed > cap
-        } else {
-            false
-        };
-        assert!(limited, "{err:?}");
-        // The same model with one read fits, so the cap decided, not the size.
-        assert!(sample_float_msa(&graph, &params(1, 0, 1), None, None).is_ok());
+    fn workspace_estimate_counts_per_word_acceptance_streams() {
+        let base = 16 + 8 + 9 + 8 + LANES * 8;
+        assert_eq!(
+            workspace_bytes(1, 0, 1, 1),
+            Some(base + size_of::<SmallRng>())
+        );
+        assert_eq!(
+            workspace_bytes(1, 0, 1, 2),
+            Some(base + 8 + 2 * size_of::<SmallRng>())
+        );
+    }
+
+    #[test]
+    fn edge_heavy_workspace_is_refused_from_counts() {
+        assert!(check_workspace(2_000_000, 0, 3136).is_ok());
+        assert!(matches!(
+            check_workspace(2_000_000, 67_108_864, 3136),
+            Err(FloatMsaError::MemoryLimit { needed, cap })
+                if cap == WORKSPACE_CAP_BYTES && needed > cap
+        ));
+    }
+
+    #[test]
+    fn size_check_accepts_node_cap_and_rejects_the_next_node() {
+        assert_eq!(check_size(4_194_304, 0), Ok(()));
+        assert_eq!(
+            check_size(4_194_305, 0),
+            Err(FloatMsaError::InvalidInput(
+                "4194305 nodes exceed the limit of 4194304".to_owned()
+            ))
+        );
+    }
+
+    #[test]
+    fn size_check_accepts_edge_cap_and_rejects_the_next_edge() {
+        assert_eq!(check_size(1, 67_108_864), Ok(()));
+        assert_eq!(
+            check_size(1, 67_108_865),
+            Err(FloatMsaError::InvalidInput(
+                "67108865 edges exceed the limit of 67108864".to_owned()
+            ))
+        );
     }
 
     #[test]
@@ -935,12 +1073,7 @@ mod tests {
             ("no nodes", chain(vec![], vec![], vec![]), params(4, 8, 1)),
             (
                 "too many nodes",
-                chain(vec![0.0; 100_001], vec![], vec![]),
-                params(4, 8, 1),
-            ),
-            (
-                "too many edges",
-                chain(vec![0.0; 2], vec![0.0; 1_000_001], vec![(0, 1); 1_000_001]),
+                chain(vec![0.0; 4_194_305], vec![], vec![]),
                 params(4, 8, 1),
             ),
             (

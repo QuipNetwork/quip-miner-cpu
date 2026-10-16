@@ -12,6 +12,25 @@ import quip_msa
 KERNELS = ("cpu-sa", "cpu-msa-unit", "cpu-msa-f64")
 
 
+def test_count_preflight_refuses_large_requests_before_copying_arrays():
+    h = np.broadcast_to(np.array([0.0]), (2_000_000,))
+    edges = np.broadcast_to(np.array([[0, 1]], dtype=np.int64), (67_108_864, 2))
+    j = np.broadcast_to(np.array([1.0]), (67_108_864,))
+    with pytest.raises(quip_msa.MemoryLimitError):
+        quip_msa.Msa().sample_research(
+            h, edges, j, kernel="cpu-msa-f64", num_sweeps=1, num_reads=3136,
+        )
+
+    h = np.broadcast_to(np.array([0.0]), (4_194_304,))
+    empty_edges = np.empty((0, 2), dtype=np.int64)
+    empty_j = np.empty(0)
+    for kernel in ("cpu-sa", "cpu-msa-unit"):
+        with pytest.raises(quip_msa.MemoryLimitError):
+            quip_msa.Msa().sample_research(
+                h, empty_edges, empty_j, kernel=kernel, num_sweeps=1, num_reads=2048,
+            )
+
+
 def ring(n: int):
     """A unit-weight ring every kernel accepts; ``planted`` satisfies every bond."""
 
@@ -296,7 +315,7 @@ def test_concurrent_calls_match_serial_results():
 
 
 def test_memory_limit_raises_distinct_error():
-    h = np.zeros(100_000, dtype=np.float64)
+    h = np.zeros(2_000_000, dtype=np.float64)
     h[0] = 0.37
     edges = np.empty((0, 2), dtype=np.int64)
     j = np.empty(0, dtype=np.float64)

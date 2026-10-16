@@ -314,8 +314,8 @@ mod tests {
     fn sb_identity_advertises_the_sb_algorithm_and_adapt_envelope() {
         assert_eq!(CPU_SB_IDENTITY.backend, quip_proto::v1::Backend::Cpu);
         assert_eq!(CPU_SB_IDENTITY.algorithm, quip_proto::v1::Algorithm::Sb);
-        assert_eq!(CPU_SB_IDENTITY.max_nodes, 100_000);
-        assert_eq!(CPU_SB_IDENTITY.max_edges, 1_000_000);
+        assert_eq!(CPU_SB_IDENTITY.max_nodes, 4_194_304);
+        assert_eq!(CPU_SB_IDENTITY.max_edges, 67_108_864);
         assert_eq!(CPU_SB_IDENTITY.adapt.min_sweeps, 256);
         assert_eq!(CPU_SB_IDENTITY.adapt.max_sweeps, 8192);
         assert_eq!(CPU_SB_IDENTITY.adapt.min_reads, 64);
@@ -418,8 +418,8 @@ mod tests {
     fn cpu_hbsb_identity_advertises_hbsb_algorithm() {
         assert_eq!(CPU_HBSB_IDENTITY.backend, quip_proto::v1::Backend::Cpu);
         assert_eq!(CPU_HBSB_IDENTITY.algorithm, quip_proto::v1::Algorithm::Hbsb);
-        assert_eq!(CPU_HBSB_IDENTITY.max_nodes, 100_000);
-        assert_eq!(CPU_HBSB_IDENTITY.max_edges, 1_000_000);
+        assert_eq!(CPU_HBSB_IDENTITY.max_nodes, 4_194_304);
+        assert_eq!(CPU_HBSB_IDENTITY.max_edges, 67_108_864);
     }
 
     #[test]

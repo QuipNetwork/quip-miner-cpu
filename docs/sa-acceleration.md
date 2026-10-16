@@ -9,8 +9,8 @@ measure.
 ## Current MSA kernel
 
 MSA visits color classes in order at each sweep and processes every replica word
-at each temperature. It fills one reusable 8 KiB threshold row per temperature.
-Sweep offsets use the CUDA seed mixing and are shared across replica words.
+at each temperature. It fills one reusable 24 KiB per-lane threshold row per temperature.
+Each replica word uses a seed-derived offset into that row.
 The CPU retains SmallRng and f64 temperatures, so CPU and CUDA trajectories can differ.
 
 The packed kernel skips neighbor counting when the threshold accepts every lane.
@@ -34,6 +34,69 @@ for degree-20 cases than the initial CPU port of the CUDA sweep loop.
 All seven cases preserved output fingerprints in five alternating rounds with
 seven timed repeats per case. Target-energy success rates require a separate corpus study.
 
+## Per-lane thresholds (QUI-1596)
+
+The unit multi-spin kernel now draws a separate acceptance threshold for each
+lane. The row has 512 entries, each with 64 lane thresholds. One temperature rung draws
+32,768 thresholds. Each word reads the row from its own cyclic offset.
+
+The table shows median milliseconds per job after one warmup and five timed
+repeats. The baseline is commit `1d65a90` from `origin/main`. The other multi-spin
+columns use this branch with the stated row width. The scalar column uses the
+current `cpu-sa` sampler on the same synthetic cases.
+
+| case | baseline multi-spin | row 256 | row 512 | row 1024 | row 2048 | current `cpu-sa` |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `hot64` | 3.985 | 6.019 | 7.693 | 10.219 | 14.008 | 46.609 |
+| `mixed128` | 32.025 | 41.051 | 44.977 | 52.040 | 66.477 | 755.580 |
+| `cold128` | 2.067 | 2.850 | 3.383 | 4.376 | 6.575 | 11.406 |
+| `sparse64` | 1.060 | 2.036 | 3.278 | 5.796 | 10.907 | 25.610 |
+| `dense64` | 2.899 | 3.930 | 5.473 | 8.604 | 14.637 | 11.813 |
+| `setup128` | 3.790 | 3.910 | 3.951 | 3.914 | 4.041 | 21.561 |
+| `setup128_fresh` | 3.992 | 4.139 | 4.147 | 4.200 | 4.192 | 21.485 |
+
+The selected row slows `hot64` by 1.93x and `mixed128` by 1.40x relative to the
+baseline multi-spin kernel. Setup cases slow by about 1.04x. On these synthetic jobs,
+the new `cpu-msa` rate is 6.06x the current `cpu-sa` rate for `hot64` and
+16.80x for `mixed128`. These ratios divide the scalar median by the row-512
+median. They do not replace a corpus throughput measurement.
+
+Applying the measured 1.404x `mixed128` slowdown to the old corpus rate of
+958.7 jobs per minute gives about 682.6 jobs per minute. Relative to the old
+`cpu-sa` rate of 110.8 jobs per minute, that projects to 6.16x. This estimate
+assumes the synthetic slowdown transfers unchanged to corpus throughput.
+
+The diversity test uses 64 reads per run. Each cell lists distinct multi-spin reads
+for one model and sweep count. The scalar counts are 18 and 11 for the complete
+graph, and 64 and 64 for the ring.
+
+| model | sweeps | row 256 | row 512 | row 1024 | row 2048 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| complete | 50 | 20 | 19 | 19 | 17 |
+| complete | 1000 | 9 | 9 | 9 | 10 |
+| ring | 50 | 64 | 64 | 64 | 64 |
+| ring | 32768 | 64 | 64 | 64 | 64 |
+
+Width 512 is the smallest width within two distinct reads of width 2048 in
+every run. Width 256 differs by three on the 50-sweep complete graph.
+
+All runs used an Apple M4 Max with 16 cores. The controller reserved the host
+for these measurements. The table records `uptime` before and after each timed
+command. Each cell shows the system uptime and the one-minute load average.
+
+| timed command | before `uptime` | after `uptime` |
+| --- | --- | --- |
+| baseline multi-spin | 32 days, 7:11 / 4.28 | 32 days, 7:12 / 7.41 |
+| row 256 | 32 days, 7:12 / 5.55 | 32 days, 7:12 / 5.74 |
+| row 512 | 32 days, 7:13 / 6.00 | 32 days, 7:13 / 6.00 |
+| row 1024 | 32 days, 7:13 / 5.85 | 32 days, 7:13 / 5.85 |
+| row 2048 | 32 days, 7:13 / 5.29 | 32 days, 7:13 / 7.03 |
+| current `cpu-sa` | 32 days, 7:17 / 2.83 | 32 days, 7:18 / 2.68 |
+
+The historical 958.7 jobs-per-minute result describes the old multi-spin kernel.
+The current corpus mining rate remains unmeasured. A new corpus
+replay can measure jobs per minute on the same instances.
+
 ## Earlier corpus results
 
 The corpus tables below describe the earlier kernel, before the
@@ -46,7 +109,7 @@ On the two bundled Zephyr corpora, at equal sweep and read counts:
 | `cpu-sa` before this work | 94.1 | 1.00x | baseline |
 | `cpu-sa` after this work | 110.8 | 1.18x | bit-identical |
 | `cpu-fsa` | 137.7 | 1.46x | none measurable |
-| `cpu-msa` | 958.7 | 10.19x | none measurable |
+| `cpu-msa` before per-lane thresholds | 958.7 | see current projection | none measurable |
 
 Measured on all 500 instances of the isingmark hardest-500 `chain-h0` corpus,
 with 2 repetitions per arm. Energy quality holds: every paired difference stays
@@ -117,8 +180,9 @@ downhill or flat candidate has `n ≤ 0 ≤ M`, the whole Metropolis test collap
 to one integer comparison, `m ≥ -M`. The kernel draws no random number per
 candidate flip.
 
-The FSA kernel draws a threshold table per job. MSA fills one reusable row per
-temperature. Both share thresholds across reads and shift the row offset each sweep.
+The tabulated kernel draws a threshold table per job and shares it across reads.
+The packed kernel fills one reusable row per temperature with separate thresholds for each lane.
+Both shift the row offset each sweep.
 
 The field-free case, `h = 0`, buys nothing extra here. A field in `{-1, 0, +1}`
 folds into the same kernel as one extra bond to a spin pinned at `+1`, so
@@ -144,8 +208,8 @@ described earlier.
 **The multi-spin coded kernel**, exposed as `cpu-msa`. One `u64` holds the same
 lattice spin across 64 replicas. A replica is a read, so a 64-read job is one
 word pass. Satisfied bonds accumulate in six bit planes through carry-save or
-ripple counting. The acceptance test compares that counter against a scalar
-threshold. An early acceptance check skips counting when every lane must flip.
+ripple counting. The acceptance test compares that counter with per-lane
+thresholds. An early acceptance check skips counting when every lane must flip.
 
 ## Why `cpu-sa` itself changed
 
@@ -185,9 +249,9 @@ whose spins are the same. The scalar adaptive budget uses at most 1024 rungs.
 Deeper MSA requests can reach the table limit when packed sampling is unavailable.
 
 `cpu-fsa` stores an 8 KiB threshold row per rung and falls back to `cpu-sa`
-when the table exceeds 64 MiB. Packed `cpu-msa` reuses one 8 KiB row.
-A problem with more than 8192 nodes reuses thresholds for sites 8192 apart.
-Changing the sweep offset changes the selected threshold but preserves that pairing.
+when the table exceeds 64 MiB. A problem with more than 8192 nodes reuses
+`cpu-fsa` thresholds for sites 8192 apart. Packed `cpu-msa` reuses one 24 KiB
+per-lane row and gives each word its own offset.
 
 `cpu-msa` needs two more conditions, and falls back to the tabulated kernel
 otherwise:
