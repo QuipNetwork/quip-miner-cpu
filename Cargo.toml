@@ -19,6 +19,12 @@ path = "src/bin/quip_cpu_sa.rs"
 name = "quip-cpu-gibbs"
 path = "src/bin/quip_cpu_gibbs.rs"
 
+# Per-part timing of the scalar SA kernel. Production track: it is ungated
+# and ships with every release.
+[[bin]]
+name = "quip-cpu-bench"
+path = "src/bin/quip_cpu_bench.rs"
+
 # Not feature-gated: discrete SB is the production track.
 [[bin]]
 name = "quip-cpu-sb"
@@ -107,12 +113,16 @@ path = "src/bin/quip_cpu_flatiron.rs"
 required-features = ["experimental"]
 
 # The experimental backends stay behind this feature, so a plain `cargo build`
-# produces only the three production binaries. CI builds, tests and lints with
+# produces only the four production binaries. CI builds, tests and lints with
 # --all-features, and a tag publishes every binary, with the release notes
 # naming the experimental ones. The feature is empty because the modules
 # compile unconditionally and only the [[bin]] targets are gated.
 [features]
 experimental = []
+# Off by default. Adds per-spin-decision and per-flip spans INSIDE the hot loop.
+# These spans distort absolute timing (millions of enters per read), so they are
+# used only for the diagnostic cross-check pass, never for headline per-part JSON.
+fine-spans = []
 
 # Single-crate package, so lints live here rather than in [workspace.lints].
 [lints.rust]
@@ -154,11 +164,13 @@ crossbeam-channel = "0.5.16"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "signal", "io-util", "sync"] }
 rand = { version = "0.8", features = ["small_rng"] }
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 toml = "0.8"
 tracing = "0.1"
+tracing-flame = "0.2"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
 proptest = "1.11.0"
 quip-solver-conformance = "0.0.3"
-serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "signal", "io-util", "sync", "process"] }

@@ -10,6 +10,7 @@
 //! them stream jobs through one shared pump, so cancellation and panic
 //! propagation cannot drift between them.
 
+pub mod bench;
 mod coloring;
 pub mod flatiron;
 pub mod flatiron_sampler;
@@ -652,8 +653,13 @@ mod tests {
 
         let algorithms: std::collections::BTreeSet<_> =
             ladder.iter().chain(&sb).map(|id| id.algorithm).collect();
+        // The bench is a profiling tool, not a solver, so it has no identity.
         let bins = std::fs::read_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/src/bin"))
             .expect("src/bin")
+            .filter(|e| {
+                e.as_ref()
+                    .map_or(true, |e| e.file_name() != "quip_cpu_bench.rs")
+            })
             .count();
         assert_eq!(algorithms.len(), ladder.len() + sb.len());
         assert_eq!(algorithms.len(), bins);

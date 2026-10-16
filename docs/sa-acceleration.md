@@ -467,19 +467,18 @@ measurement suggests a reordering pass would beat that layout.
 
 Build with the `experimental` feature to get `cpu-fsa` and `cpu-msa`:
 
-    cargo build --release --all-features
+    cargo build --release --features experimental
 
 The kernel-rate program is a loose file, following the convention of the other
 programs in `docs/comparisons/`. To run it, copy it into `src/bin/`, widen
 `sa_int` and `sa_msc` to `pub mod` in `src/lib.rs`, widen their `pub(crate)`
-items to `pub`, move `serde_json` from `[dev-dependencies]` to
-`[dependencies]`, and point `QUIP_TOPOLOGY_SPEC` at a topology fixture:
+items to `pub`, and point `QUIP_TOPOLOGY_SPEC` at a topology fixture:
 
     cp docs/comparisons/sakernels.rs src/bin/
     QUIP_TOPOLOGY_SPEC=../isingmark/fixtures/chain-h0.spec.json \
-      cargo run --release --all-features --bin sakernels
+      cargo run --release --features experimental --bin sakernels
 
-Revert all four edits afterward. The crate keeps those items private.
+Revert all three edits afterward. The crate keeps those items private.
 
 The end-to-end tables come from the isingmark `throughput` harness. See
 `docs/comparisons.md` for the method.

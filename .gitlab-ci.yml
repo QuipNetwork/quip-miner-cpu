@@ -4,10 +4,10 @@ variables:
   CARGO_HOME: $CI_PROJECT_DIR/.cargo
   # Downloadable binaries live in the generic package registry under this name.
   PKG: quip-solver-cpu
-  # 16 binary targets on three platforms. The build jobs read the target list
+  # 17 binary targets on three platforms. The build jobs read the target list
   # out of the manifest, so this number is the one place a new binary has to be
   # acknowledged by hand. Publishing a binary stays a deliberate decision.
-  ASSET_COUNT: "48"
+  ASSET_COUNT: "51"
 
 default:
   image: rust:1.97
@@ -133,16 +133,18 @@ test-py:
 # `quip-cpu-sa-arm64`, received a Linux ELF, and only discovered the mismatch
 # when it tried to run the file.
 #
-# `--all-features` builds the experimental binaries alongside the production
-# ones. The feature is empty and no code reads it, so the production binaries
-# keep the same instructions; only their build metadata hash changes.
+# `--features experimental` builds the experimental binaries alongside the
+# production ones. The feature is empty and no code reads it, so the production
+# binaries keep the same instructions; only their build metadata hash changes.
+# The build names the feature instead of passing `--all-features`, which would
+# also turn on `fine-spans` and put per-spin spans in every released hot loop.
 build-linux-amd64:
   extends: .build
   variables:
     BIN_DIR: target/release
     ASSET_SUFFIX: linux-amd64
   script:
-    - cargo build --release --bins --all-features
+    - cargo build --release --bins --features experimental
     - *package-bins
 
 build-linux-arm64:
@@ -156,7 +158,7 @@ build-linux-arm64:
     - apt-get update -qq && apt-get install -y -qq gcc-aarch64-linux-gnu
     - rustup target add aarch64-unknown-linux-gnu
     - export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
-    - cargo build --release --bins --all-features --target aarch64-unknown-linux-gnu
+    - cargo build --release --bins --features experimental --target aarch64-unknown-linux-gnu
     - *package-bins
 
 # Tag only. The Apple Silicon runners are a shared and limited resource, and the
@@ -169,7 +171,7 @@ build-darwin-arm64:
   rules:
     - if: $CI_COMMIT_TAG
   script:
-    - cargo build --release --bins --all-features
+    - cargo build --release --bins --features experimental
     - *package-bins
 
 # On a tag: upload every built binary to the generic package registry, then cut
