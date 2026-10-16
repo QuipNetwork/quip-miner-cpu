@@ -5,9 +5,8 @@
 //
 // Not part of the crate build. To run it, copy this file to
 // `src/bin/sakernels.rs`, make `sa_int` and `sa_msc` `pub mod` in `src/lib.rs`,
-// widen their `pub(crate)` items to `pub`, move `serde_json` from
-// `[dev-dependencies]` to `[dependencies]`, and `cargo run --release
-// --all-features --bin sakernels`. Point QUIP_TOPOLOGY_SPEC at
+// widen their `pub(crate)` items to `pub`, and `cargo run --release
+// --features experimental --bin sakernels`. Point QUIP_TOPOLOGY_SPEC at
 // isingmark/fixtures/chain-h0.spec.json to measure on the real Zephyr
 // adjacency; without it the first row falls back to a random graph of the same
 // size and degree.

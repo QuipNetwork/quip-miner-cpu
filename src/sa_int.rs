@@ -35,6 +35,7 @@
 use quip_solver_core::{CancelToken, IsingGraph};
 use rand::rngs::SmallRng;
 use rand::Rng;
+use tracing::trace_span;
 
 use crate::sampler_core::{random_spins, SampleCancelled};
 
@@ -431,10 +432,18 @@ pub(crate) fn anneal_one_read_int(
     cancel: Option<(&CancelToken, Option<u64>)>,
 ) -> Result<Vec<i8>, SampleCancelled> {
     let n = graph.num_nodes();
-    let mut spins = random_spins(n, rng);
+    let mut spins = {
+        let _s = trace_span!("random_spins").entered();
+        random_spins(n, rng)
+    };
 
-    let mut heff = seed_fields(graph, &spins);
+    let mut heff = {
+        let _s = trace_span!("seed_heff").entered();
+        seed_fields(graph, &spins)
+    };
 
+    let mut accepts: u64 = 0;
+    let sweep_span = trace_span!("sweep_loop").entered();
     for row in table.chunks_exact(graph.row_len()) {
         for _ in 0..sweeps_per_beta {
             // One Relaxed load per sweep, matching the `f64` kernel's budget.
@@ -444,6 +453,8 @@ pub(crate) fn anneal_one_read_int(
                 }
             }
             for var in 0..n {
+                #[cfg(feature = "fine-spans")]
+                let _d = trace_span!("spin_decision").entered();
                 // `m` is the field seen along the spin's own direction, so the
                 // flip costs `delta = -2m`. Downhill and flat candidates
                 // (`m >= 0`) are accepted without drawing, which is what keeps
@@ -460,11 +471,16 @@ pub(crate) fn anneal_one_read_int(
                 // circuits, so an accepted downhill flip still draws nothing.
                 let accept = m >= 0 || rng.gen::<f64>() < row[usize::from(m.unsigned_abs())];
                 if accept {
+                    #[cfg(feature = "fine-spans")]
+                    let _f = trace_span!("apply_flip").entered();
                     flip(graph, &mut spins, &mut heff, var);
+                    accepts += 1;
                 }
             }
         }
     }
+    drop(sweep_span);
+    crate::bench::timing::record_accepts(accepts);
     Ok(spins)
 }
 

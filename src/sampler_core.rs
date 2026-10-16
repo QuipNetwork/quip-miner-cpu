@@ -21,6 +21,7 @@ use quip_solver_core::BetaSchedule;
 use quip_solver_core::{Algorithm, CancelToken, IsingGraph, SampleParams, SamplerResult};
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
+use tracing::{info_span, trace_span};
 
 use crate::sa_int::{acceptance_table, anneal_one_read_int, IntGraph};
 
@@ -238,7 +239,10 @@ pub(crate) fn anneal_one_read(
     cancel: Option<(&CancelToken, Option<u64>)>,
 ) -> Result<Vec<i8>, SampleCancelled> {
     let n = graph.num_nodes();
-    let mut spins = random_spins(n, rng);
+    let mut spins = {
+        let _s = trace_span!("random_spins").entered();
+        random_spins(n, rng)
+    };
     if n == 0 {
         return Ok(spins);
     }
@@ -257,8 +261,13 @@ pub(crate) fn anneal_one_read(
     // the incremental path runs in production, so the live accept/reject RNG
     // stream stays self-consistent, but results are not bit-for-bit identical to
     // a recompute-every-flip implementation.
-    let mut heff: Vec<f64> = (0..n).map(|v| effective_field(v, &spins, graph)).collect();
+    let mut heff: Vec<f64> = {
+        let _s = trace_span!("seed_heff").entered();
+        (0..n).map(|v| effective_field(v, &spins, graph)).collect()
+    };
 
+    let mut accepts: u64 = 0;
+    let sweep_span = trace_span!("sweep_loop").entered();
     for &beta in beta_schedule {
         for _ in 0..sweeps_per_beta {
             // One Relaxed load per sweep, never per spin flip. A sweep is
@@ -269,15 +278,22 @@ pub(crate) fn anneal_one_read(
                 }
             }
             for var in 0..n {
+                #[cfg(feature = "fine-spans")]
+                let _d = trace_span!("spin_decision").entered();
                 let s = spin_sign(spins[var]);
                 let delta = -2.0 * s * heff[var];
                 if metropolis_accept(delta, beta, rng) {
+                    #[cfg(feature = "fine-spans")]
+                    let _f = trace_span!("apply_flip").entered();
                     spins[var] = -spins[var];
                     apply_field_delta(graph, &mut heff, var, -2.0 * s);
+                    accepts += 1;
                 }
             }
         }
     }
+    drop(sweep_span);
+    crate::bench::timing::record_accepts(accepts);
     Ok(spins)
 }
 
@@ -395,10 +411,16 @@ pub(crate) fn sample_sa_scalar(
     cancel: Option<(&CancelToken, Option<u64>)>,
 ) -> Result<(Vec<SamplerResult>, ScalarArithmetic, Vec<f64>), SampleCancelled> {
     let num_reads = params.num_reads.max(1);
-    let beta_schedule = build_beta_schedule(graph, params);
+    let beta_schedule = {
+        let _s = info_span!("beta_schedule").entered();
+        build_beta_schedule(graph, params)
+    };
     let sweeps_per = effective_sweeps_per_beta(params.num_sweeps, params.sweeps_per_beta);
     let base_seed = params.seed;
-    let kernel = Kernel::for_problem(graph, &beta_schedule);
+    let kernel = {
+        let _s = info_span!("cpu_graph_build").entered();
+        Kernel::for_problem(graph, &beta_schedule)
+    };
     let arithmetic = match &kernel {
         Kernel::Int(..) => ScalarArithmetic::Int,
         Kernel::Float(_) => ScalarArithmetic::F64,
@@ -417,12 +439,18 @@ pub(crate) fn sample_sa_scalar(
             .wrapping_add(read_idx as u64)
             .wrapping_add(1);
         let mut rng = SmallRng::seed_from_u64(seed);
-        let spins = match &kernel {
-            Kernel::Int(g, table) => anneal_one_read_int(g, table, sweeps_per, &mut rng, cancel)?,
-            Kernel::Float(cpu) => {
-                anneal_one_read(cpu, &beta_schedule, sweeps_per, &mut rng, cancel)?
+        let spins = {
+            let _s = info_span!("anneal_read").entered();
+            match &kernel {
+                Kernel::Int(g, table) => {
+                    anneal_one_read_int(g, table, sweeps_per, &mut rng, cancel)?
+                }
+                Kernel::Float(cpu) => {
+                    anneal_one_read(cpu, &beta_schedule, sweeps_per, &mut rng, cancel)?
+                }
             }
         };
+        let _s = info_span!("score").entered();
         results.push(score_spins(&spins, graph));
     }
     Ok((results, arithmetic, beta_schedule))

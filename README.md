@@ -16,6 +16,7 @@ reads are sequential and cache-local. Energies are scored with the canonical
 | `quip-cpu-sa` | simulated annealing (Metropolis) | production |
 | `quip-cpu-gibbs` | single-site heat-bath Gibbs | production |
 | `quip-cpu-sb` | discrete Simulated Bifurcation | production |
+| `quip-cpu-bench` | per-part timing of the scalar SA kernel (see [Benchmarking](#benchmarking)) | production |
 | `quip-cpu-bsb` | ballistic Simulated Bifurcation | experimental |
 | `quip-cpu-hdsb` | heated discrete Simulated Bifurcation | experimental |
 | `quip-cpu-hbsb` | heated ballistic Simulated Bifurcation | experimental |
@@ -63,7 +64,7 @@ before you deploy one.
 cargo build --release
 ```
 
-A plain build produces the three production binaries. The experimental
+A plain build produces the four production binaries. The experimental
 binaries need an opt-in feature:
 
 ```sh
@@ -200,6 +201,56 @@ and returns `(spins, energy_milli)` as numpy arrays. The call releases the GIL,
 and the kernel runs one job on one core, so call it from several threads to
 use several cores. `initial_spins` starts reads from given states, and
 `start_beta` sets where a seeded anneal enters the beta ladder.
+
+## Benchmarking
+
+`quip-cpu-bench` runs a model through the sampler under a `tracing` subscriber
+and writes per-part timing plus a flame graph. The report assigns the
+sampler's time to each annealing seam, not only to the whole-model total.
+
+```sh
+quip-cpu-bench --nodes 512 --edges 2048 --iters 5 --out-dir bench-out
+# or against a coordinator corpus (nonce-refs need --topology for the topology):
+quip-cpu-bench --source instances.jsonl --topology topology.spec.json --out-dir bench-out
+```
+
+`--source` is the coordinator's `instances.jsonl`, one JSON object per line,
+keyed on `nonce`. The bench ignores other keys. `--topology` is the
+coordinator's `topology.spec.json`
+(`{nodes, edges, allowed_h_milli, allowed_j_milli}`). The bench redraws each
+nonce-ref entry against it with `quip_protocol::chacha8::draw_ising_milli`.
+`--limit K` benches only the first `K` corpus models.
+
+The bench times the scalar SA kernel that `quip-cpu-sa` runs. Gibbs runs on a
+worker pool outside these seams, so the bench does not cover it.
+
+Flags: `--nodes`/`--edges` (synthetic model) or
+`--source`/`--topology`/`--limit` (corpus JSONL), `--num-reads`,
+`--num-sweeps`, `--sweeps-per-beta`, `--seed`, `--warmup`, `--iters`,
+`--out-dir`.
+
+Each model writes `<out_dir>/<model_id>.json` and `<out_dir>/<model_id>.folded`:
+
+- `schema_version` — bump signals a JSON shape change.
+- `parts[]` — one entry per traced span (`part`, `scope`, `total_ns`, `count`,
+  `per_call_ns`, `source`). `scope` is `"top_level"` for the four
+  non-overlapping seams (`cpu_graph_build`, `beta_schedule`, `anneal_read`,
+  `score`) summed into `residual_ns`, or `"nested"` for `anneal_read`'s
+  children (`random_spins`, `seed_heff`, `sweep_loop`), reported for the flame
+  view but excluded from that sum.
+- `derived` — `per_spin_ns` and `accept_rate` computed as total ÷
+  frequency (`sweep_loop.total_ns` ÷ spin visits), plus `sweep_loop_ns_per_read`.
+- `residual_ns`/`residual_frac` — `measured_model_ns` minus the summed
+  top-level parts. A large fraction signals a missing seam.
+- `<model_id>.folded` — `tracing-flame` folded stacks. Render them with
+  `inferno-flamegraph < model.folded > model.svg`.
+
+The headline JSON uses coarse, always-on seam spans (negligible overhead —
+entered O(reads) times per model). `--features fine-spans` also spans every
+spin decision and accepted flip inside the hot loop, for a diagnostic
+cross-check. That build measurably distorts absolute timing, so headline
+numbers never use it. Optional external cross-check:
+`cargo flamegraph --bin quip-cpu-bench -- --nodes 512 --edges 2048`.
 
 ## Tests
 
