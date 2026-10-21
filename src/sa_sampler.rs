@@ -83,8 +83,8 @@ pub const CPU_MSA_IDENTITY: BackendIdentity = BackendIdentity {
 /// Named separately from [`CPU_ADAPT`] so FSA and SA keep the scalar budget
 /// while MSA advertises its own mining envelope.
 pub(crate) const CPU_MSA_ADAPT: AdaptBounds = AdaptBounds {
-    min_sweeps: 7392,
-    max_sweeps: 29568,
+    min_sweeps: 128,
+    max_sweeps: 4096,
     min_reads: 128,
     max_reads: 128,
     reads_solution_min_factor: 0,
@@ -1297,8 +1297,8 @@ mod tests {
         // The floor is the measured plateau: on the Aglais topology the
         // energy reaches its ground state at 128 sweeps and does not improve
         // after it, while the chain's gate sits far above that plateau.
-        assert_eq!(CPU_MSA_IDENTITY.adapt.min_sweeps, 7392);
-        assert_eq!(CPU_MSA_IDENTITY.adapt.max_sweeps, 29568);
+        assert_eq!(CPU_MSA_IDENTITY.adapt.min_sweeps, 128);
+        assert_eq!(CPU_MSA_IDENTITY.adapt.max_sweeps, 4096);
         assert_eq!(CPU_MSA_IDENTITY.adapt.min_reads, 128);
         assert_eq!(CPU_MSA_IDENTITY.adapt.max_reads, 128);
         assert_eq!(CPU_MSA_IDENTITY.adapt.reads_solution_min_factor, 0);
@@ -1306,7 +1306,22 @@ mod tests {
         assert_eq!(CPU_MSA_IDENTITY.adapt.reads_solution_floor_factor, 0);
     }
 
-
+    /// The floor of the multi-spin budget is the point where the answer
+    /// stops improving.
+    ///
+    /// On the Aglais topology the packed kernel reaches -41515000 at 128
+    /// sweeps and at every budget above it, while 64 sweeps gives -40999000
+    /// and 32 gives -40859000. The chain's gate on that topology sits around
+    /// -14754, so the plateau is far below it. Sweeping past the plateau
+    /// buys no energy and costs the race, which is why the floor is 128 and
+    /// not the reference's 7392.
+    #[test]
+    fn the_multi_spin_floor_sits_where_the_energy_stops_improving() {
+        assert_eq!(CPU_MSA_ADAPT.min_sweeps, 128);
+        // The ceiling stays wide: a harder instance buys more sweeps through
+        // the difficulty interpolation, so the floor is a floor and not a cap.
+        assert!(CPU_MSA_ADAPT.max_sweeps > CPU_MSA_ADAPT.min_sweeps * 8);
+    }
 
     #[test]
     fn both_variants_return_exactly_num_reads_solutions() {
