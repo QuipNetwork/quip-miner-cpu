@@ -734,12 +734,18 @@ mod tests {
         assert_eq!(scalar.spins, reference);
 
         let unit = sample_research(&graph, &p, ResearchKernel::UnitMsa, None, None).expect("unit");
-        let reference: Vec<Vec<i8>> = SaSampler::new(SaVariant::MultiSpin)
-            .sample(&graph, &p)
-            .expect("msa")
-            .into_iter()
-            .map(|r| r.spins)
-            .collect();
+        // The research path returns the reads as the kernel produced them, so
+        // the reference is the unselected path too.
+        let reference: Vec<Vec<i8>> = crate::sa_sampler::sample_sa_variant_raw(
+            &graph,
+            &p,
+            SaVariant::MultiSpin,
+            None,
+        )
+        .expect("msa")
+        .into_iter()
+        .map(|r| r.spins)
+        .collect();
         assert_eq!(unit.spins, reference);
     }
 

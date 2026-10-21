@@ -28,6 +28,7 @@ pub mod sb_ggsb;
 pub mod sb_sampler;
 pub mod sb_sbqa;
 pub mod sb_tesb;
+pub mod selection;
 mod spin_barrier;
 
 pub use flatiron::{sample_ising_flatiron, FlatironConfig};
@@ -318,6 +319,16 @@ struct CpuBackendConfig {
     num_cpus: Option<i64>,
     #[serde(flatten)]
     unknown: BTreeMap<String, toml::Value>,
+    /// How many reads the solver samples for every read the job asked for.
+    ///
+    /// One means no oversampling. The chain scores a proof set on its energy
+    /// and on its diversity, and a set of near-identical reads has a
+    /// diversity of zero however low its energy is, so a chain with a
+    /// diversity floor above zero wants more than one. A proof-of-work round
+    /// is a throughput contest over a lease of salts, and every extra read
+    /// is a salt the miner did not answer, so that round wants one.
+    #[serde(default)]
+    pub oversample: Option<u32>,
 }
 
 /// `pub(crate)`: also the base of `declared_stream_width` on both CPU sampler
@@ -435,6 +446,23 @@ pub(crate) fn apply_num_cpus(cell: &AtomicUsize, backend_toml: &str) -> Result<(
     Ok(())
 }
 
+/// Store the oversample factor from `backend_toml`.
+///
+/// The factor is one process-wide setting rather than a field on the
+/// sampler: one miner runs in one process, and every sampler in the crate
+/// reads the same factor.
+pub(crate) fn apply_oversample(backend_toml: &str) {
+    if backend_toml.trim().is_empty() {
+        return;
+    }
+    let Ok(cfg) = toml::from_str::<CpuBackendConfig>(backend_toml) else {
+        return;
+    };
+    if let Some(factor) = cfg.oversample {
+        crate::selection::set_oversample(factor as usize);
+    }
+}
+
 /// Refuse a bad `num_cpus` at handshake. A typo must not look like it worked.
 #[expect(
     clippy::exit,
@@ -461,7 +489,14 @@ impl Sampler for CpuSampler {
             return gibbs_parallel::sample_gibbs_with(graph, params, &self.gibbs)
                 .map_err(|_| SampleError::Capacity);
         }
-        Ok(sample_ising(graph, params, self.algorithm))
+        // The chain scores a proof set on its energy *and* on its diversity,
+        // and a set of near-identical reads has a diversity of zero however
+        // low its energy is. Sampling more reads than the job asked for and
+        // returning a spread-out subset of them hands the chain a set it can
+        // actually select a diverse proof from, and keeps the best read.
+        Ok(selection::sample_oversampled(params, |p| {
+            sample_ising(graph, p, self.algorithm)
+        }))
     }
 
     /// Models to run concurrently.
@@ -496,6 +531,7 @@ impl Sampler for CpuSampler {
     }
 
     fn apply_config(&self, backend_toml: &str) {
+        crate::apply_oversample(backend_toml);
         if let Err(e) = apply_num_cpus(&self.num_cpus, backend_toml) {
             tracing::error!(error = %e, "cpu num_cpus rejected");
             reject_num_cpus(e);
@@ -512,7 +548,7 @@ impl Sampler for CpuSampler {
         let gibbs = self.gibbs;
         run_stream_pump(
             || self.stream_width(),
-            move |g, p, token, watermark| {
+            move |g, p, token, watermark| -> Result<Vec<SamplerResult>, StreamKernelError> {
                 if algorithm == Algorithm::Gibbs {
                     // Same mapping as `sample`: a colour budget the graph
                     // cannot meet is a size bound (`Capacity`), not an empty
@@ -520,13 +556,28 @@ impl Sampler for CpuSampler {
                     gibbs_parallel::sample_gibbs_with(g, p, &gibbs)
                         .map_err(|_| StreamKernelError::Reject(SampleError::Capacity))
                 } else {
-                    sampler_core::sample_ising_cancellable(
-                        g,
-                        p,
-                        algorithm,
-                        Some((token, watermark)),
-                    )
-                    .map_err(|_| StreamKernelError::Cancelled)
+                    // The same oversample and spread-out selection the
+                    // one-shot path applies. The chain reads the session
+                    // path, so the diversity the chain sees is decided here.
+                    //
+                    // A cancelled job returns no reads, and the session
+                    // turns that into a cancelled outcome rather than a
+                    // result the coordinator would count as served work.
+                    let reads = selection::sample_oversampled(p, |oversampled| {
+                        match sampler_core::sample_ising_cancellable(
+                            g,
+                            oversampled,
+                            algorithm,
+                            Some((token, watermark)),
+                        ) {
+                            Ok(reads) => reads,
+                            Err(_) => Vec::new(),
+                        }
+                    });
+                    if reads.is_empty() {
+                        return Err(StreamKernelError::Cancelled);
+                    }
+                    Ok(reads)
                 }
             },
             jobs,
