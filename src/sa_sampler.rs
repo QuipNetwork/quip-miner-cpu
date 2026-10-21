@@ -25,12 +25,13 @@ use quip_solver_core::{
 };
 use rand::rngs::SmallRng;
 use rand::SeedableRng;
+use rayon::prelude::*;
 use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex};
 
 use crate::coloring::Coloring;
 use crate::sa_int::{anneal_from, sweep_offsets, threshold_draws, threshold_table_fits, IntGraph};
-use crate::sa_msc::{anneal_words, bond_counts, MscState, LANES};
+use crate::sa_msc::{anneal_words, anneal_words_from, bond_counts, MscState, LANES};
 use crate::sampler_core::{
     build_beta_schedule, build_seeded_beta_schedule, effective_sweeps_per_beta,
     sample_ising_cancellable, sample_sa_scalar_raw, CpuGraph, SampleCancelled,
@@ -493,34 +494,47 @@ fn anneal_packed(
     cancel: Option<(&CancelToken, Option<u64>)>,
 ) -> Result<Vec<SamplerResult>, SampleCancelled> {
     let num_reads = params.num_reads.max(1);
-    let mut states = Vec::with_capacity(num_reads.div_ceil(LANES));
-    for read in (0..num_reads).step_by(LANES) {
-        if let Some((guard, watermark)) = cancel {
-            if guard.is_cancelled(watermark) {
-                return Err(SampleCancelled);
+    let groups = num_reads.div_ceil(LANES);
+
+    // One word group per task, and one group's state at a time.
+    //
+    // A group's state is one word per node, so on the Aglais topology it is
+    // 36 KB and stays in L1. Holding every group at once, as the sequential
+    // version did, puts the whole read set in memory and the sweep walks a
+    // state that no longer fits in cache. One group per task keeps the state
+    // hot, and the groups run in parallel across the cores — so a job that
+    // asks for four times the reads costs the same wall clock, because the
+    // extra words are extra cores rather than extra passes.
+    let results: Vec<Vec<SamplerResult>> = (0..groups)
+        .into_par_iter()
+        .map(|group| -> Result<Vec<SamplerResult>, SampleCancelled> {
+            let read = group * LANES;
+            if let Some((guard, watermark)) = cancel {
+                if guard.is_cancelled(watermark) {
+                    return Err(SampleCancelled);
+                }
             }
-        }
-        let mut rng = read_rng(params.seed, read);
-        // This word's share of the seeds: reads `read..read + LANES`.
-        let word_seeds: Vec<&[i8]> = seeds
-            .iter()
-            .skip(read)
-            .take(LANES)
-            .map(Vec::as_slice)
-            .collect();
-        states.push(if word_seeds.is_empty() {
-            MscState::random(int.num_nodes(), &mut rng)
-        } else {
-            MscState::seeded(int.num_nodes(), &word_seeds, &mut rng)
-        });
-    }
-    anneal_words(int, counts, colors, betas, params, &mut states, cancel)?;
-    let mut results = Vec::with_capacity(num_reads);
-    for (word, state) in states.iter().enumerate() {
-        let word_reads = LANES.min(num_reads - word * LANES);
-        results.extend(score_word(state, graph, word_reads));
-    }
-    Ok(results)
+            let mut rng = read_rng(params.seed, read);
+            // This word's share of the seeds: reads `read..read + LANES`.
+            let word_seeds: Vec<&[i8]> = seeds
+                .iter()
+                .skip(read)
+                .take(LANES)
+                .map(Vec::as_slice)
+                .collect();
+            let state = if word_seeds.is_empty() {
+                MscState::random(int.num_nodes(), &mut rng)
+            } else {
+                MscState::seeded(int.num_nodes(), &word_seeds, &mut rng)
+            };
+            let mut states = [state];
+            anneal_words_from(int, counts, colors, betas, params, &mut states, cancel, group)?;
+            let word_reads = LANES.min(num_reads - read);
+            Ok(score_word(&states[0], graph, word_reads))
+        })
+        .collect::<Result<Vec<_>, SampleCancelled>>()?;
+
+    Ok(results.into_iter().flatten().collect())
 }
 
 /// The packed unit kernel with no fallback, for the research entry point.

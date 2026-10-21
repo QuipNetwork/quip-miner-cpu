@@ -264,6 +264,26 @@ pub(crate) fn anneal_words(
     states: &mut [MscState],
     cancel: Option<(&CancelToken, Option<u64>)>,
 ) -> Result<(), SampleCancelled> {
+    anneal_words_from(graph, counts, colors, betas, params, states, cancel, 0)
+}
+
+/// Advance replica words that start at word index `word_base`.
+///
+/// The lane-row offset is derived from the word's index in the whole read
+/// set, not from its position in `states`. A caller that runs one word group
+/// at a time passes that group's index here, so the group reads the same
+/// lanes of the threshold row it would have read had every group been
+/// resident at once.
+pub(crate) fn anneal_words_from(
+    graph: &IntGraph,
+    counts: &[u8],
+    colors: &Coloring,
+    betas: &[f64],
+    params: &SampleParams,
+    states: &mut [MscState],
+    cancel: Option<(&CancelToken, Option<u64>)>,
+    word_base: usize,
+) -> Result<(), SampleCancelled> {
     let mut row = vec![[0u64; PLANES]; LANE_ROW];
     let mut cut = vec![0; graph.max_field() + 1];
     let mut rng = SmallRng::seed_from_u64(params.seed ^ 0x5341_5F54_424C_4531);
@@ -285,7 +305,7 @@ pub(crate) fn anneal_words(
             }
             for class in colors.classes() {
                 for (word, state) in states.iter_mut().enumerate() {
-                    let off = word_offset(params.seed, word, beta_idx, sweep);
+                    let off = word_offset(params.seed, word_base + word, beta_idx, sweep);
                     sweep_word(graph, counts, &row, class, off, state);
                 }
             }
