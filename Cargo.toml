@@ -1,6 +1,6 @@
 [package]
 name = "quip-solver-cpu"
-version = "0.3.5-rc1"
+version = "0.3.5"
 edition = "2021"
 description = "CPU Ising miners: simulated annealing and single-site Gibbs (v0.3)"
 license = "AGPL-3.0-or-later"
