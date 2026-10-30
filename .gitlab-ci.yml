@@ -1,5 +1,10 @@
 stages: [test, build, release]
 
+include:
+  - project: quip.network/ci-templates
+    ref: v1.0.0
+    file: templates/dependency-gate.yml
+
 variables:
   CARGO_HOME: $CI_PROJECT_DIR/.cargo
   # Downloadable binaries live in the generic package registry under this name.
@@ -226,6 +231,8 @@ release:
   # writes bins.tsv has to be one of them. `upload` carries no artifacts; it
   # is named only to order this job after the files reach the registry.
   needs:
+    - job: dependency-gate
+      optional: true
     - job: upload
       artifacts: false
     - job: build-linux-amd64
