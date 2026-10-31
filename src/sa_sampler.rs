@@ -25,15 +25,16 @@ use quip_solver_core::{
 };
 use rand::rngs::SmallRng;
 use rand::SeedableRng;
+use rayon::prelude::*;
 use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex};
 
 use crate::coloring::Coloring;
 use crate::sa_int::{anneal_from, sweep_offsets, threshold_draws, threshold_table_fits, IntGraph};
-use crate::sa_msc::{anneal_words, bond_counts, MscState, LANES};
+use crate::sa_msc::{anneal_words, anneal_words_from, bond_counts, MscState, LANES};
 use crate::sampler_core::{
     build_beta_schedule, build_seeded_beta_schedule, effective_sweeps_per_beta,
-    sample_ising_cancellable, CpuGraph, SampleCancelled,
+    sample_ising_cancellable, sample_sa_scalar_raw, CpuGraph, SampleCancelled,
 };
 use crate::{run_stream_pump, CPU_ADAPT, DEFAULT_MAX_EDGES, DEFAULT_MAX_NODES};
 
@@ -70,13 +71,20 @@ pub const CPU_MSA_IDENTITY: BackendIdentity = BackendIdentity {
     limits: crate::F64_LIMITS,
 };
 
-/// Adapt envelope for the multi-spin backend, matching CUDA `CUDA_MSA_ADAPT`.
+/// Adapt envelope for the multi-spin backend.
+///
+/// The floor is where the answer stops improving: on the Aglais topology the
+/// energy reaches its plateau at about 128 sweeps, and the chain's gate sits
+/// far above that plateau, so sweeping past it buys nothing and costs the
+/// race. The reference envelope asks for 7392 sweeps at the easiest
+/// difficulty; the ceiling stays wide so a harder instance still buys more
+/// sweeps, and only the floor moves.
 ///
 /// Named separately from [`CPU_ADAPT`] so FSA and SA keep the scalar budget
-/// while MSA advertises the same mining envelope as `quip-cuda-msa`.
+/// while MSA advertises its own mining envelope.
 pub(crate) const CPU_MSA_ADAPT: AdaptBounds = AdaptBounds {
-    min_sweeps: 7392,
-    max_sweeps: 29568,
+    min_sweeps: 128,
+    max_sweeps: 4096,
     min_reads: 128,
     max_reads: 128,
     reads_solution_min_factor: 0,
@@ -358,6 +366,22 @@ pub(crate) fn sample_sa_variant(
     variant: SaVariant,
     cancel: Option<(&CancelToken, Option<u64>)>,
 ) -> Result<Vec<SamplerResult>, SampleCancelled> {
+    // The read selection belongs here, so every caller that asks this
+    // function for a set of reads gets the same spread-out set the chain
+    // sees. The kernel-equivalence tests use `sample_sa_variant_raw`, which
+    // returns the reads as the kernel produced them.
+    Ok(crate::selection::sample_oversampled(params, |oversampled| {
+        sample_sa_variant_raw(graph, oversampled, variant, cancel).unwrap_or_default()
+    }))
+}
+
+/// The reads as the kernel produced them, with no selection applied.
+pub(crate) fn sample_sa_variant_raw(
+    graph: &IsingGraph,
+    params: &SampleParams,
+    variant: SaVariant,
+    cancel: Option<(&CancelToken, Option<u64>)>,
+) -> Result<Vec<SamplerResult>, SampleCancelled> {
     sample_sa_variant_with_cache(graph, params, variant, cancel, None, None)
 }
 
@@ -369,8 +393,10 @@ fn sample_sa_variant_with_cache(
     cache: Option<&Mutex<Option<Arc<CachedColoring>>>>,
     start: Option<SeededStart<'_>>,
 ) -> Result<Vec<SamplerResult>, SampleCancelled> {
+    // The reads as the kernel produced them. The selection belongs to the
+    // callers, so the kernel-equivalence tests can read them unmodified.
     let Some(int) = IntGraph::from_base(graph) else {
-        return sample_ising_cancellable(graph, params, Algorithm::Sa, cancel);
+        return sample_sa_scalar_raw(graph, params, cancel);
     };
     let betas = match start {
         Some(s) => build_seeded_beta_schedule(graph, params, s.start_beta),
@@ -468,34 +494,47 @@ fn anneal_packed(
     cancel: Option<(&CancelToken, Option<u64>)>,
 ) -> Result<Vec<SamplerResult>, SampleCancelled> {
     let num_reads = params.num_reads.max(1);
-    let mut states = Vec::with_capacity(num_reads.div_ceil(LANES));
-    for read in (0..num_reads).step_by(LANES) {
-        if let Some((guard, watermark)) = cancel {
-            if guard.is_cancelled(watermark) {
-                return Err(SampleCancelled);
+    let groups = num_reads.div_ceil(LANES);
+
+    // One word group per task, and one group's state at a time.
+    //
+    // A group's state is one word per node, so on the Aglais topology it is
+    // 36 KB and stays in L1. Holding every group at once, as the sequential
+    // version did, puts the whole read set in memory and the sweep walks a
+    // state that no longer fits in cache. One group per task keeps the state
+    // hot, and the groups run in parallel across the cores — so a job that
+    // asks for four times the reads costs the same wall clock, because the
+    // extra words are extra cores rather than extra passes.
+    let results: Vec<Vec<SamplerResult>> = (0..groups)
+        .into_par_iter()
+        .map(|group| -> Result<Vec<SamplerResult>, SampleCancelled> {
+            let read = group * LANES;
+            if let Some((guard, watermark)) = cancel {
+                if guard.is_cancelled(watermark) {
+                    return Err(SampleCancelled);
+                }
             }
-        }
-        let mut rng = read_rng(params.seed, read);
-        // This word's share of the seeds: reads `read..read + LANES`.
-        let word_seeds: Vec<&[i8]> = seeds
-            .iter()
-            .skip(read)
-            .take(LANES)
-            .map(Vec::as_slice)
-            .collect();
-        states.push(if word_seeds.is_empty() {
-            MscState::random(int.num_nodes(), &mut rng)
-        } else {
-            MscState::seeded(int.num_nodes(), &word_seeds, &mut rng)
-        });
-    }
-    anneal_words(int, counts, colors, betas, params, &mut states, cancel)?;
-    let mut results = Vec::with_capacity(num_reads);
-    for (word, state) in states.iter().enumerate() {
-        let word_reads = LANES.min(num_reads - word * LANES);
-        results.extend(score_word(state, graph, word_reads));
-    }
-    Ok(results)
+            let mut rng = read_rng(params.seed, read);
+            // This word's share of the seeds: reads `read..read + LANES`.
+            let word_seeds: Vec<&[i8]> = seeds
+                .iter()
+                .skip(read)
+                .take(LANES)
+                .map(Vec::as_slice)
+                .collect();
+            let state = if word_seeds.is_empty() {
+                MscState::random(int.num_nodes(), &mut rng)
+            } else {
+                MscState::seeded(int.num_nodes(), &word_seeds, &mut rng)
+            };
+            let mut states = [state];
+            anneal_words_from(int, counts, colors, betas, params, &mut states, cancel, group)?;
+            let word_reads = LANES.min(num_reads - read);
+            Ok(score_word(&states[0], graph, word_reads))
+        })
+        .collect::<Result<Vec<_>, SampleCancelled>>()?;
+
+    Ok(results.into_iter().flatten().collect())
 }
 
 /// The packed unit kernel with no fallback, for the research entry point.
@@ -634,15 +673,15 @@ impl Sampler for SaSampler {
         params: &SampleParams,
     ) -> Result<Vec<SamplerResult>, SampleError> {
         crate::check_sample_size(graph.h.len(), graph.edges.len())?;
-        Ok(sample_sa_variant_with_cache(
-            graph,
-            params,
-            self.variant,
-            None,
-            Some(&self.coloring),
-            None,
-        )
-        .unwrap_or_default())
+        // The chain scores a proof set on its energy *and* on its diversity,
+        // and a set of near-identical reads has a diversity of zero however
+        // low its energy is. Sampling more reads than the job asked for and
+        // returning a spread-out subset of them hands the chain a set it can
+        // actually select a diverse proof from, and keeps the best read.
+        Ok(crate::selection::sample_oversampled(params, |p| {
+            sample_sa_variant_with_cache(graph, p, self.variant, None, Some(&self.coloring), None)
+                .unwrap_or_default()
+        }))
     }
 
     /// One model per core, the same shape as `CpuSampler::stream_width`.
@@ -659,6 +698,7 @@ impl Sampler for SaSampler {
     }
 
     fn apply_config(&self, backend_toml: &str) {
+        crate::apply_oversample(backend_toml);
         if let Err(e) = crate::apply_num_cpus(&self.num_cpus, backend_toml) {
             tracing::error!(error = %e, "cpu num_cpus rejected");
             crate::reject_num_cpus(e);
@@ -675,16 +715,21 @@ impl Sampler for SaSampler {
         let coloring = Arc::clone(&self.coloring);
         run_stream_pump(
             || self.stream_width(),
-            move |g, p, token, watermark| {
-                sample_sa_variant_with_cache(
-                    g,
-                    p,
-                    variant,
-                    Some((token, watermark)),
-                    Some(&coloring),
-                    None,
-                )
-                .map_err(|_| crate::StreamKernelError::Cancelled)
+            move |g, p, token, watermark| -> Result<Vec<SamplerResult>, crate::StreamKernelError> {
+                // The same oversample and spread-out selection the one-shot
+                // path applies. The chain reads the session path, so the
+                // diversity the chain sees is decided here.
+                Ok(crate::selection::sample_oversampled(p, |oversampled| {
+                    sample_sa_variant_with_cache(
+                        g,
+                        oversampled,
+                        variant,
+                        Some((token, watermark)),
+                        Some(&coloring),
+                        None,
+                    )
+                    .unwrap_or_default()
+                }))
             },
             jobs,
             out,
@@ -1181,7 +1226,7 @@ mod tests {
             [[189, 345, 173], [163, 219, 477]],
             [[60, 317, 93], [208, 167, 347]],
         ];
-        let actual = sample_sa_variant(&graph, &params, SaVariant::MultiSpin, None)
+        let actual = sample_sa_variant_raw(&graph, &params, SaVariant::MultiSpin, None)
             .expect("sampling succeeds");
         for (word, base) in [0, 64].into_iter().enumerate() {
             let mut rng = read_rng(params.seed, base);
@@ -1227,7 +1272,7 @@ mod tests {
                 seed: 17,
                 ..Default::default()
             };
-            let actual = sample_sa_variant(&graph, &params, SaVariant::MultiSpin, None)
+            let actual = sample_sa_variant_raw(&graph, &params, SaVariant::MultiSpin, None)
                 .expect("sampling succeeds");
             let expected: Vec<i8> = initial
                 .iter()
@@ -1249,13 +1294,33 @@ mod tests {
         assert_eq!(CPU_FSA_IDENTITY.adapt.min_reads, CPU_ADAPT.min_reads);
         assert_eq!(CPU_FSA_IDENTITY.adapt.min_sweeps, 64);
         assert_eq!(CPU_FSA_IDENTITY.adapt.max_sweeps, 1024);
-        assert_eq!(CPU_MSA_IDENTITY.adapt.min_sweeps, 7392);
-        assert_eq!(CPU_MSA_IDENTITY.adapt.max_sweeps, 29568);
+        // The floor is the measured plateau: on the Aglais topology the
+        // energy reaches its ground state at 128 sweeps and does not improve
+        // after it, while the chain's gate sits far above that plateau.
+        assert_eq!(CPU_MSA_IDENTITY.adapt.min_sweeps, 128);
+        assert_eq!(CPU_MSA_IDENTITY.adapt.max_sweeps, 4096);
         assert_eq!(CPU_MSA_IDENTITY.adapt.min_reads, 128);
         assert_eq!(CPU_MSA_IDENTITY.adapt.max_reads, 128);
         assert_eq!(CPU_MSA_IDENTITY.adapt.reads_solution_min_factor, 0);
         assert_eq!(CPU_MSA_IDENTITY.adapt.reads_solution_max_factor, 0);
         assert_eq!(CPU_MSA_IDENTITY.adapt.reads_solution_floor_factor, 0);
+    }
+
+    /// The floor of the multi-spin budget is the point where the answer
+    /// stops improving.
+    ///
+    /// On the Aglais topology the packed kernel reaches -41515000 at 128
+    /// sweeps and at every budget above it, while 64 sweeps gives -40999000
+    /// and 32 gives -40859000. The chain's gate on that topology sits around
+    /// -14754, so the plateau is far below it. Sweeping past the plateau
+    /// buys no energy and costs the race, which is why the floor is 128 and
+    /// not the reference's 7392.
+    #[test]
+    fn the_multi_spin_floor_sits_where_the_energy_stops_improving() {
+        assert_eq!(CPU_MSA_ADAPT.min_sweeps, 128);
+        // The ceiling stays wide: a harder instance buys more sweeps through
+        // the difficulty interpolation, so the floor is a floor and not a cap.
+        assert!(CPU_MSA_ADAPT.max_sweeps > CPU_MSA_ADAPT.min_sweeps * 8);
     }
 
     #[test]
@@ -1318,7 +1383,11 @@ mod tests {
                 .sample(&graph, &params(3, 64, 7))
                 .expect("sampling succeeds");
             assert_eq!(out.len(), 3);
-            let expect = crate::sample_ising(&graph, &params(3, 64, 7), Algorithm::Sa);
+            // The sampler applies the read selection, so the reference does
+            // too: the fallback must be the cpu-sa kernel exactly.
+            let expect = crate::selection::sample_oversampled(&params(3, 64, 7), |p| {
+                crate::sample_ising(&graph, p, Algorithm::Sa)
+            });
             assert_eq!(
                 out.iter().map(|r| r.spins.clone()).collect::<Vec<_>>(),
                 expect.iter().map(|r| r.spins.clone()).collect::<Vec<_>>(),

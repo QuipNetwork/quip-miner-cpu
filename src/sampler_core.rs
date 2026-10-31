@@ -390,6 +390,20 @@ pub(crate) fn sample_ising_cancellable(
             crate::gibbs_parallel::DEFAULT_GIBBS_WORKERS,
         ));
     }
+    // The reads as the kernel produced them. The selection belongs to the
+    // sampler, so the kernel-equivalence tests read them unmodified.
+    sample_sa_scalar(graph, params, cancel).map(|(results, _, _)| results)
+}
+
+/// The scalar anneal with no read selection.
+///
+/// The packed arm calls this when a problem is not unit-valued, and it then
+/// applies the selection itself, so the reads are not selected twice.
+pub(crate) fn sample_sa_scalar_raw(
+    graph: &IsingGraph,
+    params: &SampleParams,
+    cancel: Option<(&CancelToken, Option<u64>)>,
+) -> Result<Vec<SamplerResult>, SampleCancelled> {
     sample_sa_scalar(graph, params, cancel).map(|(results, _, _)| results)
 }
 
